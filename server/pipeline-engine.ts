@@ -823,11 +823,36 @@ async function stage2_literatureSearch(ctx: PipelineContext): Promise<string> {
 }
 
 async function stage3_paperScreening(ctx: PipelineContext): Promise<string> {
-  const paperList = ctx.papers.slice(0, 20).map((p, i) => `${i + 1}. "${p.title}" (${p.year}) [${p.source}]\nAbstract: ${p.abstract?.substring(0, 200)}...`).join("\n\n");
-  return callLLM(
-    "You are a research paper screener. Evaluate papers for relevance to the research topic.",
-    `Research topic: "${ctx.topic}"\n\nScreen these papers for relevance:\n\n${paperList}\n\nFor each paper, provide:\n- Relevance score (1-10)\n- Key contribution\n- Relevance justification\n- Include/Exclude recommendation`
+  const paperList = ctx.papers.slice(0, 30).map((p, i) => `${i + 1}. "${p.title}" (${p.year}) [${p.source}]\nAbstract: ${p.abstract?.substring(0, 300)}...`).join("\n\n");
+  const screeningResult = await callLLM(
+    "You are a research paper screener. Evaluate papers for relevance to the research topic. Be strict — exclude papers that are clearly unrelated to the core topic.",
+    `Research topic: "${ctx.topic}"\n\nScreen these papers for relevance:\n\n${paperList}\n\nFor each paper, output a structured line in this EXACT format (one per paper):\nPAPER_<number>: INCLUDE|EXCLUDE, score=<1-10>, reason=<brief justification>\n\nExample:\nPAPER_1: INCLUDE, score=9, reason=Directly addresses UK data archiving practices\nPAPER_2: EXCLUDE, score=2, reason=About blood cell classification, unrelated to topic\n\nAfter all paper evaluations, provide a brief summary of the screening results.`
   );
+
+  // Parse screening results and filter ctx.papers
+  const includeIndices = new Set<number>();
+  const lines = screeningResult.split("\n");
+  for (const line of lines) {
+    const match = line.match(/PAPER_(\d+)\s*:\s*(INCLUDE|EXCLUDE)/i);
+    if (match) {
+      const idx = parseInt(match[1]) - 1; // Convert 1-based to 0-based
+      if (match[2].toUpperCase() === "INCLUDE" && idx >= 0 && idx < ctx.papers.length) {
+        includeIndices.add(idx);
+      }
+    }
+  }
+
+  // Apply filter: keep only included papers. If parsing failed (no PAPER_ lines found),
+  // keep all papers to avoid losing everything due to LLM format issues.
+  if (includeIndices.size > 0) {
+    const beforeCount = ctx.papers.length;
+    ctx.papers = ctx.papers.filter((_p, i) => includeIndices.has(i));
+    console.log(`[Pipeline] Stage 3 screening: ${beforeCount} → ${ctx.papers.length} papers (${beforeCount - ctx.papers.length} excluded)`);
+  } else {
+    console.warn("[Pipeline] Stage 3 screening: could not parse INCLUDE/EXCLUDE from LLM output, keeping all papers");
+  }
+
+  return screeningResult;
 }
 
 async function stage4_deepAnalysis(ctx: PipelineContext): Promise<string> {
@@ -1208,7 +1233,7 @@ async function stage15_tableGeneration(ctx: PipelineContext): Promise<string> {
 
   const result = await callLLM(
     `You are a scientific table designer. Create publication-quality LaTeX tables.\n\nCRITICAL ANTI-HALLUCINATION RULES:\n1. Tables MUST contain ONLY values from the "Actual computed tables" or "Actual computed metrics" sections.\n2. Do NOT invent, estimate, or fabricate any numerical values.\n3. If no actual data is provided, create tables showing the STRUCTURE only (column headers, row labels) with "—" or "N/A" in data cells, and add a note explaining that empirical values are pending.\n4. Every number in every cell must be traceable to the provided data.`,
-    `${hasRealTables || hasRealMetrics ? "Format the following actual data into publication-quality LaTeX tables" : "Create table STRUCTURES (without fabricated data) for"}:\n\n${ctx.experimentResults}\n${ctx.statisticalAnalysis?.substring(0, 2000)}${experimentTables}${experimentMetrics}${contractBlock}${executionBlock}\n\n${hasRealTables ? `Convert the actual computed tables above into LaTeX format using booktabs. Preserve ALL original values exactly as computed. Do NOT round, adjust, or add values.` : `No empirical data tables were computed. Create table STRUCTURES showing:\n1. What a main results table WOULD contain (headers and row labels only, data cells = "—")\n2. What a descriptive statistics table WOULD contain (headers and row labels only, data cells = "—")\nAdd \\caption*{Note: Empirical values pending data analysis.} to each table.`}\n\nTable formatting rules:\n- Use \\resizebox{\\textwidth}{!}{...} for tables with 4+ columns\n- Use booktabs (\\toprule, \\midrule, \\bottomrule)\n- Do NOT use sisetup or S column type\n- Keep column headers SHORT (abbreviate if needed)`
+    `${hasRealTables || hasRealMetrics ? "Format the following actual data into publication-quality LaTeX tables" : "Describe the table structures that WOULD be included in an empirical version of this paper"}:\n\n${ctx.experimentResults}\n${ctx.statisticalAnalysis?.substring(0, 2000)}${experimentTables}${experimentMetrics}${contractBlock}${executionBlock}\n\n${hasRealTables ? `Convert the actual computed tables above into LaTeX format using booktabs. Preserve ALL original values exactly as computed. Do NOT round, adjust, or add values.` : `No empirical data tables were computed. Do NOT generate LaTeX table environments with empty cells or placeholder dashes.\nInstead, provide a PROSE DESCRIPTION of what tables the empirical study would include:\n1. Describe the structure of the main results table (what columns, what rows, what metrics)\n2. Describe the structure of the descriptive statistics table\n3. Use paragraph form, NOT LaTeX table environments\nThis ensures the paper reads well without empty placeholder tables.`}\n\nTable formatting rules (for real data only):\n- Use \\resizebox{\\textwidth}{!}{...} for tables with 4+ columns\n- Use booktabs (\\toprule, \\midrule, \\bottomrule)\n- Do NOT use sisetup or S column type\n- Keep column headers SHORT (abbreviate if needed)`
   );
   ctx.tables = [result];
   await persistStageAudit(ctx, 15, {
@@ -1257,11 +1282,13 @@ async function stage17_abstractWriting(ctx: PipelineContext): Promise<string> {
 }
 
 async function stage18_bodyWriting(ctx: PipelineContext): Promise<string> {
+  // Build numbered reference list with stable BibTeX keys (ref1, ref2, ...) for citation alignment.
+  // Stage 18 uses [1], [2] in Markdown body; Stage 20 converts these to \cite{ref1}, \cite{ref2} in LaTeX.
   const numberedRefs = ctx.papers.slice(0, 20).map((p, i) => {
     const authors = p.authors || "Unknown";
     const year = p.year || "n.d.";
     const venue = p.venue ? `, ${p.venue}` : "";
-    return `[${i + 1}] ${authors}. "${p.title}". ${year}${venue}.`;
+    return `[${i + 1}] (key: ref${i + 1}) ${authors}. "${p.title}". ${year}${venue}.`;
   }).join("\n");
 
   // Build data analysis results section for the prompt
@@ -1293,7 +1320,7 @@ async function stage18_bodyWriting(ctx: PipelineContext): Promise<string> {
   if (hasRealMetrics || hasRealCharts || hasRealTables) {
     antiHallucinationRules = `\n\nANTI-HALLUCINATION RULES:\n1. In the Results section, you may ONLY report numerical values from the "Data Analysis Results" section above.\n2. When discussing figures and tables, describe what they show based on the provided descriptions.\n3. Do NOT invent additional statistics, p-values, or effect sizes beyond what is provided.\n4. If you need to discuss implications, use hedged language ("suggests", "indicates", "is consistent with").\n5. Any methodology component not confirmed by the method integrity note must be framed as unexecuted/future work.\n\nMETHODOLOGY-RESULTS ALIGNMENT (CRITICAL):\n- Actually executed methods: ${executedMethodsList}\n- Blocked/unexecuted methods: ${blockedMethodsList}\n- The Methodology section MUST describe ONLY the analyses that were actually executed.\n- Methods listed as blocked/unexecuted MUST appear ONLY in a "Limitations and Future Work" subsection, clearly marked as "not yet implemented" or "planned for future work".\n- The paper title MUST NOT reference unexecuted methods as if they are the paper's contribution.\n- Do NOT describe any blocked or unexecuted method as something "we apply" or "we implement" — only as "future work".`;
   } else {
-    antiHallucinationRules = `\n\nCRITICAL ANTI-HALLUCINATION RULES:\n1. No empirical results were computed from the data. The Results section MUST acknowledge this.\n2. Do NOT fabricate any numerical results, p-values, correlations, means, standard deviations, or effect sizes.\n3. Instead, describe the analytical FRAMEWORK: what analyses WOULD be performed, what metrics WOULD be computed, and what patterns WOULD be examined.\n4. Use conditional language throughout: "would", "is expected to", "the analysis aims to".\n5. The Experiments section should describe the planned methodology, not fabricated outcomes.\n6. If the abstract contains no specific numbers, the body should not introduce any either.\n\nMETHODOLOGY-RESULTS ALIGNMENT (CRITICAL):\n- Blocked/unexecuted methods: ${blockedMethodsList}\n- The paper MUST NOT claim to have executed any analysis. Frame the entire paper as a methodological protocol or research proposal.\n- Do NOT use past tense ("we found", "we demonstrated") for unexecuted analyses. Use future/conditional tense only.`;
+    antiHallucinationRules = `\n\nCRITICAL ANTI-HALLUCINATION RULES (NO DATASET MODE):\n1. No empirical results were computed from the data. The Results and Discussion section MUST be framed as a methodological discussion, NOT as a results presentation.\n2. Do NOT fabricate any numerical results, p-values, correlations, means, standard deviations, or effect sizes.\n3. Instead, describe the analytical FRAMEWORK: what analyses would be performed, what metrics would be computed, and what patterns would be examined.\n4. Use conditional language throughout: "would", "is expected to", "the analysis aims to".\n5. Do NOT include any tables with empty cells, placeholder dashes ("—"), or "N/A" values. Instead, describe what the tables WOULD contain in prose form.\n6. Do NOT include a "DATA ANALYSIS STATUS" line or "Research Classification" section — these are internal metadata.\n7. Do NOT include an "Execution Limitations" section — limitations should be discussed within the Discussion section naturally.\n\nPAPER FRAMING (CRITICAL):\n- This paper should be framed as a METHODOLOGICAL FRAMEWORK or RESEARCH PROTOCOL paper, not an empirical study.\n- The "Results and Discussion" section should discuss the EXPECTED OUTCOMES of the proposed framework, the interpretive logic, and methodological merits.\n- Blocked/unexecuted methods: ${blockedMethodsList}\n- Do NOT use past tense ("we found", "we demonstrated") for unexecuted analyses. Use future/conditional tense only.\n- The paper should be self-contained and valuable as a methodological contribution even without empirical data.`;
   }
 
   const firstPass = await callLLM(
@@ -1351,11 +1378,18 @@ WRITING QUALITY REQUIREMENTS:
 }
 
 async function stage19_referenceFormatting(ctx: PipelineContext): Promise<string> {
+  // Use stable numbered keys (ref1, ref2, ...) that match the [1], [2] citation style from Stage 18.
+  // This ensures \cite{ref1} in LaTeX corresponds to \bibitem{ref1} = paper #1.
   const bibtexEntries = ctx.papers.slice(0, 20).map((p, i) => {
-    if (p.bibtex && p.bibtex.trim().length > 10) return p.bibtex;
-    const firstAuthor = (p.authors || "Unknown").split(",")[0].split(" ").pop() || "unknown";
-    const key = `${firstAuthor.toLowerCase()}${p.year || "nd"}_${i + 1}`;
-    return `@article{${key},\n  title = {${p.title}},\n  author = {${p.authors || "Unknown"}},\n  year = {${p.year || "n.d."}},\n  journal = {${p.venue || "Unknown"}},\n  doi = {${p.doi || ""}},\n  url = {${p.url || ""}}\n}`;
+    const key = `ref${i + 1}`;
+    // Always regenerate BibTeX with the stable key to guarantee consistency
+    const author = p.authors || "Unknown";
+    const title = p.title || "Unknown title";
+    const year = p.year || "n.d.";
+    const venue = p.venue || "";
+    const doi = p.doi || "";
+    const url = p.url || "";
+    return `@article{${key},\n  title = {${title}},\n  author = {${author}},\n  year = {${year}},\n  journal = {${venue}},\n  doi = {${doi}},\n  url = {${url}}\n}`;
   }).join("\n\n");
   ctx.references = bibtexEntries;
   return `Generated BibTeX file with ${ctx.papers.slice(0, 20).length} references.\n\n${bibtexEntries}`;
@@ -1394,7 +1428,7 @@ async function stage20_latexCompilation(ctx: PipelineContext): Promise<string> {
     }
     dataManifest += `\nRULES:\n- Every number in the Results/Discussion sections MUST come from the list above.\n- If a statistic is not listed above, do NOT include it.\n- Do NOT add p-values, effect sizes, confidence intervals, or any other statistics unless they appear above.\n- Tables must reproduce the exact values from "Computed Tables" above.\n- If the data is insufficient, state the limitation rather than fabricating values.\n- Any method not explicitly supported by the method execution integrity note must be presented as planned/future work only.`;
   } else {
-    dataManifest = `\n\n## ANTI-HALLUCINATION NOTICE\nNo empirical metrics were computed from the data. The Results section MUST:\n- Acknowledge that empirical analysis could not be completed\n- Describe the analytical framework without fabricating any numbers\n- Use conditional language ("would", "is expected to")\n- NOT contain any specific numerical results, p-values, correlations, means, or standard deviations`;
+    dataManifest = `\n\n## ANTI-HALLUCINATION NOTICE (NO DATASET)\nNo empirical metrics were computed from the data. The LaTeX document MUST:\n- Frame the paper as a methodological framework/protocol, NOT as an empirical study\n- Describe the analytical framework without fabricating any numbers\n- Use conditional language ("would", "is expected to")\n- NOT contain any specific numerical results, p-values, correlations, means, or standard deviations\n- NOT include tables with empty/placeholder cells (dashes "---", "N/A", or blank cells). If table structures are needed, describe them in prose instead.\n- NOT include a "DATA ANALYSIS STATUS" text block or "Research Classification" section\n- NOT include an "Execution Limitations" section — discuss limitations naturally within the Discussion section`;
   }
 
   const result = await callLLM(
@@ -1427,6 +1461,68 @@ ALL content — including figures, tables, and equations — MUST fit within A4 
   );
   // Strip any code block markers the LLM might have added
   let latex = stripCodeBlockMarkers(result);
+
+  // ─── Citation normalisation post-processing ───
+  // Build a mapping from all known BibTeX keys (from any source) to the stable ref1..refN keys.
+  // This catches cases where the LLM used raw source IDs instead of stable numbered keys.
+  const citationKeyMap = new Map<string, string>();
+  ctx.papers.slice(0, 20).forEach((p, i) => {
+    const stableKey = `ref${i + 1}`;
+    // Map from source-specific BibTeX keys that the LLM might have used
+    if (p.bibtex) {
+      const bibtexKeyMatch = p.bibtex.match(/@\w+\{([^,]+),/);
+      if (bibtexKeyMatch) citationKeyMap.set(bibtexKeyMatch[1].trim(), stableKey);
+    }
+    // Map from common auto-generated key patterns
+    const doi = p.doi || "";
+    if (doi) citationKeyMap.set(`crossref_${doi.replace(/[./]/g, "_")}`, stableKey);
+    if (doi) citationKeyMap.set(`springer_${doi.replace(/[./]/g, "_")}`, stableKey);
+    const arxivId = p.arxivId || "";
+    if (arxivId) citationKeyMap.set(`arxiv_${arxivId.replace(/[./]/g, "_")}`, stableKey);
+    if (p.paperId?.startsWith("pubmed:")) {
+      const pmid = p.paperId.replace("pubmed:", "");
+      citationKeyMap.set(`pubmed_${pmid}`, stableKey);
+    }
+    if (p.paperId?.startsWith("s2:")) {
+      const s2id = p.paperId.replace("s2:", "").substring(0, 12);
+      citationKeyMap.set(`s2_${s2id}`, stableKey);
+    }
+    // Also map the first-author-year format that was previously used
+    const firstAuthor = (p.authors || "Unknown").split(",")[0].split(" ").pop() || "unknown";
+    citationKeyMap.set(`${firstAuthor.toLowerCase()}${p.year || "nd"}_${i + 1}`, stableKey);
+  });
+
+  // Replace \cite{oldKey} with \cite{refN} for all known key mappings
+  citationKeyMap.forEach((newKey, oldKey) => {
+    if (oldKey && oldKey !== newKey) {
+      const escaped = oldKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      latex = latex.replace(new RegExp(`\\\\cite\\{${escaped}\\}`, "g"), `\\cite{${newKey}}`);
+    }
+  });
+
+  // Convert remaining Markdown-style [N] citations to \cite{refN}
+  // Only convert [N] patterns that look like citation numbers (1-99), not arbitrary brackets
+  latex = latex.replace(/\[(\d{1,2})\]/g, (_match, num) => {
+    const n = parseInt(num);
+    if (n >= 1 && n <= ctx.papers.slice(0, 20).length) {
+      return `\\cite{ref${n}}`;
+    }
+    return _match; // Leave non-citation brackets as-is
+  });
+
+  // Remove any \cite{} with broken/empty keys (e.g., \cite{pubmed_} or \cite{})
+  latex = latex.replace(/\\cite\{[^}]*_\}/g, ""); // keys ending in underscore (broken IDs)
+  latex = latex.replace(/\\cite\{\}/g, ""); // empty cite
+
+  // Also fix \bibitem keys to match the stable ref1..refN scheme
+  // Replace any \bibitem{oldKey} with \bibitem{refN} if found in the mapping
+  citationKeyMap.forEach((newKey, oldKey) => {
+    if (oldKey && oldKey !== newKey) {
+      const escaped = oldKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      latex = latex.replace(new RegExp(`\\\\bibitem\\{${escaped}\\}`, "g"), `\\bibitem{${newKey}}`);
+    }
+  });
+
   if (ctx.executionDiagnostics?.executionStatus !== "success") {
     const failureReasons = ctx.executionDiagnostics?.failureReasons || [];
     const limitationSection = [
@@ -1441,6 +1537,22 @@ ALL content — including figures, tables, and equations — MUST fit within A4 
       latex = latex.replace("\\end{document}", `${limitationSection}\n\n\\end{document}`);
     }
   }
+
+  // ─── Strip internal metadata that should not appear in the paper ───
+  // These are pipeline-internal annotations that the LLM sometimes includes in the output.
+  // Remove "DATA ANALYSIS STATUS: ..." lines
+  latex = latex.replace(/\\textbf\{DATA ANALYSIS STATUS[^}]*\}[^\n]*/g, "");
+  latex = latex.replace(/DATA ANALYSIS STATUS[^\n]*/g, "");
+  // Remove "Research Classification" section if present as a visible section
+  latex = latex.replace(/\\section\*?\{Research Classification\}[\s\S]*?(?=\\section|\\end\{document\})/g, "");
+  latex = latex.replace(/\\subsection\*?\{Research Classification\}[\s\S]*?(?=\\section|\\subsection|\\end\{document\})/g, "");
+  // Remove standalone "methodological_protocol" or "empirical" classification labels
+  latex = latex.replace(/^methodological[_\s]protocol\s*$/gm, "");
+  latex = latex.replace(/^empirical\s*$/gm, "");
+  // Remove "Execution Limitations" from within the body (it gets re-added below in a controlled way)
+  // but only if we're about to re-inject it
+  // Clean up any double blank lines created by removals
+  latex = latex.replace(/\n{3,}/g, "\n\n");
 
   // Ensure bibliography is present in LaTeX output
   if (!latex.includes("\\begin{thebibliography}") && ctx.references) {

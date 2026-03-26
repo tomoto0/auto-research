@@ -71,7 +71,7 @@ async function fetchImageBuffer(url: string): Promise<Buffer | null> {
 /* ------------------------------------------------------------------ */
 
 interface PaperSection {
-  type: "title" | "conference" | "abstract" | "heading" | "subheading" | "subsubheading" |
+  type: "title" | "author" | "conference" | "abstract" | "heading" | "subheading" | "subsubheading" |
         "paragraph" | "figure" | "table" | "equation" | "list" | "bibliography" | "separator";
   text?: string;
   level?: number;
@@ -108,7 +108,29 @@ function parseLatexToSections(
   const titleMatch = tex.match(/\\title\{([^}]+)\}/);
   const paperTitle = titleMatch ? cleanLatexInline(titleMatch[1]) : title;
   sections.push({ type: "title", text: paperTitle });
-  sections.push({ type: "conference", text: conference || "NeurIPS 2025" });
+
+  // Extract author(s) - handle both single-line and multi-line \author{...}
+  const authorMatch = tex.match(/\\author\{([\s\S]*?)\}/);
+  if (authorMatch) {
+    let authorText = authorMatch[1]
+      .replace(/\\\\+/g, ", ") // line breaks to commas
+      .replace(/\\and/g, ", ") // \and to commas
+      .replace(/\\texttt\{[^}]*\}/g, "") // remove email
+      .replace(/\\footnote\{[^}]*\}/g, "") // remove footnotes
+      .replace(/\\affilimark\{[^}]*\}/g, "") // remove affiliation marks
+      .replace(/\\inst\{[^}]*\}/g, "") // remove inst markers
+      .replace(/\\\w+\{([^}]*)\}/g, "$1") // strip remaining commands
+      .replace(/[{}]/g, "") // remove stray braces
+      .replace(/\s+/g, " ") // collapse whitespace
+      .replace(/,\s*,/g, ",") // collapse double commas
+      .replace(/^[,\s]+|[,\s]+$/g, "") // trim leading/trailing commas
+      .trim();
+    if (authorText.length > 0) {
+      sections.push({ type: "author", text: authorText });
+    }
+  }
+
+  sections.push({ type: "conference", text: conference || "" });
 
   // Extract abstract
   const abstractMatch = tex.match(/\\begin\{abstract\}([\s\S]*?)\\end\{abstract\}/);
@@ -116,9 +138,12 @@ function parseLatexToSections(
     sections.push({ type: "abstract", text: cleanLatexInline(abstractMatch[1].trim()) });
   }
 
-  // Extract body
+  // Extract body — strictly between \begin{document} and \end{document}
   const bodyMatch = tex.match(/\\begin\{document\}([\s\S]*?)\\end\{document\}/);
   let body = bodyMatch ? bodyMatch[1] : tex;
+  // Ensure we don't process anything after \end{document}
+  const endDocIdx = body.indexOf("\\end{document}");
+  if (endDocIdx >= 0) body = body.substring(0, endDocIdx);
 
   // Remove preamble commands
   body = body.replace(/\\maketitle\s*/g, "");
@@ -418,7 +443,24 @@ function parseLatexToSections(
   }
   flushParagraph();
 
-  return sections;
+  // Filter out empty sections that would produce blank pages
+  const filtered = sections.filter(s => {
+    // Keep structural sections (title, conference, author, separator) always
+    if (s.type === "title" || s.type === "conference" || s.type === "author" || s.type === "separator") return true;
+    // Keep sections with actual content
+    if (s.type === "paragraph" || s.type === "abstract" || s.type === "heading" ||
+        s.type === "subheading" || s.type === "subsubheading") {
+      return (s.text || "").trim().length > 0;
+    }
+    if (s.type === "list") return (s.items || []).length > 0;
+    if (s.type === "bibliography") return (s.items || []).length > 0;
+    if (s.type === "table") return (s.headers || []).length > 0;
+    if (s.type === "figure") return !!(s.imageUrl || s.caption);
+    if (s.type === "equation") return (s.text || "").trim().length > 0;
+    return true;
+  });
+
+  return filtered;
 }
 
 function parseTabularContent(content: string): { headers: string[]; rows: string[][] } {
@@ -798,7 +840,7 @@ function parseMarkdownToSections(
 ): PaperSection[] {
   const sections: PaperSection[] = [];
   sections.push({ type: "title", text: title });
-  sections.push({ type: "conference", text: conference || "NeurIPS 2025" });
+  sections.push({ type: "conference", text: conference || "" });
 
   const lines = markdownContent.split("\n");
   let currentParagraph = "";
@@ -952,11 +994,22 @@ async function renderSectionsToPdf(
             break;
           }
 
-          case "conference": {
-            doc.font(FONT_SERIF).fontSize(9).fillColor("#666666");
+          case "author": {
+            doc.font(FONT_SERIF).fontSize(11).fillColor("#333333");
             doc.text(section.text || "", { width: CONTENT_WIDTH, align: "center" });
             doc.fillColor("#000000");
             doc.moveDown(0.2);
+            break;
+          }
+
+          case "conference": {
+            const confText = section.text || "";
+            if (confText) {
+              doc.font(FONT_SERIF).fontSize(9).fillColor("#666666");
+              doc.text(confText, { width: CONTENT_WIDTH, align: "center" });
+              doc.fillColor("#000000");
+              doc.moveDown(0.2);
+            }
             doc.font(FONT_SERIF).fontSize(8).fillColor("#888888");
             doc.text("Generated by Auto Research — Autonomous Research Pipeline", {
               width: CONTENT_WIDTH,
@@ -1317,10 +1370,10 @@ async function renderSectionsToPdf(
           PAGE_HEIGHT - 40,
           { width: PAGE_WIDTH, align: "center" }
         );
-        // Header: conference name (skip first page)
-        if (i > 0) {
+        // Header: conference name (skip first page, only if conference is specified)
+        if (i > 0 && conference && conference.trim().length > 0) {
           doc.text(
-            conference || "NeurIPS 2025",
+            conference,
             0,
             25,
             { width: PAGE_WIDTH, align: "center" }
@@ -1365,7 +1418,7 @@ export async function generatePaperPdf(
   latexSource?: string,
   chartImages: ChartImage[] = []
 ): Promise<Buffer> {
-  const confLabel = conference || "NeurIPS 2025";
+  const confLabel = conference || "";
 
   // Primary path: LaTeX → sections → PDF
   if (latexSource && latexSource.trim().length > 100) {

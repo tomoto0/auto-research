@@ -237,12 +237,15 @@ export async function searchPubMed(query: string, maxResults = 10): Promise<Lite
       return m ? m[1].trim() : "";
     };
     const pmid = get("PMID");
+    if (!pmid) continue; // Skip entries with empty PMID
     const title = get("ArticleTitle");
+    if (!title || title.trim().length < 5) continue; // Skip entries with missing/short titles
     const abs = get("AbstractText");
     const year = get("Year");
     const journal = get("Title");
     const authorNames = Array.from(article.matchAll(/<LastName>([^<]+)<\/LastName>\s*<ForeName>([^<]+)<\/ForeName>/g))
       .map(m => `${m[2]} ${m[1]}`).join(", ");
+    if (!authorNames) continue; // Skip entries with no authors
     const doiMatch = article.match(/<ArticleId IdType="doi">([^<]+)<\/ArticleId>/);
     const doi = doiMatch ? doiMatch[1] : "";
 
@@ -369,13 +372,23 @@ export async function unifiedSearch(query: string, options: SearchOptions = {}):
     }
   }
 
-  return Array.from(seen.values())
+  const sorted = Array.from(seen.values())
     .sort((a, b) => {
       if (b.score !== a.score) return b.score - a.score;
       if ((b.paper.citationCount || 0) !== (a.paper.citationCount || 0)) {
         return (b.paper.citationCount || 0) - (a.paper.citationCount || 0);
       }
       return (b.paper.year || 0) - (a.paper.year || 0);
-    })
-    .map((entry) => entry.paper);
+    });
+
+  // Apply minimum relevance threshold: require at least 1 query term match
+  // (score of ~4.0 from title match or ~1.5 from abstract match).
+  // Papers below threshold are likely irrelevant noise from broad keyword matches.
+  const MIN_RELEVANCE_SCORE = 2.0;
+  const filtered = sorted.filter(entry => entry.score >= MIN_RELEVANCE_SCORE);
+
+  // If aggressive filtering removed too many papers, fall back to top results by score
+  const finalResults = filtered.length >= 5 ? filtered : sorted.slice(0, Math.max(sorted.length, 5));
+
+  return finalResults.map((entry) => entry.paper);
 }
