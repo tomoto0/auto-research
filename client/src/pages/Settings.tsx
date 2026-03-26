@@ -17,7 +17,7 @@ export default function Settings() {
     onError: (err: any) => toast.error(err.message),
   });
 
-  const [targetConference, setTargetConference] = useState("NeurIPS");
+  const [targetConference, setTargetConference] = useState("General");
   const [experimentMode, setExperimentMode] = useState("simulated");
   const [maxRetries, setMaxRetries] = useState(2);
   const [timeoutMinutes, setTimeoutMinutes] = useState(120);

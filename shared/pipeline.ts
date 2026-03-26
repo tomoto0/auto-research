@@ -88,21 +88,45 @@ export interface RunConfig {
 }
 
 export const CONFERENCE_TEMPLATES = [
+  // General / multi-disciplinary
+  { id: "general", name: "General", description: "General academic paper format (auto-detects field)", documentClass: "article" },
+  // ML / AI
   { id: "neurips", name: "NeurIPS", description: "Neural Information Processing Systems", documentClass: "neurips" },
   { id: "icml", name: "ICML", description: "International Conference on Machine Learning", documentClass: "icml" },
   { id: "iclr", name: "ICLR", description: "International Conference on Learning Representations", documentClass: "iclr" },
-  { id: "acl", name: "ACL", description: "Association for Computational Linguistics", documentClass: "acl" },
   { id: "aaai", name: "AAAI", description: "Association for the Advancement of AI", documentClass: "aaai" },
-  { id: "cvpr", name: "CVPR", description: "Computer Vision and Pattern Recognition", documentClass: "cvpr" },
+  // NLP
+  { id: "acl", name: "ACL", description: "Association for Computational Linguistics", documentClass: "acl" },
   { id: "emnlp", name: "EMNLP", description: "Empirical Methods in NLP", documentClass: "emnlp" },
-  { id: "general", name: "General", description: "General academic paper format", documentClass: "article" },
+  // Computer Vision
+  { id: "cvpr", name: "CVPR", description: "Computer Vision and Pattern Recognition", documentClass: "cvpr" },
+  // Economics / Social Sciences
+  { id: "aer", name: "AER", description: "American Economic Review", documentClass: "article" },
+  { id: "qje", name: "QJE", description: "Quarterly Journal of Economics", documentClass: "article" },
+  { id: "econometrica", name: "Econometrica", description: "Econometrica (Econometric Society)", documentClass: "article" },
+  // Medicine / Public Health
+  { id: "lancet", name: "Lancet", description: "The Lancet", documentClass: "article" },
+  { id: "nejm", name: "NEJM", description: "New England Journal of Medicine", documentClass: "article" },
+  { id: "bmj", name: "BMJ", description: "British Medical Journal", documentClass: "article" },
+  // Natural Sciences
+  { id: "nature", name: "Nature", description: "Nature", documentClass: "article" },
+  { id: "science", name: "Science", description: "Science (AAAS)", documentClass: "article" },
+  { id: "pnas", name: "PNAS", description: "Proceedings of the National Academy of Sciences", documentClass: "article" },
+  // Social Sciences / Psychology
+  { id: "apa", name: "APA", description: "APA style (Psychology / Social Sciences)", documentClass: "article" },
+  // Education
+  { id: "aera", name: "AERA", description: "American Educational Research Association", documentClass: "article" },
+  // Environmental / Earth Sciences
+  { id: "agu", name: "AGU", description: "American Geophysical Union", documentClass: "article" },
+  // Engineering
+  { id: "ieee", name: "IEEE", description: "IEEE Transactions", documentClass: "article" },
 ] as const;
 
 export type ConferenceTemplateId = typeof CONFERENCE_TEMPLATES[number]["id"];
 
 export const DEFAULT_RUN_CONFIG: RunConfig = {
   autoApprove: true,
-  targetConference: "NeurIPS",
+  targetConference: "General",
   experimentMode: "simulated",
   maxRetries: 2,
   timeoutMinutes: 120,

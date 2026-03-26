@@ -146,6 +146,74 @@ function stripCodeBlockMarkers(text: string): string {
   return cleaned.trim();
 }
 
+// ─── Helper: Infer research field from topic, data, and literature ───
+function inferResearchField(ctx: PipelineContext): string {
+  const topic = (ctx.topic || "").toLowerCase();
+  const paperText = ctx.papers.map(p => `${p.title || ""} ${p.abstract || ""}`).join(" ").toLowerCase();
+  const allCols = ctx.datasetFiles.flatMap(ds => ds.columnNames || []).join(" ").toLowerCase();
+  const combined = `${topic} ${paperText} ${allCols}`;
+
+  // Check target conference first — if user explicitly chose a venue, use its field
+  const conf = (ctx.config.targetConference || "").toLowerCase();
+  if (["neurips", "icml", "iclr", "aaai"].includes(conf)) return "machine learning / artificial intelligence";
+  if (["acl", "emnlp"].includes(conf)) return "natural language processing / computational linguistics";
+  if (["cvpr"].includes(conf)) return "computer vision";
+  if (["aer", "qje", "econometrica"].includes(conf)) return "economics";
+  if (["lancet", "nejm", "bmj"].includes(conf)) return "medicine / public health";
+  if (["nature", "science", "pnas"].includes(conf)) return "natural sciences";
+  if (["apa"].includes(conf)) return "psychology / social sciences";
+  if (["aera"].includes(conf)) return "education";
+  if (["agu"].includes(conf)) return "environmental / earth sciences";
+  if (["ieee"].includes(conf)) return "engineering";
+
+  // Auto-detect from topic + literature + data columns
+  if (/(neural network|deep learning|transformer|bert|gpt|llm|reinforcement learning|generative model|diffusion model|foundation model)/i.test(combined))
+    return "machine learning / artificial intelligence";
+  if (/(gdp|inflation|monetary|fiscal|trade|macroeconom|microeconom|labor market|wage|price elast|econometr)/i.test(combined))
+    return "economics";
+  if (/(patient|clinical|disease|treatment|drug|mortality|hospital|epidemiol|symptom|diagnosis|biomarker|cohort study)/i.test(combined))
+    return "medicine / public health";
+  if (/(gene|protein|genome|molecular|cell|phylogen|evolution|enzyme|dna|rna|bioinform)/i.test(combined))
+    return "biology / life sciences";
+  if (/(climate|environment|pollution|ecosystem|biodiversity|carbon|emission|sustainability|conservation)/i.test(combined))
+    return "environmental science";
+  if (/(education|student|teacher|curriculum|school|pedagog|learning outcome|academic achievement)/i.test(combined))
+    return "education";
+  if (/(psychology|cognitive|behavior|mental health|personality|perception|emotion|well.?being|anxiety|depression)/i.test(combined))
+    return "psychology";
+  if (/(sociology|social|inequality|demograph|migration|community|ethnograph|gender|race|class)/i.test(combined))
+    return "sociology / social sciences";
+  if (/(politic|election|democracy|governance|policy|legislation|voting|parliament|geopolit)/i.test(combined))
+    return "political science";
+  if (/(law|legal|regulation|constitutional|judicial|court|statute|compliance)/i.test(combined))
+    return "law / legal studies";
+  if (/(material|polymer|semiconductor|nanotechnology|crystal|alloy|composite|thin film)/i.test(combined))
+    return "materials science / engineering";
+  if (/(robot|autonomous|sensor|signal processing|circuit|wireless|antenna|vlsi)/i.test(combined))
+    return "electrical engineering / robotics";
+  if (/(urban|city|transport|infrastructure|land use|real estate|housing|spatial)/i.test(combined))
+    return "urban studies / planning";
+  if (/(agriculture|crop|soil|livestock|food security|farm|irrigation)/i.test(combined))
+    return "agricultural science";
+  if (/(marketing|consumer|brand|advertis|purchase|customer|retail|e-commerce)/i.test(combined))
+    return "marketing / business";
+  if (/(finance|stock|portfolio|asset pricing|risk|banking|credit|investment)/i.test(combined))
+    return "finance";
+  if (/(management|organisation|leadership|hrm|strategic|supply chain|operation)/i.test(combined))
+    return "management / organisational studies";
+
+  return "interdisciplinary research";
+}
+
+function buildFieldContext(ctx: PipelineContext): string {
+  const field = inferResearchField(ctx);
+  const conf = ctx.config.targetConference || "General";
+  if (conf === "General") {
+    return `The research field is ${field}. Adapt your writing style, methodology norms, citation practices, and terminology to match conventions in ${field}.`;
+  }
+  return `The target venue is ${conf} in the field of ${field}. Follow the conventions and expectations of this venue.`;
+}
+
 // ─── Helper: Build dataset description for LLM prompts ───
 function buildDatasetDescription(datasets: DatasetInfo[]): string {
   if (datasets.length === 0) return "";
@@ -818,7 +886,7 @@ RULES:
    - If only descriptive_statistics and correlation are allowed → title: "Descriptive and Correlational Analysis of ..."
    - If linear_regression is allowed → title: "Regression Analysis of ..."
    - Do NOT title it "Causal Inference Framework" or "Deep Learning Approach" if those methods are blocked.
-3. DO NOT propose transformers, GNNs, deep learning, NLP, causal inference (DiD, IV, RDD, propensity score), or any advanced method unless it explicitly appears in the ALLOWED list above.
+3. DO NOT propose any advanced method (e.g., deep learning, causal inference, structural equation modelling, or domain-specific techniques) unless it explicitly appears in the ALLOWED list above.
 4. BE HONEST: if the data only supports basic statistics, design a rigorous descriptive/correlational study. A well-executed simple analysis is better than an unexecutable sophisticated one.
 5. The methodology section should describe:
    a. What specific statistical tests or models will be applied to which columns
@@ -1153,9 +1221,11 @@ async function stage15_tableGeneration(ctx: PipelineContext): Promise<string> {
 }
 
 async function stage16_outlineGeneration(ctx: PipelineContext): Promise<string> {
+  const fieldCtx = buildFieldContext(ctx);
+  const venueLabel = ctx.config.targetConference === "General" ? `a leading venue in ${inferResearchField(ctx)}` : ctx.config.targetConference;
   const result = await callLLM(
-    `You are an academic paper outline generator targeting ${ctx.config.targetConference} conference.`,
-    `Research topic: "${ctx.topic}"\nMethod contract:\n${formatMethodContract(ctx.methodContract)}\nExecution diagnostics:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}\n\nGenerate a detailed paper outline for ${ctx.config.targetConference}:\n1. Title (compelling, specific)\n2. Abstract outline (key points)\n3. Introduction structure (motivation, contributions)\n4. Related Work organization\n5. Methodology section structure\n6. Experiments section structure\n7. Results and Discussion\n8. Conclusion and Future Work\n9. Appendix items\n\nInclude explicit subsection placeholders for:\n- Construct operationalisation and falsification logic\n- Evidence-backed findings only\n- Execution limitations and unmet data prerequisites`
+    `You are an academic paper outline generator. ${fieldCtx}`,
+    `Research topic: "${ctx.topic}"\nMethod contract:\n${formatMethodContract(ctx.methodContract)}\nExecution diagnostics:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}\n\nGenerate a detailed paper outline suitable for ${venueLabel}:\n1. Title (compelling, specific)\n2. Abstract outline (key points)\n3. Introduction structure (motivation, contributions)\n4. Related Work / Literature Review organization\n5. Methodology section structure\n6. Experiments / Empirical Analysis section structure\n7. Results and Discussion\n8. Conclusion and Future Work\n9. Appendix items\n\nInclude explicit subsection placeholders for:\n- Construct operationalisation and falsification logic\n- Evidence-backed findings only\n- Execution limitations and unmet data prerequisites\n\nAdapt the section naming and structure to conventions in ${inferResearchField(ctx)}.`
   );
   ctx.outline = result;
   return result;
@@ -1174,7 +1244,7 @@ async function stage17_abstractWriting(ctx: PipelineContext): Promise<string> {
   const executionBlock = `\n\nExecution diagnostics:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}`;
 
   const result = await callLLM(
-    `You are an expert academic writer. Write a compelling abstract for a ${ctx.config.targetConference} paper. Use British English spelling and academic tone.\n\nCRITICAL ANTI-HALLUCINATION RULES:\n1. You may ONLY cite specific numbers that appear in the "Actual computed analytical metrics" section below.\n2. If no actual analytical metrics are provided, write the abstract WITHOUT specific numerical claims. Use qualitative descriptions instead (e.g., "we analyse", "we propose", "our framework examines").\n3. Do NOT invent percentages, p-values, effect sizes, or any other statistics.\n4. If methodology mentions techniques not executed, frame them as planned/future work, never as completed evidence.\n\nMETHODOLOGY ALIGNMENT RULES:\n5. The abstract MUST NOT mention unexecuted methods (NLP, causal inference, deep learning, graph neural networks, etc.) as contributions or methods of this paper.\n6. Only describe the methods that were actually executed (see execution diagnostics below).\n7. Unexecuted methods may be mentioned ONLY in a single sentence about future directions at the end of the abstract.\n8. The abstract should accurately reflect what the paper delivers, not what it aspires to deliver.`,
+    `You are an expert academic writer. ${buildFieldContext(ctx)} Write a compelling abstract. Use British English spelling and academic tone.\n\nCRITICAL ANTI-HALLUCINATION RULES:\n1. You may ONLY cite specific numbers that appear in the "Actual computed analytical metrics" section below.\n2. If no actual analytical metrics are provided, write the abstract WITHOUT specific numerical claims. Use qualitative descriptions instead (e.g., "we analyse", "we propose", "our framework examines").\n3. Do NOT invent percentages, p-values, effect sizes, or any other statistics.\n4. If methodology mentions techniques not executed, frame them as planned/future work, never as completed evidence.\n\nMETHODOLOGY ALIGNMENT RULES:\n5. The abstract MUST NOT mention unexecuted methods as contributions or methods of this paper.\n6. Only describe the methods that were actually executed (see execution diagnostics below).\n7. Unexecuted methods may be mentioned ONLY in a single sentence about future directions at the end of the abstract.\n8. The abstract should accurately reflect what the paper delivers, not what it aspires to deliver.`,
     `Research topic: "${ctx.topic}"\nOutline:\n${ctx.outline}\nStatistical analysis:\n${ctx.statisticalAnalysis?.substring(0, 2000)}${metricsForAbstract}${methodIntegrityBlock}${contractBlock}${executionBlock}\n\nWrite a 150-250 word abstract that:\n1. States the problem clearly\n2. Describes the approach and methodology\n3. ${hasRealMetrics ? "Highlights key results using ONLY the actual computed analytical metrics above" : "Describes the analytical framework and expected contributions WITHOUT fabricating numerical results"}\n4. States the main contribution\n\n${!hasRealMetrics ? "IMPORTANT: No empirical analytical metrics are available. Write the abstract focusing on the research question, methodology, and analytical framework. Do NOT include any specific numbers, percentages, or statistical values." : ""}`
   );
   ctx.abstract = result;
@@ -1221,13 +1291,13 @@ async function stage18_bodyWriting(ctx: PipelineContext): Promise<string> {
 
   let antiHallucinationRules = "";
   if (hasRealMetrics || hasRealCharts || hasRealTables) {
-    antiHallucinationRules = `\n\nANTI-HALLUCINATION RULES:\n1. In the Results section, you may ONLY report numerical values from the "Data Analysis Results" section above.\n2. When discussing figures and tables, describe what they show based on the provided descriptions.\n3. Do NOT invent additional statistics, p-values, or effect sizes beyond what is provided.\n4. If you need to discuss implications, use hedged language ("suggests", "indicates", "is consistent with").\n5. Any methodology component not confirmed by the method integrity note must be framed as unexecuted/future work.\n\nMETHODOLOGY-RESULTS ALIGNMENT (CRITICAL):\n- Actually executed methods: ${executedMethodsList}\n- Blocked/unexecuted methods: ${blockedMethodsList}\n- The Methodology section MUST describe ONLY the analyses that were actually executed.\n- Methods listed as blocked/unexecuted MUST appear ONLY in a "Limitations and Future Work" subsection, clearly marked as "not yet implemented" or "planned for future work".\n- The paper title MUST NOT reference unexecuted methods as if they are the paper's contribution.\n- Do NOT describe NLP, causal inference, deep learning, or any blocked method as something "we apply" or "we implement" — only as "future work".`;
+    antiHallucinationRules = `\n\nANTI-HALLUCINATION RULES:\n1. In the Results section, you may ONLY report numerical values from the "Data Analysis Results" section above.\n2. When discussing figures and tables, describe what they show based on the provided descriptions.\n3. Do NOT invent additional statistics, p-values, or effect sizes beyond what is provided.\n4. If you need to discuss implications, use hedged language ("suggests", "indicates", "is consistent with").\n5. Any methodology component not confirmed by the method integrity note must be framed as unexecuted/future work.\n\nMETHODOLOGY-RESULTS ALIGNMENT (CRITICAL):\n- Actually executed methods: ${executedMethodsList}\n- Blocked/unexecuted methods: ${blockedMethodsList}\n- The Methodology section MUST describe ONLY the analyses that were actually executed.\n- Methods listed as blocked/unexecuted MUST appear ONLY in a "Limitations and Future Work" subsection, clearly marked as "not yet implemented" or "planned for future work".\n- The paper title MUST NOT reference unexecuted methods as if they are the paper's contribution.\n- Do NOT describe any blocked or unexecuted method as something "we apply" or "we implement" — only as "future work".`;
   } else {
     antiHallucinationRules = `\n\nCRITICAL ANTI-HALLUCINATION RULES:\n1. No empirical results were computed from the data. The Results section MUST acknowledge this.\n2. Do NOT fabricate any numerical results, p-values, correlations, means, standard deviations, or effect sizes.\n3. Instead, describe the analytical FRAMEWORK: what analyses WOULD be performed, what metrics WOULD be computed, and what patterns WOULD be examined.\n4. Use conditional language throughout: "would", "is expected to", "the analysis aims to".\n5. The Experiments section should describe the planned methodology, not fabricated outcomes.\n6. If the abstract contains no specific numbers, the body should not introduce any either.\n\nMETHODOLOGY-RESULTS ALIGNMENT (CRITICAL):\n- Blocked/unexecuted methods: ${blockedMethodsList}\n- The paper MUST NOT claim to have executed any analysis. Frame the entire paper as a methodological protocol or research proposal.\n- Do NOT use past tense ("we found", "we demonstrated") for unexecuted analyses. Use future/conditional tense only.`;
   }
 
   const firstPass = await callLLM(
-    `You are an expert academic writer producing a full research paper for ${ctx.config.targetConference}. Use British English spelling. You MUST cite the provided references throughout the paper body using numbered citations like [1], [2], [3], etc. Every claim derived from prior work must include a citation. The Related Work section must cite at least 8 references. The Introduction should cite at least 3-5 references to motivate the research.${antiHallucinationRules}
+    `You are an expert academic writer. ${buildFieldContext(ctx)} Use British English spelling. You MUST cite the provided references throughout the paper body using numbered citations like [1], [2], [3], etc. Every claim derived from prior work must include a citation. The Related Work / Literature Review section must cite at least 8 references. The Introduction should cite at least 3-5 references to motivate the research.${antiHallucinationRules}
 
 WRITING QUALITY REQUIREMENTS:
 - Each section must be substantive (at least 3-4 paragraphs for major sections like Methodology, Results).
@@ -1328,11 +1398,11 @@ async function stage20_latexCompilation(ctx: PipelineContext): Promise<string> {
   }
 
   const result = await callLLM(
-    `You are a LaTeX expert. Convert the paper to a professional academic LaTeX document styled for ${ctx.config.targetConference}.
+    `You are a LaTeX expert. ${buildFieldContext(ctx)} Convert the paper to a professional academic LaTeX document.
 
 CRITICAL DOCUMENT CLASS RULE:
 - You MUST use \\documentclass[11pt,a4paper]{article} as the document class.
-- Do NOT use any conference-specific class files (e.g., neurips_2024, neurips_2025, icml2025, iclr2025_conference). These .cls files are NOT available and will cause compilation errors.
+- Do NOT use any conference-specific or journal-specific class files (e.g., neurips_2024, icml2025, elsarticle, apa7). These .cls files are NOT available and will cause compilation errors.
 - Instead, replicate the conference style using ONLY standard LaTeX packages (geometry, titling, amsmath, graphicx, booktabs, hyperref, tabularx, adjustbox, etc.).
 
 CRITICAL ANTI-HALLUCINATION RULE:
@@ -1352,7 +1422,7 @@ CRITICAL REFERENCE INTEGRITY RULE:
 Output ONLY the raw LaTeX source code. Do NOT wrap it in markdown code blocks (no \`\`\`latex or \`\`\`). Start directly with \\documentclass and end with \\end{document}.
 You MUST include \\usepackage{graphicx}, \\usepackage{float}, \\usepackage{tabularx}, and \\usepackage{adjustbox} in the preamble.
 ALL content — including figures, tables, and equations — MUST fit within A4 portrait page margins (\\textwidth). Never allow any element to overflow the page width.`,
-    `Convert this paper to complete LaTeX format styled for ${ctx.config.targetConference}:\n\nAbstract: ${ctx.abstract}\n\nBody (with numbered citations [1], [2], etc.):\n${ctx.paperBody || ""}\n\nTables:\n${ctx.tables.join("\n")}\n\nBibTeX references:\n${ctx.references || ""}${figureInstructions}${dataManifest}\n\nGenerate complete LaTeX source with:\n1. \\documentclass[11pt,a4paper]{article} — NEVER use conference-specific .cls files\n2. \\usepackage[a4paper, margin=2.5cm]{geometry} for A4 layout\n3. \\usepackage{graphicx}, \\usepackage{float}, \\usepackage{amsmath}, \\usepackage{amssymb}, \\usepackage{booktabs}, \\usepackage{hyperref}, \\usepackage{tabularx}, \\usepackage{adjustbox} in preamble\n4. Professional title formatting with \\title{}, \\author{}, \\date{}, \\maketitle\n5. All sections with proper \\cite{} commands for every reference\n6. Actual \\includegraphics commands for each data analysis figure (using the exact keys provided above)\n7. Table environments using booktabs (\\toprule, \\midrule, \\bottomrule)\n8. \\begin{thebibliography}{99} section at the end with all cited \\bibitem entries\n\n## TABLE WIDTH CONSTRAINTS (ABSOLUTELY CRITICAL — MUST FOLLOW):\nEvery table MUST fit within the A4 page width (\\textwidth = approximately 16cm with 2.5cm margins).\nFor tables with 4 or more columns, you MUST use one of these approaches:\n\nApproach 1 (PREFERRED): Wrap the entire tabular in \\resizebox:\n\\begin{table}[H]\n  \\centering\n  \\caption{...}\n  \\resizebox{\\textwidth}{!}{%\n    \\begin{tabular}{lcccc}\n      ...\n    \\end{tabular}%\n  }\n\\end{table}\n\nApproach 2: Use tabularx with X columns that auto-wrap:\n\\begin{table}[H]\n  \\centering\n  \\caption{...}\n  \\begin{tabularx}{\\textwidth}{lXXXX}\n    ...\n  \\end{tabularx}\n\\end{table}\n\nApproach 3: Use adjustbox:\n\\begin{table}[H]\n  \\centering\n  \\caption{...}\n  \\begin{adjustbox}{max width=\\textwidth}\n    \\begin{tabular}{lcccc}\n      ...\n    \\end{tabular}\n  \\end{adjustbox}\n\\end{table}\n\nRULES:\n- NEVER use plain \\begin{tabular} without \\resizebox, tabularx, or adjustbox for tables with 4+ columns\n- NEVER use sisetup or S column type (these cause width issues)\n- Use SHORT column headers (abbreviate long names, e.g., \"Female Mgmt Ratio\" instead of \"Female Management Ratio\")\n- Use \\footnotesize inside tables if needed for extra space\n- For correlation matrices and wide data tables, ALWAYS use \\resizebox{\\textwidth}{!}{...}\n\nA4 PAGE WIDTH CONSTRAINTS (OTHER ELEMENTS):\n- ALL figures MUST use width=\\textwidth or smaller (e.g., width=0.85\\textwidth) in \\includegraphics. Never use absolute widths.\n- ALL equations MUST fit within \\textwidth. For long equations, use split, multline, or aligned environments.\n- Never use \\hspace or manual spacing that pushes content beyond margins.\n\nIMPORTANT:\n- Convert all [1], [2] style citations to \\cite{key} commands with corresponding \\bibitem entries.\n- Output ONLY raw LaTeX code. Start with \\documentclass[11pt,a4paper]{article} and end with \\end{document}.\n- Each figure MUST use \\includegraphics with the exact key provided (e.g., figure_1, figure_2). Do NOT use placeholder paths or URLs.\n- Do NOT use \\usepackage{natbib} — use \\begin{thebibliography} with \\bibitem instead.\n- Do NOT use \\usepackage{siunitx} or S column type — they cause width overflow issues.`,
+    `Convert this paper to complete LaTeX format for a professional academic publication in ${inferResearchField(ctx)}:\n\nAbstract: ${ctx.abstract}\n\nBody (with numbered citations [1], [2], etc.):\n${ctx.paperBody || ""}\n\nTables:\n${ctx.tables.join("\n")}\n\nBibTeX references:\n${ctx.references || ""}${figureInstructions}${dataManifest}\n\nGenerate complete LaTeX source with:\n1. \\documentclass[11pt,a4paper]{article} — NEVER use conference-specific .cls files\n2. \\usepackage[a4paper, margin=2.5cm]{geometry} for A4 layout\n3. \\usepackage{graphicx}, \\usepackage{float}, \\usepackage{amsmath}, \\usepackage{amssymb}, \\usepackage{booktabs}, \\usepackage{hyperref}, \\usepackage{tabularx}, \\usepackage{adjustbox} in preamble\n4. Professional title formatting with \\title{}, \\author{}, \\date{}, \\maketitle\n5. All sections with proper \\cite{} commands for every reference\n6. Actual \\includegraphics commands for each data analysis figure (using the exact keys provided above)\n7. Table environments using booktabs (\\toprule, \\midrule, \\bottomrule)\n8. \\begin{thebibliography}{99} section at the end with all cited \\bibitem entries\n\n## TABLE WIDTH CONSTRAINTS (ABSOLUTELY CRITICAL — MUST FOLLOW):\nEvery table MUST fit within the A4 page width (\\textwidth = approximately 16cm with 2.5cm margins).\nFor tables with 4 or more columns, you MUST use one of these approaches:\n\nApproach 1 (PREFERRED): Wrap the entire tabular in \\resizebox:\n\\begin{table}[H]\n  \\centering\n  \\caption{...}\n  \\resizebox{\\textwidth}{!}{%\n    \\begin{tabular}{lcccc}\n      ...\n    \\end{tabular}%\n  }\n\\end{table}\n\nApproach 2: Use tabularx with X columns that auto-wrap:\n\\begin{table}[H]\n  \\centering\n  \\caption{...}\n  \\begin{tabularx}{\\textwidth}{lXXXX}\n    ...\n  \\end{tabularx}\n\\end{table}\n\nApproach 3: Use adjustbox:\n\\begin{table}[H]\n  \\centering\n  \\caption{...}\n  \\begin{adjustbox}{max width=\\textwidth}\n    \\begin{tabular}{lcccc}\n      ...\n    \\end{tabular}\n  \\end{adjustbox}\n\\end{table}\n\nRULES:\n- NEVER use plain \\begin{tabular} without \\resizebox, tabularx, or adjustbox for tables with 4+ columns\n- NEVER use sisetup or S column type (these cause width issues)\n- Use SHORT column headers (abbreviate long names, e.g., \"Female Mgmt Ratio\" instead of \"Female Management Ratio\")\n- Use \\footnotesize inside tables if needed for extra space\n- For correlation matrices and wide data tables, ALWAYS use \\resizebox{\\textwidth}{!}{...}\n\nA4 PAGE WIDTH CONSTRAINTS (OTHER ELEMENTS):\n- ALL figures MUST use width=\\textwidth or smaller (e.g., width=0.85\\textwidth) in \\includegraphics. Never use absolute widths.\n- ALL equations MUST fit within \\textwidth. For long equations, use split, multline, or aligned environments.\n- Never use \\hspace or manual spacing that pushes content beyond margins.\n\nIMPORTANT:\n- Convert all [1], [2] style citations to \\cite{key} commands with corresponding \\bibitem entries.\n- Output ONLY raw LaTeX code. Start with \\documentclass[11pt,a4paper]{article} and end with \\end{document}.\n- Each figure MUST use \\includegraphics with the exact key provided (e.g., figure_1, figure_2). Do NOT use placeholder paths or URLs.\n- Do NOT use \\usepackage{natbib} — use \\begin{thebibliography} with \\bibitem instead.\n- Do NOT use \\usepackage{siunitx} or S column type — they cause width overflow issues.`,
     32768
   );
   // Strip any code block markers the LLM might have added
@@ -1423,7 +1493,7 @@ ALL content — including figures, tables, and equations — MUST fit within A4 
 
 async function stage21_peerReview(ctx: PipelineContext): Promise<string> {
   const result = await callLLM(
-    "You are a panel of 3 expert peer reviewers for a top-tier ML/AI conference. Provide detailed, constructive reviews.",
+    `You are a panel of 3 expert peer reviewers for a leading academic venue in ${inferResearchField(ctx)}. ${buildFieldContext(ctx)} Provide detailed, constructive reviews.`,
     `Review this paper submission:\n\nTitle: ${ctx.topic}\nAbstract: ${ctx.abstract}\nBody: ${ctx.paperBody || ""}\n\nProvide 3 independent reviews, each containing:\n1. Summary (2-3 sentences)\n2. Strengths (3-5 points)\n3. Weaknesses (3-5 points)\n4. Questions for authors\n5. Minor issues\n6. Overall score (1-10)\n7. Confidence (1-5)\n8. Recommendation (Accept/Weak Accept/Borderline/Weak Reject/Reject)\n\nAlso provide a meta-review summarizing the consensus.`
   );
   ctx.reviewReport = result;

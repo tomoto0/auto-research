@@ -109,7 +109,7 @@ export default function Home() {
   const [, setLocation] = useLocation();
   const [topic, setTopic] = useState("");
   const [autoApprove, setAutoApprove] = useState(true);
-  const [targetConference, setTargetConference] = useState("NeurIPS");
+  const [targetConference, setTargetConference] = useState("General");
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<ChunkedUploadProgress | null>(null);
