@@ -8,6 +8,7 @@ import * as db from "./db";
 import { unifiedSearch } from "./literature";
 import { executePipeline, approveStage, rejectStage, isAwaitingApproval, type EventEmitter } from "./pipeline-engine";
 import { PIPELINE_STAGES, DEFAULT_RUN_CONFIG, CONFERENCE_TEMPLATES, type PipelineEvent, type RunConfig } from "../shared/pipeline";
+import { uploadChunkProcedure, assembleChunksProcedure, registerFileProcedure } from "./upload-procedures";
 
 // ─── In-memory event store for SSE/polling ───
 const runEventBuffers = new Map<string, PipelineEvent[]>();
@@ -252,6 +253,10 @@ const datasetRouter = router({
     .query(async ({ input }) => {
       return db.getExperimentResultsForRun(input.runId);
     }),
+
+  uploadChunk: uploadChunkProcedure,
+  assembleChunks: assembleChunksProcedure,
+  registerFile: registerFileProcedure,
 });
 
 export const appRouter = router({

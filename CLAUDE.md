@@ -28,7 +28,7 @@ pnpm exec vitest run server/pipeline.test.ts -t "test name here"
 Full-stack TypeScript app: React 19 + Vite frontend, Express + tRPC 11 backend, TiDB/MySQL via Drizzle ORM, S3 object storage via Manus Forge proxy.
 
 ### Request Flow
-- Browser uses tRPC client (`client/src/lib/trpc.ts`) with React Query + superjson
+- Browser uses tRPC client (`client/src/lib/trpc.ts`) with React Query + superjson; standalone async functions (e.g. chunked upload) use the vanilla client (`client/src/lib/trpc-client.ts`)
 - Server mounts tRPC at `/api/trpc` (`server/_core/index.ts`)
 - Context (`server/_core/context.ts`) injects authenticated user from Manus OAuth session
 - Most procedures are `publicProcedure`; `protectedProcedure` exists for auth-required endpoints
@@ -48,9 +48,10 @@ Full-stack TypeScript app: React 19 + Vite frontend, Express + tRPC 11 backend, 
 - `server/storage.ts` — S3 proxy via Forge API (`BUILT_IN_FORGE_API_URL`)
 - `server/_core/llm.ts` — centralized LLM calls via Forge chat completions (currently uses `gemini-2.5-flash`)
 - `server/dta-parser.ts` — Stata .dta file parser
+- `server/upload-procedures.ts` — tRPC mutations for chunked dataset upload (uploadChunk, assembleChunks, registerFile)
 
 ### Dataset Upload Flow
-Chunked S3 proxy upload: client splits files into 8MB chunks → `/api/upload/s3chunk` → `/api/upload/assemble` → `/api/upload/register`. Legacy single-request upload at `/api/upload/dataset` for files < 10MB. Max dataset size: 250MB. Supported types: CSV, Excel (.xlsx/.xls), Stata (.dta), JSON, TSV.
+Chunked S3 proxy upload via tRPC mutations on the `datasets` router: client splits files into 8MB chunks, base64-encodes each → `datasets.uploadChunk` → `datasets.assembleChunks` (multi-chunk only) → `datasets.registerFile`. Upload procedures live in `server/upload-procedures.ts`; the client-side logic is in `client/src/lib/chunked-upload.ts` using the vanilla tRPC client. `longRunningProcedure` (defined in `server/_core/trpc.ts`) sets a 10-minute request timeout for assemble/register. User ID is derived from `ctx.user` (automatic auth). Max dataset size: 250MB. Supported types: CSV, Excel (.xlsx/.xls), Stata (.dta), JSON, TSV.
 
 ### Frontend
 - React 19 SPA with wouter routing, Tailwind CSS 4, shadcn/ui components

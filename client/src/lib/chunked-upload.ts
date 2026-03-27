@@ -1,15 +1,18 @@
 /**
  * Chunked S3 Proxy Upload utility.
- * Splits large files into 8MB chunks and uploads each chunk to S3 via the server proxy.
- * Each chunk goes through /api/upload/s3chunk (server forwards to S3 with backend key).
- * After all chunks are uploaded, calls /api/upload/register to save metadata + parse preview.
+ * Splits large files into 8MB chunks and uploads each chunk to S3 via tRPC mutations.
+ * Each chunk is base64-encoded and sent via datasets.uploadChunk mutation.
+ * After all chunks are uploaded, calls datasets.registerFile to save metadata + parse preview.
  *
  * This approach:
  * - Bypasses reverse proxy body size limits (each chunk < 10MB)
  * - Avoids server memory accumulation (each chunk is processed independently)
  * - Survives server restarts (chunks already in S3 are safe)
  * - Provides real upload progress tracking
+ * - Uses tRPC for automatic auth via ctx.user (no manual userId headers)
  */
+
+import { trpcVanilla } from "./trpc-client";
 
 const CHUNK_SIZE = 8 * 1024 * 1024; // 8MB per chunk
 const MAX_RETRIES = 3;
@@ -48,23 +51,34 @@ function generateId(len = 12): string {
   return result;
 }
 
-async function fetchWithRetry(
-  url: string,
-  options: RequestInit,
+/** Convert a Blob to a base64 string (chunked to avoid call stack limits) */
+async function blobToBase64(blob: Blob): Promise<string> {
+  const buffer = await blob.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  // Process in 32KB chunks to avoid call stack size limits with btoa
+  const BTOA_CHUNK = 32768;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += BTOA_CHUNK) {
+    const slice = bytes.subarray(i, Math.min(i + BTOA_CHUNK, bytes.length));
+    binary += String.fromCharCode.apply(null, Array.from(slice));
+  }
+  return btoa(binary);
+}
+
+/** Retry wrapper for tRPC mutations. Retries on server errors, not on client errors. */
+async function mutateWithRetry<T>(
+  fn: () => Promise<T>,
   retries = MAX_RETRIES
-): Promise<Response> {
+): Promise<T> {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const resp = await fetch(url, options);
-      if (resp.ok || resp.status === 413 || resp.status === 400) {
-        return resp;
+      return await fn();
+    } catch (err: any) {
+      // Don't retry on client-side errors (BAD_REQUEST, PAYLOAD_TOO_LARGE, etc.)
+      const code = err?.data?.code;
+      if (code === "BAD_REQUEST" || code === "PAYLOAD_TOO_LARGE" || code === "UNPROCESSABLE_CONTENT") {
+        throw err;
       }
-      if (attempt < retries && resp.status >= 500) {
-        await new Promise(r => setTimeout(r, RETRY_DELAY * (attempt + 1)));
-        continue;
-      }
-      return resp;
-    } catch (err) {
       if (attempt < retries) {
         await new Promise(r => setTimeout(r, RETRY_DELAY * (attempt + 1)));
         continue;
@@ -103,7 +117,7 @@ export async function chunkedUpload(
     percent: 0,
   });
 
-  // Phase 2: Upload chunks sequentially via server proxy to S3
+  // Phase 2: Upload chunks sequentially via tRPC to S3
   let bytesUploaded = 0;
   let lastChunkUrl = "";
 
@@ -126,25 +140,20 @@ export async function chunkedUpload(
       ? `datasets/${uploadId}/${file.name}`
       : `datasets/${uploadId}/parts/${String(i).padStart(4, "0")}`;
 
-    const chunkResp = await fetchWithRetry("/api/upload/s3chunk", {
-      method: "POST",
-      headers: {
-        "x-file-key": fileKey,
-        "x-file-mime": fileMime,
-      },
-      body: chunk,
-    });
+    const chunkBase64 = await blobToBase64(chunk);
 
-    if (!chunkResp.ok) {
-      const err = await chunkResp.json().catch(() => ({ error: "Chunk upload failed" }));
+    try {
+      const chunkResult = await mutateWithRetry(() =>
+        trpcVanilla.datasets.uploadChunk.mutate({ fileKey, fileMime, chunkBase64 })
+      );
+      lastChunkUrl = chunkResult.url;
+    } catch (err: any) {
       return {
         success: false,
-        error: err.error || `Chunk ${i + 1}/${totalChunks} failed (${chunkResp.status})`,
+        error: err?.message || `Chunk ${i + 1}/${totalChunks} failed`,
       };
     }
 
-    const chunkResult = await chunkResp.json();
-    lastChunkUrl = chunkResult.url;
     bytesUploaded = end;
   }
 
@@ -168,55 +177,46 @@ export async function chunkedUpload(
     finalFileKey = `datasets/${uploadId}/${file.name}`;
   } else {
     // Multi-chunk - call server to assemble parts
-    const assembleResp = await fetchWithRetry("/api/upload/assemble", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        uploadId,
-        fileName: file.name,
-        fileMime,
-        totalChunks,
-        totalSize: totalBytes,
-      }),
-    });
-
-    if (!assembleResp.ok) {
-      const err = await assembleResp.json().catch(() => ({ error: "Assembly failed" }));
-      return { success: false, error: err.error || `Assembly failed (${assembleResp.status})` };
+    try {
+      const assembleResult = await mutateWithRetry(() =>
+        trpcVanilla.datasets.assembleChunks.mutate({
+          uploadId,
+          fileName: file.name,
+          fileMime,
+          totalChunks,
+          totalSize: totalBytes,
+        })
+      );
+      finalFileUrl = assembleResult.fileUrl;
+      finalFileKey = assembleResult.fileKey;
+    } catch (err: any) {
+      return { success: false, error: err?.message || "Assembly failed" };
     }
-
-    const assembleResult = await assembleResp.json();
-    finalFileUrl = assembleResult.fileUrl;
-    finalFileKey = assembleResult.fileKey;
   }
 
   // Phase 4: Register with server (small JSON, no file data)
-  const registerResp = await fetchWithRetry("/api/upload/register", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      fileName: file.name,
-      fileMime,
-      fileKey: finalFileKey,
-      fileUrl: finalFileUrl,
-      sizeBytes: totalBytes,
-    }),
-  });
+  try {
+    const result = await mutateWithRetry(() =>
+      trpcVanilla.datasets.registerFile.mutate({
+        fileName: file.name,
+        fileMime,
+        fileKey: finalFileKey,
+        fileUrl: finalFileUrl,
+        sizeBytes: totalBytes,
+      })
+    );
 
-  if (!registerResp.ok) {
-    const err = await registerResp.json().catch(() => ({ error: "Registration failed" }));
-    return { success: false, error: err.error || `Registration failed (${registerResp.status})` };
+    onProgress?.({
+      phase: "completing",
+      chunkIndex: totalChunks,
+      totalChunks,
+      bytesUploaded: totalBytes,
+      totalBytes,
+      percent: 100,
+    });
+
+    return { success: true, file: result.file };
+  } catch (err: any) {
+    return { success: false, error: err?.message || "Registration failed" };
   }
-
-  onProgress?.({
-    phase: "completing",
-    chunkIndex: totalChunks,
-    totalChunks,
-    bytesUploaded: totalBytes,
-    totalBytes,
-    percent: 100,
-  });
-
-  const result = await registerResp.json();
-  return { success: true, file: result.file };
 }
