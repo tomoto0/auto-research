@@ -40,7 +40,14 @@ export interface ExperimentOutput {
   stderr: string;
   exitCode: number;
   executionTimeMs: number;
-  charts: { name: string; url: string; description: string }[];
+  charts: {
+    name: string;
+    url: string;
+    description: string;
+    fileKey?: string;
+    mimeType?: string;
+    format?: "png" | "svg";
+  }[];
   tables: { name: string; url: string; data: string; description: string }[];
   metrics: Record<string, number | string>;
 }
@@ -1394,6 +1401,7 @@ export async function executePythonExperiment(
         const isSvg = pngBuffer.length > 0 && pngBuffer[0] === 0x3C; // '<' character
         const contentType = isSvg ? "image/svg+xml" : "image/png";
         const ext = isSvg ? "svg" : "png";
+        const format: "png" | "svg" = isSvg ? "svg" : "png";
 
         const chartKey = `experiments/${runId}/${chartDef.name}.${ext}`;
         const { url } = await storagePut(chartKey, pngBuffer, contentType);
@@ -1401,6 +1409,9 @@ export async function executePythonExperiment(
           name: chartDef.name,
           url,
           description: chartDef.description || chartDef.name,
+          fileKey: chartKey,
+          mimeType: contentType,
+          format,
         });
         logs.push(`[CHART] Generated: ${chartDef.name} (${(pngBuffer.length / 1024).toFixed(1)} KiB, ${ext})`);
       } catch (chartErr: any) {

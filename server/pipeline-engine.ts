@@ -1055,14 +1055,17 @@ async function stage11_experimentExecution(ctx: PipelineContext): Promise<string
 
       // Upload charts as artifacts
       for (const chart of output.charts) {
+        const inferredFormat = chart.format || (chart.mimeType === "image/svg+xml" || chart.url.includes(".svg") ? "svg" : "png");
+        const inferredMime = chart.mimeType || (inferredFormat === "svg" ? "image/svg+xml" : "image/png");
+        const inferredKey = chart.fileKey || `experiments/${ctx.runId}/${chart.name}.${inferredFormat}`;
         await db.insertArtifact({
           runId: ctx.runId,
           stageNumber: 11,
           artifactType: "experiment_chart",
-          fileName: `${chart.name}.png`,
+          fileName: `${chart.name}.${inferredFormat}`,
           fileUrl: chart.url,
-          fileKey: `experiments/${ctx.runId}/${chart.name}.png`,
-          mimeType: "image/png",
+          fileKey: inferredKey,
+          mimeType: inferredMime,
         });
       }
 
@@ -1645,16 +1648,34 @@ async function stage23_finalCompilation(ctx: PipelineContext): Promise<string> {
     // Refresh chart URLs (S3 pre-signed URLs may have expired since stage 11)
     const charts = ctx.experimentOutput?.charts || [];
     for (const chart of charts) {
-      try {
-        const refreshed = await storageGet(`experiments/${ctx.runId}/${chart.name}.png`);
-        chart.url = refreshed.url;
-      } catch {
+      const candidates = [
+        chart.fileKey,
+        `experiments/${ctx.runId}/${chart.name}.png`,
+        `experiments/${ctx.runId}/${chart.name}.svg`,
+      ].filter((key): key is string => !!key);
+      let refreshedUrl: string | null = null;
+      let refreshedKey: string | null = null;
+      for (const key of candidates) {
         try {
-          const refreshed = await storageGet(`experiments/${ctx.runId}/${chart.name}.svg`);
-          chart.url = refreshed.url;
+          const refreshed = await storageGet(key);
+          refreshedUrl = refreshed.url;
+          refreshedKey = key;
+          break;
         } catch {
-          console.warn(`[Pipeline] Could not refresh URL for chart ${chart.name}, using original`);
+          // try next candidate
         }
+      }
+      if (refreshedUrl && refreshedKey) {
+        chart.url = refreshedUrl;
+        chart.fileKey = refreshedKey;
+        if (!chart.format) {
+          chart.format = refreshedKey.endsWith(".svg") ? "svg" : "png";
+        }
+        if (!chart.mimeType) {
+          chart.mimeType = chart.format === "svg" ? "image/svg+xml" : "image/png";
+        }
+      } else {
+        console.warn(`[Pipeline] Could not refresh URL for chart ${chart.name}, using original`);
       }
     }
     if (charts.length > 0) {
@@ -1675,18 +1696,21 @@ async function stage23_finalCompilation(ctx: PipelineContext): Promise<string> {
       try {
         // Check if this chart already exists as an artifact (avoid duplicates)
         const existingArtifacts = await db.getArtifactsForRun(ctx.runId);
+        const inferredFormat = chart.format || (chart.mimeType === "image/svg+xml" || chart.url.includes(".svg") ? "svg" : "png");
+        const inferredMime = chart.mimeType || (inferredFormat === "svg" ? "image/svg+xml" : "image/png");
+        const inferredKey = chart.fileKey || `experiments/${ctx.runId}/${chart.name}.${inferredFormat}`;
         const alreadyExists = existingArtifacts.some(
-          a => a.artifactType === "experiment_chart" && a.fileUrl === chart.url
+          a => a.artifactType === "experiment_chart" && (a.fileUrl === chart.url || a.fileKey === inferredKey)
         );
         if (!alreadyExists) {
           await db.insertArtifact({
             runId: ctx.runId,
             stageNumber: 23,
             artifactType: "experiment_chart",
-            fileName: `${chart.name}.png`,
+            fileName: `${chart.name}.${inferredFormat}`,
             fileUrl: chart.url,
-            fileKey: `experiments/${ctx.runId}/${chart.name}.png`,
-            mimeType: "image/png",
+            fileKey: inferredKey,
+            mimeType: inferredMime,
           });
           console.log(`[Pipeline] Chart artifact saved: ${chart.name}`);
         }

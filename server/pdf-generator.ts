@@ -66,6 +66,27 @@ async function fetchImageBuffer(url: string): Promise<Buffer | null> {
   });
 }
 
+function isSvgBuffer(buffer: Buffer): boolean {
+  if (!buffer || buffer.length === 0) return false;
+  const sample = buffer.subarray(0, Math.min(buffer.length, 4096)).toString("utf-8").trimStart();
+  return sample.startsWith("<svg") || sample.startsWith("<?xml") || sample.includes("<svg");
+}
+
+async function ensurePdfEmbeddableImage(buffer: Buffer): Promise<Buffer | null> {
+  if (!isSvgBuffer(buffer)) return buffer;
+  try {
+    const sharp = (await import("sharp")).default;
+    const pngBuffer = await sharp(buffer).png().toBuffer();
+    if (pngBuffer[0] === 0x89 && pngBuffer[1] === 0x50) {
+      return pngBuffer;
+    }
+    return null;
+  } catch (err: any) {
+    console.warn(`[PDF] SVG chart conversion failed: ${err?.message || "unknown error"}`);
+    return null;
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /*  LaTeX / Markdown parser → structured content                       */
 /* ------------------------------------------------------------------ */
@@ -1099,7 +1120,8 @@ async function renderSectionsToPdf(
 
             if (section.imageUrl) {
               try {
-                const imgBuffer = await fetchImageBuffer(section.imageUrl);
+                const rawBuffer = await fetchImageBuffer(section.imageUrl);
+                const imgBuffer = rawBuffer ? await ensurePdfEmbeddableImage(rawBuffer) : null;
                 if (imgBuffer && imgBuffer.length > 100) {
                   // Calculate image dimensions to fit within content width
                   const maxImgWidth = CONTENT_WIDTH * 0.85;
