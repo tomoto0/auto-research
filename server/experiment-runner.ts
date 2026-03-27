@@ -537,10 +537,11 @@ async function renderChartToPng(
 }
 
 /**
- * Generate a simple SVG chart as a fallback when chartjs-node-canvas is unavailable.
+ * Generate an SVG chart as a fallback when chartjs-node-canvas is unavailable.
+ * Supports bar/line/scatter/bubble/pie to avoid malformed placeholder visuals.
  * Returns SVG as buffer.
  */
-function generateSvgFallbackChart(
+export function generateSvgFallbackChart(
   chartConfigJs: string,
   width: number,
   height: number
@@ -559,86 +560,324 @@ function generateSvgFallbackChart(
   // Transliterate non-ASCII labels to prevent □□□□ garbling
   config = transliterateChartConfigSync(config);
 
-  const title = config.options?.plugins?.title?.text || config.type || "Chart";
-  const datasets = config.data?.datasets || [];
-  const labels = config.data?.labels || [];
+  const rawTitle = config.options?.plugins?.title?.text;
+  const title = Array.isArray(rawTitle)
+    ? String(rawTitle.join(" "))
+    : String(rawTitle || config.type || "Chart");
+  const chartType = String(config.type || "bar").toLowerCase();
+  const datasets: any[] = Array.isArray(config.data?.datasets) ? config.data.datasets : [];
+  const labels: string[] = Array.isArray(config.data?.labels)
+    ? config.data.labels.map((l: any) => String(l))
+    : [];
 
-  // Generate a simple SVG bar/line chart
-  const padding = 60;
-  const chartWidth = width - padding * 2;
-  const chartHeight = height - padding * 2;
+  const asNumber = (value: unknown): number | null => {
+    const n = typeof value === "number" ? value : Number(value);
+    return Number.isFinite(n) ? n : null;
+  };
+  const clamp = (value: number, min: number, max: number): number => Math.min(max, Math.max(min, value));
+  const normaliseRange = (min: number, max: number): [number, number] => {
+    if (!Number.isFinite(min) || !Number.isFinite(max)) return [0, 1];
+    if (min === max) {
+      const delta = Math.abs(min) > 1 ? Math.abs(min) * 0.1 : 1;
+      return [min - delta, max + delta];
+    }
+    return [min, max];
+  };
+  const shortLabel = (value: unknown, maxLen = 22): string => {
+    const text = String(value ?? "");
+    return text.length > maxLen ? `${text.slice(0, maxLen - 3)}...` : text;
+  };
+  const readRecord = (value: unknown): Record<string, unknown> =>
+    value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  const readArray = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
+  type PieSlice = { value: number; label: string; color: string };
+  type BubblePoint = { x: number; y: number; r: number };
+  type LinePoint = { x: number; y: number };
+  type RenderSeries<T> = { label: string; color: string; points: T[] };
 
   // Use a font stack that includes CJK fonts available on most systems
   const fontFamily = `'Noto Sans JP', 'Noto Sans CJK JP', 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Yu Gothic', 'Meiryo', 'MS Gothic', 'IPAGothic', 'IPAPGothic', 'TakaoPGothic', 'DejaVu Sans', 'Liberation Sans', sans-serif`;
 
-  let svgContent = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`;
-  // Embed a style block with the CJK font stack for all text elements
-  svgContent += `<style>text { font-family: ${fontFamily}; }</style>`;
-  svgContent += `<rect width="${width}" height="${height}" fill="white"/>`;
+  const padding = { top: 56, right: 36, bottom: 84, left: 64 };
+  const plotX = padding.left;
+  const plotY = padding.top;
+  const plotWidth = Math.max(160, width - padding.left - padding.right);
+  const plotHeight = Math.max(140, height - padding.top - padding.bottom);
+  const plotBottomY = plotY + plotHeight;
 
-  // Title
-  svgContent += `<text x="${width / 2}" y="30" text-anchor="middle" font-size="16" font-weight="bold" fill="#333" font-family="${fontFamily}">${escapeXml(title)}</text>`;
-
-  // Draw axes
-  svgContent += `<line x1="${padding}" y1="${height - padding}" x2="${width - padding}" y2="${height - padding}" stroke="#999" stroke-width="1"/>`;
-  svgContent += `<line x1="${padding}" y1="${padding}" x2="${padding}" y2="${height - padding}" stroke="#999" stroke-width="1"/>`;
-
-  const colors = [
-    "rgba(78,121,167,0.7)", "rgba(242,142,43,0.7)", "rgba(225,87,89,0.7)",
-    "rgba(118,183,178,0.7)", "rgba(89,161,79,0.7)", "rgba(176,122,161,0.7)",
+  const palette = [
+    "#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc949",
+    "#af7aa1", "#ff9da7", "#9c755f", "#bab0ab",
   ];
+  const pickColor = (dsIndex: number, colorValue: unknown): string => {
+    if (typeof colorValue === "string" && colorValue.trim().length > 0) return colorValue;
+    if (Array.isArray(colorValue) && typeof colorValue[0] === "string") return colorValue[0];
+    return palette[dsIndex % palette.length];
+  };
+  const mapLinear = (value: number, min: number, max: number, outMin: number, outMax: number): number => {
+    const [safeMin, safeMax] = normaliseRange(min, max);
+    const t = (value - safeMin) / (safeMax - safeMin);
+    return outMin + t * (outMax - outMin);
+  };
+  const formatTick = (value: number): string => {
+    const abs = Math.abs(value);
+    if (abs >= 1000) return value.toFixed(0);
+    if (abs >= 100) return value.toFixed(1);
+    if (abs >= 10) return value.toFixed(2);
+    return value.toFixed(3);
+  };
 
-  if (datasets.length > 0 && labels.length > 0) {
-    const allValues = datasets.flatMap((ds: any) => (ds.data || []).map((v: any) => typeof v === "object" ? v.y : Number(v)));
-    const maxVal = Math.max(...allValues.filter((v: number) => !isNaN(v)), 1);
-    const minVal = Math.min(...allValues.filter((v: number) => !isNaN(v)), 0);
-    const range = maxVal - minVal || 1;
+  const parts: string[] = [];
+  parts.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`);
+  parts.push(`<style>text { font-family: ${fontFamily}; }</style>`);
+  parts.push(`<rect width="${width}" height="${height}" fill="#ffffff"/>`);
+  parts.push(`<text x="${width / 2}" y="30" text-anchor="middle" font-size="16" font-weight="bold" fill="#333">${escapeXml(shortLabel(title, 90))}</text>`);
 
-    const barGroupWidth = chartWidth / labels.length;
-    const barWidth = barGroupWidth / (datasets.length + 1);
+  const drawNoDataMessage = (message: string) => {
+    parts.push(`<text x="${width / 2}" y="${plotY + plotHeight / 2}" text-anchor="middle" font-size="12" fill="#999">${escapeXml(message)}</text>`);
+  };
+  const drawCartesianFrame = (minY: number, maxY: number) => {
+    const [safeMinY, safeMaxY] = normaliseRange(minY, maxY);
+    for (let i = 0; i <= 4; i++) {
+      const t = i / 4;
+      const y = plotY + t * plotHeight;
+      const value = safeMaxY - t * (safeMaxY - safeMinY);
+      parts.push(`<line x1="${plotX}" y1="${y}" x2="${plotX + plotWidth}" y2="${y}" stroke="#ececec" stroke-width="1"/>`);
+      parts.push(`<text x="${plotX - 8}" y="${y + 3}" text-anchor="end" font-size="9" fill="#666">${escapeXml(formatTick(value))}</text>`);
+    }
+    parts.push(`<line x1="${plotX}" y1="${plotBottomY}" x2="${plotX + plotWidth}" y2="${plotBottomY}" stroke="#999" stroke-width="1"/>`);
+    parts.push(`<line x1="${plotX}" y1="${plotY}" x2="${plotX}" y2="${plotBottomY}" stroke="#999" stroke-width="1"/>`);
+    return [safeMinY, safeMaxY] as [number, number];
+  };
 
-    datasets.forEach((ds: any, dsIdx: number) => {
-      const color = ds.backgroundColor || colors[dsIdx % colors.length];
-      const data = ds.data || [];
+  if (chartType === "pie" || chartType === "doughnut") {
+    const pieDataset = readRecord(datasets[0]);
+    const rawValues = readArray(pieDataset.data);
+    const backgroundColors = readArray(pieDataset.backgroundColor);
+    const slices: PieSlice[] = rawValues
+      .map((value: unknown, i: number) => {
+        const n = asNumber(value);
+        return {
+          value: n === null ? 0 : Math.max(0, n),
+          label: shortLabel(labels[i] || `Category ${i + 1}`, 22),
+          color: pickColor(i, backgroundColors.length > 0 ? backgroundColors[i] : pieDataset.backgroundColor),
+        };
+      })
+      .filter((s: PieSlice) => s.value > 0);
 
-      data.forEach((val: any, i: number) => {
-        const numVal = typeof val === "object" ? val.y : Number(val);
-        if (isNaN(numVal)) return;
+    const total = slices.reduce((sum: number, s: PieSlice) => sum + s.value, 0);
+    if (total <= 0) {
+      drawNoDataMessage("No positive values available for pie chart.");
+    } else {
+      const cx = plotX + plotWidth * 0.35;
+      const cy = plotY + plotHeight * 0.5;
+      const r = Math.max(40, Math.min(plotWidth * 0.24, plotHeight * 0.42));
+      let startAngle = -Math.PI / 2;
+      for (const slice of slices) {
+        const sweep = (slice.value / total) * Math.PI * 2;
+        const endAngle = startAngle + sweep;
+        const sx = cx + r * Math.cos(startAngle);
+        const sy = cy + r * Math.sin(startAngle);
+        const ex = cx + r * Math.cos(endAngle);
+        const ey = cy + r * Math.sin(endAngle);
+        const largeArc = sweep > Math.PI ? 1 : 0;
+        parts.push(
+          `<path d="M ${cx} ${cy} L ${sx} ${sy} A ${r} ${r} 0 ${largeArc} 1 ${ex} ${ey} Z" fill="${slice.color}" stroke="#ffffff" stroke-width="1"/>`
+        );
+        startAngle = endAngle;
+      }
+      if (chartType === "doughnut") {
+        parts.push(`<circle cx="${cx}" cy="${cy}" r="${r * 0.52}" fill="#ffffff"/>`);
+      }
+      const legendX = plotX + plotWidth * 0.62;
+      let legendY = plotY + 12;
+      const maxLegend = Math.min(slices.length, 10);
+      for (let i = 0; i < maxLegend; i++) {
+        const slice = slices[i];
+        const pct = ((slice.value / total) * 100).toFixed(1);
+        parts.push(`<rect x="${legendX}" y="${legendY - 8}" width="10" height="10" fill="${slice.color}"/>`);
+        parts.push(`<text x="${legendX + 14}" y="${legendY}" font-size="10" fill="#666">${escapeXml(`${slice.label} (${pct}%)`)}</text>`);
+        legendY += 16;
+      }
+      if (slices.length > maxLegend) {
+        parts.push(`<text x="${legendX}" y="${legendY}" font-size="10" fill="#888">${escapeXml(`... ${slices.length - maxLegend} more categories`)}</text>`);
+      }
+    }
+  } else if (chartType === "scatter" || chartType === "bubble") {
+    const allSeries: RenderSeries<BubblePoint>[] = datasets.map((ds, dsIndex) => {
+      const dsRecord = readRecord(ds);
+      const dsData = readArray(dsRecord.data);
+      const points = dsData
+        .map((raw: any, idx: number) => {
+          if (raw && typeof raw === "object") {
+            const pointRecord = raw as Record<string, unknown>;
+            const x = asNumber(pointRecord.x);
+            const y = asNumber(pointRecord.y);
+            const r = asNumber(pointRecord.r);
+            if (x === null || y === null) return null;
+            return { x, y, r: r === null ? 4 : clamp(r, 2, 16) };
+          }
+          const y = asNumber(raw);
+          if (y === null) return null;
+          return { x: idx, y, r: 4 };
+        })
+        .filter((p): p is { x: number; y: number; r: number } => p !== null);
+      return {
+        label: shortLabel(dsRecord.label || `Dataset ${dsIndex + 1}`, 28),
+        color: pickColor(dsIndex, dsRecord.backgroundColor || dsRecord.borderColor),
+        points,
+      };
+    }).filter((s: RenderSeries<BubblePoint>) => s.points.length > 0);
 
-        const barHeight = ((numVal - minVal) / range) * chartHeight;
-        const x = padding + i * barGroupWidth + dsIdx * barWidth + barWidth * 0.1;
-        const y = height - padding - barHeight;
+    if (allSeries.length === 0) {
+      drawNoDataMessage("No numeric points available for scatter chart.");
+    } else {
+      const xs = allSeries.flatMap((s) => s.points.map((p: BubblePoint) => p.x));
+      const ys = allSeries.flatMap((s) => s.points.map((p: BubblePoint) => p.y));
+      const [minX, maxX] = normaliseRange(Math.min(...xs), Math.max(...xs));
+      const [minY, maxY] = drawCartesianFrame(Math.min(...ys), Math.max(...ys));
+      const mapX = (x: number): number => mapLinear(x, minX, maxX, plotX, plotX + plotWidth);
+      const mapY = (y: number): number => mapLinear(y, minY, maxY, plotBottomY, plotY);
 
-        if (config.type === "scatter") {
-          const cx = padding + ((typeof val === "object" ? val.x : i) / (labels.length || data.length)) * chartWidth;
-          const cy = height - padding - barHeight;
-          svgContent += `<circle cx="${cx}" cy="${cy}" r="3" fill="${color}"/>`;
-        } else {
-          svgContent += `<rect x="${x}" y="${y}" width="${barWidth * 0.8}" height="${barHeight}" fill="${color}" rx="2"/>`;
+      for (const series of allSeries) {
+        for (const point of series.points) {
+          const cx = mapX(point.x);
+          const cy = mapY(point.y);
+          const radius = chartType === "bubble" ? point.r : 3;
+          if (!Number.isFinite(cx) || !Number.isFinite(cy)) continue;
+          parts.push(`<circle cx="${cx}" cy="${cy}" r="${radius}" fill="${series.color}" fill-opacity="0.65" stroke="${series.color}" stroke-width="1"/>`);
         }
-      });
-    });
+      }
+    }
+  } else if (chartType === "line") {
+    const series: RenderSeries<LinePoint>[] = datasets.map((ds, dsIndex) => {
+      const dsRecord = readRecord(ds);
+      const dsData = readArray(dsRecord.data);
+      const points = dsData
+        .map((raw: any, idx: number) => {
+          const value = raw && typeof raw === "object" ? asNumber(raw.y) : asNumber(raw);
+          if (value === null) return null;
+          return { x: idx, y: value };
+        })
+        .filter((p): p is LinePoint => p !== null);
+      return {
+        label: shortLabel(dsRecord.label || `Dataset ${dsIndex + 1}`, 28),
+        color: pickColor(dsIndex, dsRecord.borderColor || dsRecord.backgroundColor),
+        points,
+      };
+    }).filter((s: RenderSeries<LinePoint>) => s.points.length > 1);
 
-    // X-axis labels
-    labels.forEach((label: string, i: number) => {
-      const x = padding + i * barGroupWidth + barGroupWidth / 2;
-      const displayLabel = String(label).length > 10 ? String(label).slice(0, 10) + "..." : String(label);
-      svgContent += `<text x="${x}" y="${height - padding + 20}" text-anchor="middle" font-size="9" fill="#666" font-family="${fontFamily}">${escapeXml(displayLabel)}</text>`;
-    });
+    if (series.length === 0) {
+      drawNoDataMessage("No line-series values available.");
+    } else {
+      const yValues = series.flatMap((s) => s.points.map((p: LinePoint) => p.y));
+      const maxPoints = Math.max(...series.map((s) => s.points.length));
+      const [minY, maxY] = drawCartesianFrame(Math.min(...yValues), Math.max(...yValues));
+      const [minX, maxX] = normaliseRange(0, Math.max(1, maxPoints - 1));
+      const mapX = (x: number): number => mapLinear(x, minX, maxX, plotX, plotX + plotWidth);
+      const mapY = (y: number): number => mapLinear(y, minY, maxY, plotBottomY, plotY);
+
+      for (const s of series) {
+        const path = s.points
+          .map((p: LinePoint, i: number) => `${i === 0 ? "M" : "L"} ${mapX(p.x).toFixed(2)} ${mapY(p.y).toFixed(2)}`)
+          .join(" ");
+        parts.push(`<path d="${path}" fill="none" stroke="${s.color}" stroke-width="2"/>`);
+        for (const p of s.points) {
+          parts.push(`<circle cx="${mapX(p.x)}" cy="${mapY(p.y)}" r="2.3" fill="${s.color}"/>`);
+        }
+      }
+
+      const tickStep = Math.max(1, Math.ceil(Math.max(labels.length, maxPoints) / 10));
+      for (let i = 0; i < Math.max(labels.length, maxPoints); i += tickStep) {
+        const x = mapX(i);
+        const text = shortLabel(labels[i] || `${i + 1}`, 10);
+        parts.push(`<text x="${x}" y="${plotBottomY + 16}" text-anchor="middle" font-size="9" fill="#666">${escapeXml(text)}</text>`);
+      }
+    }
+  } else {
+    // Default to bar-like rendering for bar and unknown cartesian types.
+    const categoryCount = labels.length > 0
+      ? labels.length
+      : Math.max(0, ...datasets.map((d) => Array.isArray(d?.data) ? d.data.length : 0));
+
+    if (categoryCount === 0 || datasets.length === 0) {
+      drawNoDataMessage("No categorical values available for bar chart.");
+    } else {
+      const valueRanges = datasets.map((ds) => Array.from({ length: categoryCount }, (_, i) => {
+        const raw = Array.isArray(ds?.data) ? ds.data[i] : null;
+        if (Array.isArray(raw) && raw.length >= 2) {
+          const low = asNumber(raw[0]);
+          const high = asNumber(raw[1]);
+          if (low !== null && high !== null) {
+            return { low: Math.min(low, high), high: Math.max(low, high) };
+          }
+          return null;
+        }
+        const n = raw && typeof raw === "object" ? asNumber(raw.y) : asNumber(raw);
+        if (n === null) return null;
+        return { low: Math.min(0, n), high: Math.max(0, n) };
+      }));
+      const allLow = valueRanges.flatMap((row) => row.map((v) => v?.low).filter((v): v is number => typeof v === "number"));
+      const allHigh = valueRanges.flatMap((row) => row.map((v) => v?.high).filter((v): v is number => typeof v === "number"));
+      if (allLow.length === 0 || allHigh.length === 0) {
+        drawNoDataMessage("No numeric bar values available.");
+      } else {
+        const [minY, maxY] = drawCartesianFrame(Math.min(...allLow), Math.max(...allHigh));
+        const mapY = (y: number): number => mapLinear(y, minY, maxY, plotBottomY, plotY);
+        const baselineY = mapY(0);
+        parts.push(`<line x1="${plotX}" y1="${baselineY}" x2="${plotX + plotWidth}" y2="${baselineY}" stroke="#c9c9c9" stroke-width="1"/>`);
+
+        const groupWidth = plotWidth / categoryCount;
+        const innerPadding = Math.min(10, groupWidth * 0.18);
+        const barSlotWidth = Math.max(groupWidth - innerPadding, 2);
+        const barWidth = Math.max(1.6, Math.min(36, barSlotWidth / Math.max(datasets.length, 1)));
+
+        for (let i = 0; i < categoryCount; i++) {
+          const xStart = plotX + i * groupWidth + innerPadding / 2;
+          for (let dsIndex = 0; dsIndex < datasets.length; dsIndex++) {
+            const range = valueRanges[dsIndex][i];
+            if (!range) continue;
+            const yTop = mapY(range.high);
+            const yBottom = mapY(range.low);
+            const rectY = Math.min(yTop, yBottom);
+            const rectH = Math.max(1, Math.abs(yBottom - yTop));
+            const x = xStart + dsIndex * barWidth;
+            const fill = pickColor(dsIndex, datasets[dsIndex]?.backgroundColor);
+            parts.push(`<rect x="${x}" y="${rectY}" width="${Math.max(1, barWidth - 1)}" height="${rectH}" fill="${fill}" fill-opacity="0.78" rx="1.4"/>`);
+          }
+        }
+
+        const tickStep = Math.max(1, Math.ceil(categoryCount / 12));
+        for (let i = 0; i < categoryCount; i += tickStep) {
+          const x = plotX + i * groupWidth + groupWidth / 2;
+          const text = shortLabel(labels[i] || `${i + 1}`, 10);
+          parts.push(`<text x="${x}" y="${plotBottomY + 16}" text-anchor="middle" font-size="9" fill="#666">${escapeXml(text)}</text>`);
+        }
+      }
+    }
   }
 
-  // Legend
-  datasets.forEach((ds: any, i: number) => {
-    const color = ds.backgroundColor || colors[i % colors.length];
-    const label = ds.label || `Dataset ${i + 1}`;
-    const lx = padding + i * 120;
-    svgContent += `<rect x="${lx}" y="${height - 15}" width="10" height="10" fill="${color}"/>`;
-    svgContent += `<text x="${lx + 14}" y="${height - 6}" font-size="10" fill="#666" font-family="${fontFamily}">${escapeXml(label)}</text>`;
-  });
+  // Shared legend for non-pie charts
+  if (chartType !== "pie" && chartType !== "doughnut" && datasets.length > 0) {
+    const legendCount = Math.min(datasets.length, 6);
+    const legendColumns = Math.min(3, legendCount);
+    const legendRows = Math.ceil(legendCount / legendColumns);
+    const legendStartY = height - 18 - (legendRows - 1) * 14;
+    const legendCellW = plotWidth / legendColumns;
+    for (let i = 0; i < legendCount; i++) {
+      const row = Math.floor(i / legendColumns);
+      const col = i % legendColumns;
+      const x = plotX + col * legendCellW;
+      const y = legendStartY + row * 14;
+      const color = pickColor(i, datasets[i]?.backgroundColor || datasets[i]?.borderColor);
+      const label = shortLabel(datasets[i]?.label || `Dataset ${i + 1}`, 24);
+      parts.push(`<rect x="${x}" y="${y - 8}" width="9" height="9" fill="${color}"/>`);
+      parts.push(`<text x="${x + 13}" y="${y}" font-size="9.5" fill="#666">${escapeXml(label)}</text>`);
+    }
+  }
 
-  svgContent += `</svg>`;
-
-  return Buffer.from(svgContent, "utf-8");
+  parts.push(`</svg>`);
+  return Buffer.from(parts.join(""), "utf-8");
 }
 
 /* ------------------------------------------------------------------ */
