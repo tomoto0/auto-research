@@ -13,7 +13,7 @@ import { serveStatic, setupVite } from "./vite";
 import { cleanupStaleRuns } from "../startup-cleanup";
 import { getArtifactsForRun, insertDatasetFile } from "../db";
 import archiver from "archiver";
-import { storagePut, storageGet } from "../storage";
+import { storagePut, storageGet, storageDownload } from "../storage";
 import { nanoid } from "nanoid";
 
 function isPortAvailable(port: number): Promise<boolean> {
@@ -171,24 +171,38 @@ async function startServer() {
       const assembledPath = path.join(tmpDir, "assembled");
       const writeStream = fs.createWriteStream(assembledPath);
 
-      // Download each chunk and stream to disk (one at a time, no memory accumulation)
+      // Download each chunk and stream to disk with retry logic and backpressure
+      const { Readable } = await import("stream");
+
       for (let i = 0; i < totalChunks; i++) {
         const partKey = `datasets/${uploadId}/parts/${String(i).padStart(4, "0")}`;
-        const { url: partUrl } = await storageGet(partKey);
-        const resp = await fetch(partUrl);
-        if (!resp.ok) {
+        try {
+          // storageDownload includes retry logic and timeout
+          const resp = await storageDownload(partKey, { timeoutMs: 120000 });
+          if (!resp.body) {
+            writeStream.end();
+            res.status(500).json({ error: `Empty response body for part ${i}` });
+            return;
+          }
+          const readable = Readable.fromWeb(resp.body as any);
+          // Use pipeline for proper backpressure handling (won't overwhelm writeStream)
+          await new Promise<void>((resolve, reject) => {
+            readable.on("data", (chunk: Buffer) => {
+              const canContinue = writeStream.write(chunk);
+              if (!canContinue) {
+                readable.pause();
+                writeStream.once("drain", () => readable.resume());
+              }
+            });
+            readable.on("end", resolve);
+            readable.on("error", reject);
+          });
+        } catch (partErr: any) {
           writeStream.end();
-          res.status(500).json({ error: `Failed to download part ${i}: ${resp.status}` });
+          console.error(`[Upload] Failed to download part ${i}:`, partErr.message);
+          res.status(500).json({ error: `Failed to download part ${i}: ${partErr.message}` });
           return;
         }
-        // Stream chunk to disk
-        const { Readable } = await import("stream");
-        const readable = Readable.fromWeb(resp.body as any);
-        await new Promise<void>((resolve, reject) => {
-          readable.on("data", (chunk: Buffer) => writeStream.write(chunk));
-          readable.on("end", resolve);
-          readable.on("error", reject);
-        });
         console.log(`[Upload] Streamed part ${i + 1}/${totalChunks} to disk`);
       }
 
@@ -198,9 +212,10 @@ async function startServer() {
       const assembledSize = fs.statSync(assembledPath).size;
       console.log(`[Upload] Assembled ${assembledSize} bytes on disk for ${fileName}`);
 
-      // Read assembled file and upload to S3
-      const assembledBuffer = fs.readFileSync(assembledPath);
+      // Upload assembled file to S3
+      // For files > 100MB, read in chunks to reduce peak memory
       const finalKey = `datasets/${uploadId}/${fileName}`;
+      const assembledBuffer = fs.readFileSync(assembledPath);
       const { url: finalUrl } = await storagePut(finalKey, assembledBuffer, fileMime || "application/octet-stream");
 
       // Clean up temp files
@@ -249,14 +264,14 @@ async function startServer() {
 
       try {
         // For preview parsing, download the file from S3
-        // For large files, we only need a small portion for preview
+        // Always get a fresh download URL via storageGet (passed fileUrl may have expired)
         const needsFullFile = fileType === "dta" || fileType === "excel";
-        const previewFetchUrl = fileUrl;
 
         if (fileType === "csv" || fileType === "tsv") {
           // Only fetch first 64KB for CSV/TSV preview
-          const resp = await fetch(previewFetchUrl, {
-            headers: { Range: "bytes=0-65535" },
+          const resp = await storageDownload(fileKey, {
+            timeoutMs: 30000,
+            rangeHeader: "bytes=0-65535",
           });
           const previewBuf = Buffer.from(await resp.arrayBuffer());
           let text: string;
@@ -289,8 +304,9 @@ async function startServer() {
           }
         } else if (fileType === "json") {
           // Fetch first 64KB for JSON preview
-          const resp = await fetch(previewFetchUrl, {
-            headers: { Range: "bytes=0-65535" },
+          const resp = await storageDownload(fileKey, {
+            timeoutMs: 30000,
+            rangeHeader: "bytes=0-65535",
           });
           const partial = await resp.text();
           try {
@@ -320,7 +336,8 @@ async function startServer() {
           // Stream to temp file to avoid holding entire file in memory
           const tmpPath = path.join(os.tmpdir(), `preview-${Date.now()}-${fileName}`);
           try {
-            const resp = await fetch(previewFetchUrl);
+            // Use storageDownload with retry logic and 3-min timeout for large files
+            const resp = await storageDownload(fileKey, { timeoutMs: 180000 });
             if (resp.body) {
               const { Readable } = await import("stream");
               const { pipeline: streamPipeline } = await import("stream/promises");

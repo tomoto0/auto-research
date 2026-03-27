@@ -5,6 +5,9 @@ import { ENV } from './_core/env';
 
 type StorageConfig = { baseUrl: string; apiKey: string };
 
+const MAX_RETRIES = 3;
+const RETRY_BASE_DELAY = 1000; // 1s, 2s, 4s exponential backoff
+
 function getStorageConfig(): StorageConfig {
   const baseUrl = ENV.forgeApiUrl;
   const apiKey = ENV.forgeApiKey;
@@ -34,11 +37,50 @@ async function buildDownloadUrl(
     ensureTrailingSlash(baseUrl)
   );
   downloadApiUrl.searchParams.set("path", normalizeKey(relKey));
-  const response = await fetch(downloadApiUrl, {
-    method: "GET",
-    headers: buildAuthHeaders(apiKey),
-  });
-  return (await response.json()).url;
+
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30000); // 30s timeout
+      const response = await fetch(downloadApiUrl, {
+        method: "GET",
+        headers: buildAuthHeaders(apiKey),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        const body = await response.text().catch(() => response.statusText);
+        lastError = new Error(
+          `Storage downloadUrl failed (${response.status} ${response.statusText}): ${body}`
+        );
+        if (response.status >= 500 && attempt < MAX_RETRIES) {
+          console.warn(`[Storage] downloadUrl attempt ${attempt + 1} failed (${response.status}), retrying...`);
+          await sleep(RETRY_BASE_DELAY * Math.pow(2, attempt));
+          continue;
+        }
+        throw lastError;
+      }
+
+      const json = await response.json();
+      if (!json.url) {
+        throw new Error("Storage downloadUrl returned empty URL");
+      }
+      return json.url;
+    } catch (err: any) {
+      lastError = err;
+      if (err.name === "AbortError") {
+        lastError = new Error("Storage downloadUrl timed out after 30s");
+      }
+      if (attempt < MAX_RETRIES) {
+        console.warn(`[Storage] downloadUrl attempt ${attempt + 1} failed: ${lastError!.message}, retrying...`);
+        await sleep(RETRY_BASE_DELAY * Math.pow(2, attempt));
+        continue;
+      }
+    }
+  }
+  throw lastError || new Error("Storage downloadUrl failed after retries");
 }
 
 function ensureTrailingSlash(value: string): string {
@@ -67,6 +109,10 @@ function buildAuthHeaders(apiKey: string): HeadersInit {
   return { Authorization: `Bearer ${apiKey}` };
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 export async function storagePut(
   relKey: string,
   data: Buffer | Uint8Array | string,
@@ -75,21 +121,54 @@ export async function storagePut(
   const { baseUrl, apiKey } = getStorageConfig();
   const key = normalizeKey(relKey);
   const uploadUrl = buildUploadUrl(baseUrl, key);
-  const formData = toFormData(data, contentType, key.split("/").pop() ?? key);
-  const response = await fetch(uploadUrl, {
-    method: "POST",
-    headers: buildAuthHeaders(apiKey),
-    body: formData,
-  });
+  const fileName = key.split("/").pop() ?? key;
 
-  if (!response.ok) {
-    const message = await response.text().catch(() => response.statusText);
-    throw new Error(
-      `Storage upload failed (${response.status} ${response.statusText}): ${message}`
-    );
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const formData = toFormData(data, contentType, fileName);
+      const controller = new AbortController();
+      // 5 min timeout for uploads (large files)
+      const timeout = setTimeout(() => controller.abort(), 300000);
+      const response = await fetch(uploadUrl, {
+        method: "POST",
+        headers: buildAuthHeaders(apiKey),
+        body: formData,
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        const message = await response.text().catch(() => response.statusText);
+        lastError = new Error(
+          `Storage upload failed (${response.status} ${response.statusText}): ${message}`
+        );
+        if (response.status >= 500 && attempt < MAX_RETRIES) {
+          console.warn(`[Storage] upload attempt ${attempt + 1} failed (${response.status}), retrying...`);
+          await sleep(RETRY_BASE_DELAY * Math.pow(2, attempt));
+          continue;
+        }
+        throw lastError;
+      }
+
+      const json = await response.json();
+      if (!json.url) {
+        throw new Error("Storage upload returned empty URL");
+      }
+      return { key, url: json.url };
+    } catch (err: any) {
+      lastError = err;
+      if (err.name === "AbortError") {
+        lastError = new Error(`Storage upload timed out for ${key}`);
+      }
+      if (attempt < MAX_RETRIES) {
+        console.warn(`[Storage] upload attempt ${attempt + 1} failed: ${lastError!.message}, retrying...`);
+        await sleep(RETRY_BASE_DELAY * Math.pow(2, attempt));
+        continue;
+      }
+    }
   }
-  const url = (await response.json()).url;
-  return { key, url };
+  throw lastError || new Error("Storage upload failed after retries");
 }
 
 export async function storageGet(relKey: string): Promise<{ key: string; url: string; }> {
@@ -99,4 +178,51 @@ export async function storageGet(relKey: string): Promise<{ key: string; url: st
     key,
     url: await buildDownloadUrl(baseUrl, key, apiKey),
   };
+}
+
+/**
+ * Download a file from S3 storage with retry logic and timeout.
+ * Returns a Response object for streaming.
+ */
+export async function storageDownload(
+  relKey: string,
+  options?: { timeoutMs?: number; rangeHeader?: string }
+): Promise<Response> {
+  const { url } = await storageGet(relKey);
+  const timeoutMs = options?.timeoutMs ?? 120000; // 2 min default
+
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      const headers: Record<string, string> = {};
+      if (options?.rangeHeader) headers["Range"] = options.rangeHeader;
+
+      const resp = await fetch(url, { signal: controller.signal, headers });
+      clearTimeout(timeout);
+
+      if (!resp.ok) {
+        lastError = new Error(`Storage download failed (${resp.status}) for ${relKey}`);
+        if (resp.status >= 500 && attempt < MAX_RETRIES) {
+          console.warn(`[Storage] download attempt ${attempt + 1} failed (${resp.status}), retrying...`);
+          await sleep(RETRY_BASE_DELAY * Math.pow(2, attempt));
+          continue;
+        }
+        throw lastError;
+      }
+      return resp;
+    } catch (err: any) {
+      lastError = err;
+      if (err.name === "AbortError") {
+        lastError = new Error(`Storage download timed out after ${timeoutMs}ms for ${relKey}`);
+      }
+      if (attempt < MAX_RETRIES) {
+        console.warn(`[Storage] download attempt ${attempt + 1} failed: ${lastError!.message}, retrying...`);
+        await sleep(RETRY_BASE_DELAY * Math.pow(2, attempt));
+        continue;
+      }
+    }
+  }
+  throw lastError || new Error(`Storage download failed after retries for ${relKey}`);
 }
