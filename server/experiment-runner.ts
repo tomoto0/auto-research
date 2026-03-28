@@ -942,6 +942,8 @@ export function generateSvgFallbackChart(
     }
   } else {
     // Default to bar-like rendering for bar and unknown cartesian types.
+    const isHorizontal = config.options?.indexAxis === "y";
+    const isStacked = !!(config.options?.scales?.x?.stacked || config.options?.scales?.y?.stacked);
     const categoryCount = labels.length > 0
       ? labels.length
       : Math.max(0, ...datasets.map((d) => Array.isArray(d?.data) ? d.data.length : 0));
@@ -949,60 +951,180 @@ export function generateSvgFallbackChart(
     if (categoryCount === 0 || datasets.length === 0) {
       drawNoDataMessage("No categorical values available for bar chart.");
     } else {
-      const valueRanges = datasets.map((ds) => Array.from({ length: categoryCount }, (_, i) => {
+      // Parse numeric values per dataset per category
+      const numericValues = datasets.map((ds) => Array.from({ length: categoryCount }, (_, i) => {
         const raw = Array.isArray(ds?.data) ? ds.data[i] : null;
         if (Array.isArray(raw) && raw.length >= 2) {
           const low = asNumber(raw[0]);
           const high = asNumber(raw[1]);
-          if (low !== null && high !== null) {
-            return { low: Math.min(low, high), high: Math.max(low, high) };
-          }
+          if (low !== null && high !== null) return Math.max(low, high);
           return null;
         }
         const n = raw && typeof raw === "object" ? asNumber(raw.y) : asNumber(raw);
-        if (n === null) return null;
-        return { low: Math.min(0, n), high: Math.max(0, n) };
+        return n;
       }));
-      const allLow = valueRanges.flatMap((row) => row.map((v) => v?.low).filter((v): v is number => typeof v === "number"));
-      const allHigh = valueRanges.flatMap((row) => row.map((v) => v?.high).filter((v): v is number => typeof v === "number"));
-      if (allLow.length === 0 || allHigh.length === 0) {
-        drawNoDataMessage("No numeric bar values available.");
-      } else {
-        const [minY, maxY] = drawCartesianFrame(Math.min(...allLow), Math.max(...allHigh));
-        const mapY = (y: number): number => mapLinear(y, minY, maxY, plotBottomY, plotY);
-        const baselineY = mapY(0);
-        parts.push(`<line x1="${plotX}" y1="${baselineY}" x2="${plotX + plotWidth}" y2="${baselineY}" stroke="#c9c9c9" stroke-width="1"/>`);
 
-        const groupWidth = plotWidth / categoryCount;
-        const innerPadding = Math.min(10, groupWidth * 0.18);
-        const barSlotWidth = Math.max(groupWidth - innerPadding, 2);
-        const barWidth = Math.max(1.6, Math.min(36, barSlotWidth / Math.max(datasets.length, 1)));
+      if (isHorizontal) {
+        // --- Horizontal bar rendering (indexAxis: "y") ---
+        // Value axis is X (horizontal), category axis is Y (vertical)
+        const allVals = numericValues.flatMap(row => row.filter((v): v is number => v !== null));
+        if (allVals.length === 0) {
+          drawNoDataMessage("No numeric bar values available.");
+        } else {
+          const minVal = Math.min(0, ...allVals);
+          const maxVal = Math.max(...allVals);
+          const [safeMin, safeMax] = normaliseRange(minVal, maxVal);
+          // Draw horizontal grid lines and value axis labels along bottom
+          for (let i = 0; i <= 4; i++) {
+            const t = i / 4;
+            const x = plotX + t * plotWidth;
+            const value = safeMin + t * (safeMax - safeMin);
+            parts.push(`<line x1="${x}" y1="${plotY}" x2="${x}" y2="${plotBottomY}" stroke="#ececec" stroke-width="1"/>`);
+            parts.push(`<text x="${x}" y="${plotBottomY + 16}" text-anchor="middle" font-size="9" fill="#666">${escapeXml(formatTick(value))}</text>`);
+          }
+          parts.push(`<line x1="${plotX}" y1="${plotBottomY}" x2="${plotX + plotWidth}" y2="${plotBottomY}" stroke="#999" stroke-width="1"/>`);
+          parts.push(`<line x1="${plotX}" y1="${plotY}" x2="${plotX}" y2="${plotBottomY}" stroke="#999" stroke-width="1"/>`);
 
-        for (let i = 0; i < categoryCount; i++) {
-          const xStart = plotX + i * groupWidth + innerPadding / 2;
-          for (let dsIndex = 0; dsIndex < datasets.length; dsIndex++) {
-            const range = valueRanges[dsIndex][i];
-            if (!range) continue;
-            const yTop = mapY(range.high);
-            const yBottom = mapY(range.low);
-            const rectY = Math.min(yTop, yBottom);
-            const rectH = Math.max(1, Math.abs(yBottom - yTop));
-            const x = xStart + dsIndex * barWidth;
-            const fill = pickColor(dsIndex, datasets[dsIndex]?.backgroundColor);
-            parts.push(`<rect x="${x}" y="${rectY}" width="${Math.max(1, barWidth - 1)}" height="${rectH}" fill="${fill}" fill-opacity="0.78" rx="1.4"/>`);
+          const groupHeight = plotHeight / categoryCount;
+          const innerPadding = Math.min(8, groupHeight * 0.18);
+          const barSlotH = Math.max(groupHeight - innerPadding, 2);
+          const barH = Math.max(1.6, Math.min(28, barSlotH / Math.max(datasets.length, 1)));
+          const mapX = (v: number): number => mapLinear(v, safeMin, safeMax, plotX, plotX + plotWidth);
+          const baselineX = mapX(0);
+
+          for (let i = 0; i < categoryCount; i++) {
+            const yStart = plotY + i * groupHeight + innerPadding / 2;
+            for (let dsIndex = 0; dsIndex < datasets.length; dsIndex++) {
+              const val = numericValues[dsIndex][i];
+              if (val === null) continue;
+              const xEnd = mapX(val);
+              const rectX = Math.min(baselineX, xEnd);
+              const rectW = Math.max(1, Math.abs(xEnd - baselineX));
+              const y = yStart + dsIndex * barH;
+              const fill = pickColor(dsIndex, datasets[dsIndex]?.backgroundColor);
+              parts.push(`<rect x="${rectX}" y="${y}" width="${rectW}" height="${Math.max(1, barH - 1)}" fill="${fill}" fill-opacity="0.78" rx="1.4"/>`);
+            }
+          }
+
+          // Category labels on Y axis
+          const maxTickLabels = 20;
+          const tickStep = Math.max(1, Math.ceil(categoryCount / maxTickLabels));
+          for (let i = 0; i < categoryCount; i += tickStep) {
+            const y = plotY + i * groupHeight + groupHeight / 2 + 3;
+            const text = shortLabel(labels[i] || `${i + 1}`, 18);
+            parts.push(`<text x="${plotX - 6}" y="${y}" text-anchor="end" font-size="9" fill="#666">${escapeXml(text)}</text>`);
           }
         }
+      } else if (isStacked) {
+        // --- Stacked bar rendering ---
+        // Compute cumulative sums per category for stacking
+        const stackSums = Array.from({ length: categoryCount }, (_, i) => {
+          let sum = 0;
+          for (let dsIndex = 0; dsIndex < datasets.length; dsIndex++) {
+            const val = numericValues[dsIndex][i];
+            if (val !== null && val > 0) sum += val;
+          }
+          return sum;
+        });
+        const maxStack = Math.max(...stackSums, 0);
+        if (maxStack <= 0) {
+          drawNoDataMessage("No positive stacked values available.");
+        } else {
+          const [minY, maxY] = drawCartesianFrame(0, maxStack);
+          const mapY = (y: number): number => mapLinear(y, minY, maxY, plotBottomY, plotY);
+          const baselineY = mapY(0);
+          parts.push(`<line x1="${plotX}" y1="${baselineY}" x2="${plotX + plotWidth}" y2="${baselineY}" stroke="#c9c9c9" stroke-width="1"/>`);
 
-        const maxTickLabels = 15;
-        const tickStep = Math.max(1, Math.ceil(categoryCount / maxTickLabels));
-        const useRotation = categoryCount > 8;
-        for (let i = 0; i < categoryCount; i += tickStep) {
-          const x = plotX + i * groupWidth + groupWidth / 2;
-          const text = shortLabel(labels[i] || `${i + 1}`, useRotation ? 18 : 14);
-          if (useRotation) {
-            parts.push(`<text x="${x}" y="${plotBottomY + 12}" text-anchor="end" font-size="8" fill="#666" transform="rotate(-35, ${x}, ${plotBottomY + 12})">${escapeXml(text)}</text>`);
-          } else {
-            parts.push(`<text x="${x}" y="${plotBottomY + 16}" text-anchor="middle" font-size="9" fill="#666">${escapeXml(text)}</text>`);
+          const groupWidth = plotWidth / categoryCount;
+          const innerPadding = Math.min(10, groupWidth * 0.18);
+          const barWidth = Math.max(2, groupWidth - innerPadding);
+
+          for (let i = 0; i < categoryCount; i++) {
+            let cumY = 0;
+            const xStart = plotX + i * groupWidth + innerPadding / 2;
+            for (let dsIndex = 0; dsIndex < datasets.length; dsIndex++) {
+              const val = numericValues[dsIndex][i];
+              if (val === null || val <= 0) continue;
+              const yBottom = mapY(cumY);
+              const yTop = mapY(cumY + val);
+              const rectY = Math.min(yTop, yBottom);
+              const rectH = Math.max(1, Math.abs(yBottom - yTop));
+              const fill = pickColor(dsIndex, datasets[dsIndex]?.backgroundColor);
+              parts.push(`<rect x="${xStart}" y="${rectY}" width="${Math.max(1, barWidth - 1)}" height="${rectH}" fill="${fill}" fill-opacity="0.78" rx="1.4"/>`);
+              cumY += val;
+            }
+          }
+
+          const maxTickLabels = 15;
+          const tickStep = Math.max(1, Math.ceil(categoryCount / maxTickLabels));
+          const useRotation = categoryCount > 8;
+          for (let i = 0; i < categoryCount; i += tickStep) {
+            const x = plotX + i * groupWidth + groupWidth / 2;
+            const text = shortLabel(labels[i] || `${i + 1}`, useRotation ? 18 : 14);
+            if (useRotation) {
+              parts.push(`<text x="${x}" y="${plotBottomY + 12}" text-anchor="end" font-size="8" fill="#666" transform="rotate(-35, ${x}, ${plotBottomY + 12})">${escapeXml(text)}</text>`);
+            } else {
+              parts.push(`<text x="${x}" y="${plotBottomY + 16}" text-anchor="middle" font-size="9" fill="#666">${escapeXml(text)}</text>`);
+            }
+          }
+        }
+      } else {
+        // --- Default grouped bar rendering ---
+        const valueRanges = datasets.map((ds) => Array.from({ length: categoryCount }, (_, i) => {
+          const raw = Array.isArray(ds?.data) ? ds.data[i] : null;
+          if (Array.isArray(raw) && raw.length >= 2) {
+            const low = asNumber(raw[0]);
+            const high = asNumber(raw[1]);
+            if (low !== null && high !== null) {
+              return { low: Math.min(low, high), high: Math.max(low, high) };
+            }
+            return null;
+          }
+          const n = raw && typeof raw === "object" ? asNumber(raw.y) : asNumber(raw);
+          if (n === null) return null;
+          return { low: Math.min(0, n), high: Math.max(0, n) };
+        }));
+        const allLow = valueRanges.flatMap((row) => row.map((v) => v?.low).filter((v): v is number => typeof v === "number"));
+        const allHigh = valueRanges.flatMap((row) => row.map((v) => v?.high).filter((v): v is number => typeof v === "number"));
+        if (allLow.length === 0 || allHigh.length === 0) {
+          drawNoDataMessage("No numeric bar values available.");
+        } else {
+          const [minY, maxY] = drawCartesianFrame(Math.min(...allLow), Math.max(...allHigh));
+          const mapY = (y: number): number => mapLinear(y, minY, maxY, plotBottomY, plotY);
+          const baselineY = mapY(0);
+          parts.push(`<line x1="${plotX}" y1="${baselineY}" x2="${plotX + plotWidth}" y2="${baselineY}" stroke="#c9c9c9" stroke-width="1"/>`);
+
+          const groupWidth = plotWidth / categoryCount;
+          const innerPadding = Math.min(10, groupWidth * 0.18);
+          const barSlotWidth = Math.max(groupWidth - innerPadding, 2);
+          const barWidth = Math.max(1.6, Math.min(36, barSlotWidth / Math.max(datasets.length, 1)));
+
+          for (let i = 0; i < categoryCount; i++) {
+            const xStart = plotX + i * groupWidth + innerPadding / 2;
+            for (let dsIndex = 0; dsIndex < datasets.length; dsIndex++) {
+              const range = valueRanges[dsIndex][i];
+              if (!range) continue;
+              const yTop = mapY(range.high);
+              const yBottom = mapY(range.low);
+              const rectY = Math.min(yTop, yBottom);
+              const rectH = Math.max(1, Math.abs(yBottom - yTop));
+              const x = xStart + dsIndex * barWidth;
+              const fill = pickColor(dsIndex, datasets[dsIndex]?.backgroundColor);
+              parts.push(`<rect x="${x}" y="${rectY}" width="${Math.max(1, barWidth - 1)}" height="${rectH}" fill="${fill}" fill-opacity="0.78" rx="1.4"/>`);
+            }
+          }
+
+          const maxTickLabels = 15;
+          const tickStep = Math.max(1, Math.ceil(categoryCount / maxTickLabels));
+          const useRotation = categoryCount > 8;
+          for (let i = 0; i < categoryCount; i += tickStep) {
+            const x = plotX + i * groupWidth + groupWidth / 2;
+            const text = shortLabel(labels[i] || `${i + 1}`, useRotation ? 18 : 14);
+            if (useRotation) {
+              parts.push(`<text x="${x}" y="${plotBottomY + 12}" text-anchor="end" font-size="8" fill="#666" transform="rotate(-35, ${x}, ${plotBottomY + 12})">${escapeXml(text)}</text>`);
+            } else {
+              parts.push(`<text x="${x}" y="${plotBottomY + 16}" text-anchor="middle" font-size="9" fill="#666">${escapeXml(text)}</text>`);
+            }
           }
         }
       }
@@ -2777,6 +2899,109 @@ function generateDefaultCharts(
               x: {
                 title: { display: true, text: "Methodology" },
               },
+            },
+          },
+        },
+      });
+    }
+  }
+
+  // Chart 12: Stacked bar chart (proportional composition per category)
+  if (categoricalCols.length > 0 && numericCols.length >= 2 && methodAllowed(executableMethods, "group_comparison")) {
+    const catCol = categoricalCols[0];
+    const useCols = numericCols.slice(0, 4);
+    const groups: Record<string, Record<string, number[]>> = {};
+    for (const row of ds.data) {
+      const key = String(row[catCol] ?? "N/A").slice(0, 30);
+      if (!groups[key]) groups[key] = {};
+      for (const nc of useCols) {
+        if (!groups[key][nc]) groups[key][nc] = [];
+        const val = Number(row[nc]);
+        if (!isNaN(val)) groups[key][nc].push(val);
+      }
+    }
+    const sortedKeys = Object.keys(groups).sort().slice(0, 15);
+    const stackColors = ["rgba(78, 121, 167, 0.7)", "rgba(242, 142, 43, 0.7)", "rgba(225, 87, 89, 0.7)", "rgba(118, 183, 178, 0.7)"];
+    const stackBorders = ["rgba(78, 121, 167, 1)", "rgba(242, 142, 43, 1)", "rgba(225, 87, 89, 1)", "rgba(118, 183, 178, 1)"];
+
+    if (sortedKeys.length >= 2) {
+      const displayCatCol = catCol.length > 30 ? catCol.slice(0, 27) + "..." : catCol;
+
+      charts.push({
+        name: "stacked_bar",
+        description: `Stacked composition of ${useCols.length} variables by ${displayCatCol}`,
+        config: {
+          type: "bar",
+          data: {
+            labels: sortedKeys,
+            datasets: useCols.map((nc, idx) => {
+              const displayNc = nc.length > 20 ? nc.slice(0, 17) + "..." : nc;
+              return {
+                label: `${displayNc}`,
+                data: sortedKeys.map(k => {
+                  const vals = (groups[k]?.[nc] || []).filter(v => !isNaN(v));
+                  return vals.length > 0 ? Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 100) / 100 : 0;
+                }),
+                backgroundColor: stackColors[idx % stackColors.length],
+                borderColor: stackBorders[idx % stackBorders.length],
+                borderWidth: 1,
+              };
+            }),
+          },
+          options: {
+            plugins: { title: { display: true, text: `Stacked Composition by ${displayCatCol}`, font: { size: 16 } } },
+            scales: {
+              x: { stacked: true, title: { display: true, text: displayCatCol } },
+              y: { stacked: true, title: { display: true, text: "Mean value" } },
+            },
+          },
+        },
+      });
+    }
+  }
+
+  // Chart 13: Horizontal bar chart (better readability for many categories)
+  if (categoricalCols.length > 0 && numericCols.length > 0 && methodAllowed(executableMethods, "descriptive_statistics")) {
+    // Try to pick different columns from Chart 3 (category frequency); use second categorical or second numeric
+    const catCol = categoricalCols.length > 1 ? categoricalCols[1] : categoricalCols[0];
+    const numCol = numericCols.length > 1 ? numericCols[1] : numericCols[0];
+    const catGroups: Record<string, number[]> = {};
+    for (const row of ds.data) {
+      const key = String(row[catCol] ?? "N/A").slice(0, 30);
+      if (!catGroups[key]) catGroups[key] = [];
+      const val = Number(row[numCol]);
+      if (!isNaN(val)) catGroups[key].push(val);
+    }
+    const sortedEntries = Object.entries(catGroups)
+      .map(([k, vals]) => ({ label: k, mean: vals.length > 0 ? vals.reduce((a, b) => a + b, 0) / vals.length : 0 }))
+      .sort((a, b) => b.mean - a.mean)
+      .slice(0, 20);
+
+    if (sortedEntries.length >= 5) {
+      const displayCatCol = catCol.length > 30 ? catCol.slice(0, 27) + "..." : catCol;
+      const displayNumCol = numCol.length > 30 ? numCol.slice(0, 27) + "..." : numCol;
+
+      charts.push({
+        name: "horizontal_bar",
+        description: `Horizontal bar: mean ${displayNumCol} by ${displayCatCol}`,
+        config: {
+          type: "bar",
+          data: {
+            labels: sortedEntries.map(e => e.label),
+            datasets: [{
+              label: `Mean ${displayNumCol}`,
+              data: sortedEntries.map(e => Math.round(e.mean * 100) / 100),
+              backgroundColor: "rgba(89, 161, 79, 0.7)",
+              borderColor: "rgba(89, 161, 79, 1)",
+              borderWidth: 1,
+            }],
+          },
+          options: {
+            indexAxis: "y" as const,
+            plugins: { title: { display: true, text: `${displayNumCol} by ${displayCatCol}`, font: { size: 16 } } },
+            scales: {
+              x: { title: { display: true, text: displayNumCol } },
+              y: { title: { display: true, text: displayCatCol } },
             },
           },
         },
