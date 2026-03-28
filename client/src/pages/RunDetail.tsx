@@ -52,7 +52,19 @@ function formatFileSize(bytes: number): string {
 
 export default function RunDetail({ runId }: { runId: string }) {
   const [, setLocation] = useLocation();
-  const runQuery = trpc.pipeline.get.useQuery({ runId }, { refetchInterval: 3000 });
+  const runQuery = trpc.pipeline.get.useQuery({ runId }, {
+    // Only poll while the run is active; SSE provides real-time updates
+    // so we use a longer interval just as a fallback safety net.
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      if (status === "running" || status === "pending" || status === "awaiting_approval") {
+        return 10_000; // 10s fallback while running
+      }
+      return false; // stop polling once completed/failed/stopped
+    },
+    structuralSharing: true,
+    staleTime: 2_000, // avoid rapid re-fetches from SSE + polling overlap
+  });
   const papersQuery = trpc.literature.forRun.useQuery({ runId });
   const [events, setEvents] = useState<PipelineEvent[]>([]);
   const eventsEndRef = useRef<HTMLDivElement>(null);
@@ -100,17 +112,36 @@ export default function RunDetail({ runId }: { runId: string }) {
 
   useEffect(() => {
     const evtSource = new EventSource(`/api/pipeline/events/${runId}`);
+    // Debounce refetch to avoid rapid-fire re-fetches from SSE bursts
+    let refetchTimer: ReturnType<typeof setTimeout> | null = null;
+    const scheduleRefetch = () => {
+      if (refetchTimer) return; // already scheduled
+      refetchTimer = setTimeout(() => {
+        refetchTimer = null;
+        runQuery.refetch();
+      }, 1_000);
+    };
     evtSource.onmessage = (e) => {
       try {
         const event = JSON.parse(e.data) as PipelineEvent;
         setEvents(prev => [...prev.slice(-200), event]);
-        if (event.type === "stage_awaiting_approval" || event.type === "stage_approved" || event.type === "stage_rejected") {
-          runQuery.refetch();
+        // Only refetch on state-changing events (approval, completion, failure)
+        if (
+          event.type === "stage_awaiting_approval" ||
+          event.type === "stage_approved" ||
+          event.type === "stage_rejected" ||
+          event.type === "run_complete" ||
+          event.type === "run_fail"
+        ) {
+          scheduleRefetch();
         }
       } catch {}
     };
     evtSource.onerror = () => { evtSource.close(); };
-    return () => evtSource.close();
+    return () => {
+      evtSource.close();
+      if (refetchTimer) clearTimeout(refetchTimer);
+    };
   }, [runId]);
 
   useEffect(() => {
