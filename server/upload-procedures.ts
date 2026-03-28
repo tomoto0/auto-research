@@ -157,15 +157,33 @@ async function parsePreview(
     }
   };
 
+  const DTA_PREVIEW_HEAD_BYTES = 5 * 1024 * 1024; // 5MB — enough for DTA header + 10 preview rows
+
   if (isMultipart) {
     const tmpPath = path.join(os.tmpdir(), `preview-multipart-${Date.now()}-${fileName}`);
     try {
-      await storageDownloadDatasetMultipartToFile({
-        uploadId: multipartUploadId!,
-        totalChunks: multipartTotalChunks!,
-        destinationPath: tmpPath,
-        timeoutMsPerPart: 120000,
-      });
+      if (fileType === "dta") {
+        // For DTA preview, only download the first chunk (~8MB) instead of the entire file
+        const firstPartKey = buildDatasetMultipartPartKey(multipartUploadId!, 0);
+        const resp = await storageDownload(firstPartKey, { timeoutMs: 120000 });
+        if (resp.body) {
+          const { Readable } = await import("stream");
+          const { pipeline: streamPipeline } = await import("stream/promises");
+          const tmpStream = fs.createWriteStream(tmpPath);
+          const readable = Readable.fromWeb(resp.body as any);
+          await streamPipeline(readable, tmpStream);
+        } else {
+          const buf = Buffer.from(await resp.arrayBuffer());
+          fs.writeFileSync(tmpPath, buf);
+        }
+      } else {
+        await storageDownloadDatasetMultipartToFile({
+          uploadId: multipartUploadId!,
+          totalChunks: multipartTotalChunks!,
+          destinationPath: tmpPath,
+          timeoutMsPerPart: 120000,
+        });
+      }
     } catch (dlErr: any) {
       console.warn("[Upload] Failed to download multipart file for preview:", dlErr.message);
       try { fs.unlinkSync(tmpPath); } catch {}
@@ -208,7 +226,10 @@ async function parsePreview(
           }
         }
       } else if (fileType === "dta" || fileType === "excel") {
-        const fileBuffer = fs.readFileSync(tmpPath);
+        // For DTA, only read first 5MB (header + 10 rows); for Excel, read full file
+        let fileBuffer: Buffer | null = fileType === "dta"
+          ? readFileHead(tmpPath, DTA_PREVIEW_HEAD_BYTES)
+          : fs.readFileSync(tmpPath);
         if (fileType === "excel") {
           try {
             const XLSX = await import("xlsx");
@@ -229,7 +250,7 @@ async function parsePreview(
         } else {
           try {
             const { parseDtaFile } = await import("./dta-parser");
-            const dtaResult = parseDtaFile(fileBuffer, { previewRows: 10 });
+            const dtaResult = parseDtaFile(fileBuffer!, { previewRows: 10 });
             if (dtaResult && dtaResult.columns) {
               columnNames = dtaResult.columns;
               rowCount = dtaResult.totalRows || dtaResult.data?.length || null;
@@ -241,6 +262,9 @@ async function parsePreview(
             console.warn("[Upload] DTA parse for preview failed:", dtaErr.message);
           }
         }
+        // Help GC reclaim the buffer
+        fileBuffer = null;
+        try { global.gc?.(); } catch {}
       }
     } finally {
       try { fs.unlinkSync(tmpPath); } catch {}
@@ -308,7 +332,10 @@ async function parsePreview(
       console.warn("[Upload] Failed to download for preview:", dlErr.message);
       try { fs.unlinkSync(tmpPath); } catch {}
     }
-    const fileBuffer = fs.existsSync(tmpPath) ? fs.readFileSync(tmpPath) : null;
+    // For DTA, only read first 5MB (header + 10 rows); for Excel, read full file
+    let fileBuffer: Buffer | null = fs.existsSync(tmpPath)
+      ? (fileType === "dta" ? readFileHead(tmpPath, DTA_PREVIEW_HEAD_BYTES) : fs.readFileSync(tmpPath))
+      : null;
     const cleanupTmp = () => { try { fs.unlinkSync(tmpPath); } catch {} };
 
     if (fileBuffer) {
@@ -344,6 +371,9 @@ async function parsePreview(
           console.warn("[Upload] DTA parse for preview failed:", dtaErr.message);
         }
       }
+      // Help GC reclaim the buffer
+      fileBuffer = null;
+      try { global.gc?.(); } catch {}
     }
     cleanupTmp();
   }
@@ -361,6 +391,8 @@ export const uploadChunkProcedure = publicProcedure
   }))
   .mutation(async ({ input }) => {
     const chunkBuffer = Buffer.from(input.chunkBase64, "base64");
+    // Release the ~10.7MB base64 string immediately after decoding
+    (input as any).chunkBase64 = null;
     const MAX_CHUNK_SIZE = 10 * 1024 * 1024; // 10MB safety limit
     if (chunkBuffer.length > MAX_CHUNK_SIZE) {
       throw new TRPCError({ code: "PAYLOAD_TOO_LARGE", message: "Chunk too large (max 10MB per chunk)" });
