@@ -20,6 +20,14 @@ import { insertDatasetFile } from "./db";
 
 type FileType = "csv" | "excel" | "dta" | "json" | "tsv" | "other";
 
+const MAX_PREVIEW_BYTES = 60 * 1024; // MySQL TEXT practical safety headroom
+const MAX_PREVIEW_RETRY_BYTES = 16 * 1024;
+const MAX_PREVIEW_ROWS = 5;
+const MAX_PREVIEW_COLUMNS = 180;
+const MAX_PREVIEW_CELL_CHARS = 160;
+const MAX_COLUMN_NAMES_STORED = 1500;
+const MAX_COLUMN_NAME_CHARS = 180;
+
 function detectFileType(fileName: string): FileType {
   const ext = fileName.split(".").pop()?.toLowerCase() || "";
   if (ext === "csv") return "csv";
@@ -28,6 +36,79 @@ function detectFileType(fileName: string): FileType {
   if (ext === "json") return "json";
   if (ext === "tsv") return "tsv";
   return "other";
+}
+
+function sanitizeControlChars(input: string): string {
+  return input.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+}
+
+export function truncateUtf8ToBytes(input: string, maxBytes: number): string {
+  if (maxBytes <= 0 || !input) return "";
+  if (Buffer.byteLength(input, "utf8") <= maxBytes) return input;
+  let low = 0;
+  let high = input.length;
+  while (low < high) {
+    const mid = Math.floor((low + high + 1) / 2);
+    const candidate = input.slice(0, mid);
+    if (Buffer.byteLength(candidate, "utf8") <= maxBytes) {
+      low = mid;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return input.slice(0, low);
+}
+
+export function preparePreviewForStorage(preview: string | null, maxBytes = MAX_PREVIEW_BYTES): string | null {
+  if (!preview) return null;
+  const normalised = sanitizeControlChars(preview).replace(/\r\n/g, "\n").trim();
+  if (!normalised) return null;
+  if (Buffer.byteLength(normalised, "utf8") <= maxBytes) {
+    return normalised;
+  }
+  const suffix = "\n...[preview truncated]";
+  const suffixBytes = Buffer.byteLength(suffix, "utf8");
+  const headBudget = Math.max(0, maxBytes - suffixBytes);
+  return `${truncateUtf8ToBytes(normalised, headBudget)}${suffix}`;
+}
+
+export function normaliseColumnNamesForStorage(columnNames: string[] | null): { columnNames: string[] | null; truncated: boolean } {
+  if (!columnNames || columnNames.length === 0) return { columnNames: null, truncated: false };
+  const cleaned = columnNames
+    .map((name) => sanitizeControlChars(String(name ?? "")).trim())
+    .filter(Boolean)
+    .map((name) => name.length > MAX_COLUMN_NAME_CHARS ? `${name.slice(0, MAX_COLUMN_NAME_CHARS - 3)}...` : name);
+  if (cleaned.length > MAX_COLUMN_NAMES_STORED) {
+    return { columnNames: cleaned.slice(0, MAX_COLUMN_NAMES_STORED), truncated: true };
+  }
+  return { columnNames: cleaned, truncated: false };
+}
+
+function toPreviewCell(value: unknown): string {
+  const asText = sanitizeControlChars(String(value ?? "")).replace(/\r?\n/g, " ").trim();
+  if (asText.length <= MAX_PREVIEW_CELL_CHARS) return asText;
+  return `${asText.slice(0, MAX_PREVIEW_CELL_CHARS - 3)}...`;
+}
+
+function buildTabularPreview(
+  allColumns: string[],
+  rows: Record<string, unknown>[],
+): string | null {
+  if (!allColumns || allColumns.length === 0) return null;
+  const useColumns = allColumns.slice(0, MAX_PREVIEW_COLUMNS);
+  const useRows = rows.slice(0, MAX_PREVIEW_ROWS);
+  const lines: string[] = [];
+  lines.push(useColumns.map(toPreviewCell).join(","));
+  for (const row of useRows) {
+    lines.push(useColumns.map((col) => toPreviewCell((row as any)?.[col])).join(","));
+  }
+  if (allColumns.length > useColumns.length) {
+    lines.push(`...[${allColumns.length - useColumns.length} additional columns omitted]`);
+  }
+  if (rows.length > useRows.length) {
+    lines.push(`...[${rows.length - useRows.length} additional preview rows omitted]`);
+  }
+  return preparePreviewForStorage(lines.join("\n"));
 }
 
 async function parsePreview(
@@ -153,8 +234,7 @@ async function parsePreview(
               columnNames = dtaResult.columns;
               rowCount = dtaResult.totalRows || dtaResult.data?.length || null;
               if (dtaResult.data && dtaResult.data.length > 0) {
-                const previewRows = dtaResult.data.slice(0, 5);
-                preview = columnNames.join(",") + "\n" + previewRows.map((r: any) => columnNames!.map(c => r[c] ?? "").join(",")).join("\n");
+                preview = buildTabularPreview(columnNames, dtaResult.data as Record<string, unknown>[]);
               }
             }
           } catch (dtaErr: any) {
@@ -257,8 +337,7 @@ async function parsePreview(
             columnNames = dtaResult.columns;
             rowCount = dtaResult.totalRows || dtaResult.data?.length || null;
             if (dtaResult.data && dtaResult.data.length > 0) {
-              const previewRows = dtaResult.data.slice(0, 5);
-              preview = columnNames.join(",") + "\n" + previewRows.map((r: any) => columnNames!.map(c => r[c] ?? "").join(",")).join("\n");
+              preview = buildTabularPreview(columnNames, dtaResult.data as Record<string, unknown>[]);
             }
           }
         } catch (dtaErr: any) {
@@ -366,6 +445,7 @@ export const registerFileProcedure = longRunningProcedure
     let columnNames: string[] | null = null;
     let rowCount: number | null = null;
     let preview: string | null = null;
+    const warnings: string[] = [];
 
     try {
       const parsed = await parsePreview(fileKey, fileType, fileName, sizeBytes, {
@@ -379,8 +459,18 @@ export const registerFileProcedure = longRunningProcedure
       console.warn("[Upload] Preview parsing failed (non-fatal):", parseErr.message);
     }
 
+    const normalisedColumns = normaliseColumnNamesForStorage(columnNames);
+    columnNames = normalisedColumns.columnNames;
+    if (normalisedColumns.truncated) {
+      warnings.push(`Column metadata exceeded safe limits and was truncated to first ${MAX_COLUMN_NAMES_STORED} columns`);
+    }
+    const preparedPreview = preparePreviewForStorage(preview, MAX_PREVIEW_BYTES);
+    if (preview && preparedPreview !== preview) {
+      warnings.push("Preview text exceeded storage limits and was truncated");
+    }
+    preview = preparedPreview;
+
     // Validate parsed data
-    const warnings: string[] = [];
     if ((!columnNames || columnNames.length === 0) && (rowCount === 0 || rowCount === null)) {
       throw new TRPCError({ code: "UNPROCESSABLE_CONTENT", message: "File appears to be empty or unparseable: no columns or rows detected" });
     }
@@ -404,7 +494,7 @@ export const registerFileProcedure = longRunningProcedure
       console.warn(`[Upload] Validation warnings for ${fileName}:`, warnings);
     }
 
-    const record = await insertDatasetFile({
+    const baseFileRecord = {
       userId: ctx.user?.id ?? null,
       originalName: fileName,
       fileKey,
@@ -412,12 +502,54 @@ export const registerFileProcedure = longRunningProcedure
       mimeType: fileMime,
       sizeBytes,
       fileType,
-      columnNames: columnNames as any,
       rowCount,
-      preview,
-    });
+    };
 
-    console.log(`[Upload] Registered: ${fileName} (id=${record.id}, ${columnNames?.length || 0} cols, ${rowCount ?? "?"} rows)`);
+    let storedColumnNames = columnNames;
+    let storedPreview = preview;
+    let record: Awaited<ReturnType<typeof insertDatasetFile>>;
+    try {
+      record = await insertDatasetFile({
+        ...baseFileRecord,
+        columnNames: storedColumnNames as any,
+        preview: storedPreview,
+      });
+    } catch (insertErr: any) {
+      console.error("[Upload] Initial metadata insert failed:", insertErr?.message || insertErr);
+      warnings.push("Metadata payload exceeded DB limits; retrying with reduced preview payload");
+
+      storedPreview = preparePreviewForStorage(storedPreview, MAX_PREVIEW_RETRY_BYTES);
+      if (storedColumnNames && storedColumnNames.length > 800) {
+        storedColumnNames = storedColumnNames.slice(0, 800);
+      }
+
+      try {
+        record = await insertDatasetFile({
+          ...baseFileRecord,
+          columnNames: storedColumnNames as any,
+          preview: storedPreview,
+        });
+      } catch (reducedErr: any) {
+        console.error("[Upload] Reduced metadata insert failed:", reducedErr?.message || reducedErr);
+        warnings.push("Stored file without preview/column metadata due to database storage constraints");
+        try {
+          storedColumnNames = null;
+          storedPreview = null;
+          record = await insertDatasetFile({
+            ...baseFileRecord,
+            columnNames: null as any,
+            preview: null,
+          });
+        } catch (finalErr: any) {
+          throw new TRPCError({
+            code: "INTERNAL_SERVER_ERROR",
+            message: finalErr?.message || insertErr?.message || "Failed to register file metadata",
+          });
+        }
+      }
+    }
+
+    console.log(`[Upload] Registered: ${fileName} (id=${record.id}, ${storedColumnNames?.length || 0} cols, ${rowCount ?? "?"} rows)`);
 
     return {
       success: true as const,
@@ -428,9 +560,9 @@ export const registerFileProcedure = longRunningProcedure
         fileUrl,
         fileType,
         sizeBytes,
-        columnNames,
+        columnNames: storedColumnNames,
         rowCount,
-        preview,
+        preview: storedPreview,
       },
     };
   });

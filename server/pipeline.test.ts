@@ -1393,6 +1393,26 @@ describe("Chunked upload client utility", () => {
   });
 });
 
+describe("Upload metadata size guards", () => {
+  it("preparePreviewForStorage truncates oversized preview safely", async () => {
+    const { preparePreviewForStorage } = await import("./upload-procedures");
+    const longText = "列".repeat(120000); // multibyte, intentionally large
+    const prepared = preparePreviewForStorage(longText, 4096);
+    expect(prepared).toBeTruthy();
+    expect(Buffer.byteLength(prepared || "", "utf8")).toBeLessThanOrEqual(4096);
+    expect(prepared).toContain("...[preview truncated]");
+  });
+
+  it("normaliseColumnNamesForStorage caps count and per-name length", async () => {
+    const { normaliseColumnNamesForStorage } = await import("./upload-procedures");
+    const hugeColumns = Array.from({ length: 1800 }, (_, i) => `very_long_column_${i}_${"x".repeat(300)}`);
+    const result = normaliseColumnNamesForStorage(hugeColumns);
+    expect(result.truncated).toBe(true);
+    expect((result.columnNames || []).length).toBeLessThanOrEqual(1500);
+    expect((result.columnNames || [])[0].length).toBeLessThanOrEqual(180);
+  });
+});
+
 describe("Multipart dataset key helpers", () => {
   it("builds and parses multipart file keys consistently", async () => {
     const {
