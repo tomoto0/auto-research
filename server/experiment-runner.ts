@@ -616,7 +616,7 @@ export function generateSvgFallbackChart(
     }
     return [min, max];
   };
-  const shortLabel = (value: unknown, maxLen = 22): string => {
+  const shortLabel = (value: unknown, maxLen = 30): string => {
     let text = String(value ?? "");
     // Strip non-ASCII characters as a safety net (labels should already be transliterated)
     text = text.replace(/[^\x20-\x7E]/g, "").trim();
@@ -779,13 +779,27 @@ export function generateSvgFallbackChart(
       const mapY = (y: number): number => mapLinear(y, minY, maxY, plotBottomY, plotY);
 
       for (const series of allSeries) {
-        for (const point of series.points) {
+        // Limit scatter points in SVG to avoid visual noise
+        const maxScatterPoints = 200;
+        const renderPoints = series.points.length > maxScatterPoints
+          ? series.points.filter((_, i) => i % Math.ceil(series.points.length / maxScatterPoints) === 0)
+          : series.points;
+        for (const point of renderPoints) {
           const cx = mapX(point.x);
           const cy = mapY(point.y);
           const radius = chartType === "bubble" ? point.r : 3;
           if (!Number.isFinite(cx) || !Number.isFinite(cy)) continue;
           parts.push(`<circle cx="${cx}" cy="${cy}" r="${radius}" fill="${series.color}" fill-opacity="0.65" stroke="${series.color}" stroke-width="1"/>`);
         }
+      }
+
+      // X-axis tick labels for scatter/bubble
+      const xTickCount = 5;
+      for (let i = 0; i <= xTickCount; i++) {
+        const t = i / xTickCount;
+        const value = minX + t * (maxX - minX);
+        const x = plotX + t * plotWidth;
+        parts.push(`<text x="${x}" y="${plotBottomY + 16}" text-anchor="middle" font-size="9" fill="#666">${escapeXml(formatTick(value))}</text>`);
       }
     }
   } else if (chartType === "line") {
@@ -832,13 +846,99 @@ export function generateSvgFallbackChart(
       const lineUseRotation = lineLabelCount / lineTickStep > 8;
       for (let i = 0; i < lineLabelCount; i += lineTickStep) {
         const x = mapX(i);
-        const text = shortLabel(labels[i] || `${i + 1}`, lineUseRotation ? 12 : 10);
+        const text = shortLabel(labels[i] || `${i + 1}`, lineUseRotation ? 18 : 14);
         if (lineUseRotation) {
           parts.push(`<text x="${x}" y="${plotBottomY + 12}" text-anchor="end" font-size="8" fill="#666" transform="rotate(-35, ${x}, ${plotBottomY + 12})">${escapeXml(text)}</text>`);
         } else {
           parts.push(`<text x="${x}" y="${plotBottomY + 16}" text-anchor="middle" font-size="9" fill="#666">${escapeXml(text)}</text>`);
         }
       }
+    }
+  } else if (chartType === "heatmap") {
+    // Custom heatmap rendering for correlation matrices and similar grid data
+    const heatmapLabels: string[] = labels.length > 0 ? labels : [];
+    const heatmapData: { x: number; y: number; v: number }[] = [];
+    if (datasets.length > 0 && Array.isArray(datasets[0]?.data)) {
+      for (const d of datasets[0].data) {
+        if (d && typeof d === "object" && "x" in d && "y" in d && "v" in d) {
+          const x = asNumber(d.x), y = asNumber(d.y), v = asNumber(d.v);
+          if (x !== null && y !== null && v !== null) heatmapData.push({ x, y, v });
+        }
+      }
+    }
+    const gridSize = heatmapLabels.length;
+    if (gridSize < 2 || heatmapData.length === 0) {
+      drawNoDataMessage("No heatmap data available.");
+    } else {
+      // Reserve space for axis labels
+      const labelSpace = 80;
+      const gridX = plotX + labelSpace;
+      const gridY = plotY + 8;
+      const gridWidth = plotWidth - labelSpace;
+      const gridHeight = plotHeight - 30;
+      const cellW = gridWidth / gridSize;
+      const cellH = gridHeight / gridSize;
+
+      // Color interpolation: blue (positive) to white (zero) to red (negative)
+      const heatColor = (v: number): string => {
+        const clamped = Math.max(-1, Math.min(1, v));
+        const abs = Math.abs(clamped);
+        if (clamped >= 0) {
+          // White to blue
+          const r = Math.round(255 * (1 - abs * 0.7));
+          const g = Math.round(255 * (1 - abs * 0.5));
+          const b = 255;
+          return `rgb(${r},${g},${b})`;
+        } else {
+          // White to red
+          const r = 255;
+          const g = Math.round(255 * (1 - abs * 0.6));
+          const b = Math.round(255 * (1 - abs * 0.7));
+          return `rgb(${r},${g},${b})`;
+        }
+      };
+
+      // Draw cells
+      for (const cell of heatmapData) {
+        const cx = gridX + cell.x * cellW;
+        const cy = gridY + cell.y * cellH;
+        parts.push(`<rect x="${cx}" y="${cy}" width="${cellW}" height="${cellH}" fill="${heatColor(cell.v)}" stroke="#fff" stroke-width="1"/>`);
+        // Show correlation value in cell
+        if (cellW >= 20 && cellH >= 16) {
+          const textColor = Math.abs(cell.v) > 0.6 ? "#fff" : "#333";
+          const fontSize = Math.min(10, Math.max(7, cellW / 4));
+          parts.push(`<text x="${cx + cellW / 2}" y="${cy + cellH / 2 + fontSize / 3}" text-anchor="middle" font-size="${fontSize}" fill="${textColor}">${cell.v.toFixed(2)}</text>`);
+        }
+      }
+
+      // Y-axis labels (left side)
+      for (let i = 0; i < gridSize; i++) {
+        const y = gridY + i * cellH + cellH / 2 + 3;
+        const lbl = shortLabel(heatmapLabels[i] || `${i}`, 14);
+        parts.push(`<text x="${gridX - 6}" y="${y}" text-anchor="end" font-size="9" fill="#444">${escapeXml(lbl)}</text>`);
+      }
+
+      // X-axis labels (bottom, rotated)
+      for (let i = 0; i < gridSize; i++) {
+        const x = gridX + i * cellW + cellW / 2;
+        const y = gridY + gridHeight + 10;
+        const lbl = shortLabel(heatmapLabels[i] || `${i}`, 14);
+        parts.push(`<text x="${x}" y="${y}" text-anchor="end" font-size="9" fill="#444" transform="rotate(-45, ${x}, ${y})">${escapeXml(lbl)}</text>`);
+      }
+
+      // Color legend
+      const legendW = 120, legendH = 10;
+      const legendX = gridX + gridWidth / 2 - legendW / 2;
+      const legendY = plotBottomY + 42;
+      const gradSteps = 20;
+      for (let i = 0; i < gradSteps; i++) {
+        const v = -1 + (2 * i) / (gradSteps - 1);
+        const sx = legendX + (i / gradSteps) * legendW;
+        parts.push(`<rect x="${sx}" y="${legendY}" width="${legendW / gradSteps + 1}" height="${legendH}" fill="${heatColor(v)}"/>`);
+      }
+      parts.push(`<text x="${legendX}" y="${legendY + legendH + 12}" text-anchor="middle" font-size="8" fill="#666">-1</text>`);
+      parts.push(`<text x="${legendX + legendW / 2}" y="${legendY + legendH + 12}" text-anchor="middle" font-size="8" fill="#666">0</text>`);
+      parts.push(`<text x="${legendX + legendW}" y="${legendY + legendH + 12}" text-anchor="middle" font-size="8" fill="#666">+1</text>`);
     }
   } else {
     // Default to bar-like rendering for bar and unknown cartesian types.
@@ -898,7 +998,7 @@ export function generateSvgFallbackChart(
         const useRotation = categoryCount > 8;
         for (let i = 0; i < categoryCount; i += tickStep) {
           const x = plotX + i * groupWidth + groupWidth / 2;
-          const text = shortLabel(labels[i] || `${i + 1}`, useRotation ? 12 : 10);
+          const text = shortLabel(labels[i] || `${i + 1}`, useRotation ? 18 : 14);
           if (useRotation) {
             parts.push(`<text x="${x}" y="${plotBottomY + 12}" text-anchor="end" font-size="8" fill="#666" transform="rotate(-35, ${x}, ${plotBottomY + 12})">${escapeXml(text)}</text>`);
           } else {
@@ -909,8 +1009,22 @@ export function generateSvgFallbackChart(
     }
   }
 
+  // Render axis titles from config (applies to all cartesian chart types)
+  if (chartType !== "pie" && chartType !== "doughnut" && chartType !== "heatmap") {
+    const xTitle = config.options?.scales?.x?.title;
+    if (xTitle?.display && xTitle?.text) {
+      const axisLabel = shortLabel(xTitle.text, 50);
+      parts.push(`<text x="${plotX + plotWidth / 2}" y="${plotBottomY + 52}" text-anchor="middle" font-size="11" fill="#444" font-weight="500">${escapeXml(axisLabel)}</text>`);
+    }
+    const yTitle = config.options?.scales?.y?.title;
+    if (yTitle?.display && yTitle?.text) {
+      const axisLabel = shortLabel(yTitle.text, 50);
+      parts.push(`<text x="${plotX - 46}" y="${plotY + plotHeight / 2}" text-anchor="middle" font-size="11" fill="#444" font-weight="500" transform="rotate(-90, ${plotX - 46}, ${plotY + plotHeight / 2})">${escapeXml(axisLabel)}</text>`);
+    }
+  }
+
   // Shared legend for non-pie charts
-  if (chartType !== "pie" && chartType !== "doughnut" && datasets.length > 0) {
+  if (chartType !== "pie" && chartType !== "doughnut" && chartType !== "heatmap" && datasets.length > 0) {
     const legendCount = Math.min(datasets.length, 6);
     const legendColumns = Math.min(3, legendCount);
     const legendRows = Math.ceil(legendCount / legendColumns);
@@ -2056,15 +2170,16 @@ function generateDefaultCharts(
     if (values.length > 0) {
       const min = Math.min(...values);
       const max = Math.max(...values);
-      const binCount = Math.min(20, Math.ceil(Math.sqrt(values.length)));
+      const binCount = Math.min(10, Math.ceil(Math.sqrt(values.length)));
       const binWidth = (max - min) / binCount || 1;
       const bins = Array(binCount).fill(0);
       const labels: string[] = [];
 
       for (let i = 0; i < binCount; i++) {
-        const lo = min + i * binWidth;
-        const hi = lo + binWidth;
-        labels.push(`${lo.toFixed(1)}-${hi.toFixed(1)}`);
+        const mid = min + (i + 0.5) * binWidth;
+        // Use short midpoint labels to prevent overlap in SVG fallback
+        const isInteger = Number.isInteger(min) && Number.isInteger(max) && binWidth >= 1;
+        labels.push(isInteger ? Math.round(mid).toString() : mid.toFixed(1));
       }
       for (const v of values) {
         const idx = Math.min(Math.floor((v - min) / binWidth), binCount - 1);
@@ -2121,7 +2236,7 @@ function generateDefaultCharts(
     const points = ds.data
       .map(r => ({ x: Number(r[xCol]), y: Number(r[yCol]) }))
       .filter(p => !isNaN(p.x) && !isNaN(p.y) && isFinite(p.x) && isFinite(p.y))
-      .slice(0, 500);
+      .slice(0, 200);
 
     if (points.length >= 5) {
       const displayXCol = xCol.length > 30 ? xCol.slice(0, 27) + "..." : xCol;
@@ -2223,11 +2338,11 @@ function generateDefaultCharts(
     });
   }
 
-  // Chart 4: Correlation bubble heatmap (if multiple numeric cols)
+  // Chart 4: Correlation heatmap (if multiple numeric cols)
   if (numericCols.length >= 3 && methodAllowed(executableMethods, "correlation")) {
     const cols = numericCols.slice(0, 8);
     const displayCols = cols.map(c => c.length > 15 ? c.slice(0, 12) + "..." : c);
-    const bubbleData: { x: number; y: number; r: number; corr: number }[] = [];
+    const heatmapData: { x: number; y: number; v: number }[] = [];
     for (let ci = 0; ci < cols.length; ci++) {
       for (let cj = 0; cj < cols.length; cj++) {
         const pairs = parseNumericPairs(ds, cols[ci], cols[cj]);
@@ -2245,71 +2360,22 @@ function generateDefaultCharts(
           corr = d1 > 0 && d2 > 0 ? num / Math.sqrt(d1 * d2) : 0;
         }
         corr = Math.round(corr * 100) / 100;
-        bubbleData.push({ x: ci, y: cj, r: Math.max(3, Math.abs(corr) * 18), corr });
+        heatmapData.push({ x: ci, y: cj, v: corr });
       }
     }
 
-    // Separate positive and negative correlations into two datasets
-    const positivePoints = bubbleData.filter(d => d.corr >= 0);
-    const negativePoints = bubbleData.filter(d => d.corr < 0);
-
     charts.push({
       name: "correlation_matrix",
-      description: `Correlation bubble heatmap of numeric variables`,
+      description: `Correlation heatmap of numeric variables`,
       config: {
-        type: "bubble",
+        type: "heatmap",
         data: {
-          datasets: [
-            {
-              label: "Positive correlation",
-              data: positivePoints,
-              backgroundColor: "rgba(78, 121, 167, 0.6)",
-              borderColor: "rgba(78, 121, 167, 1)",
-              borderWidth: 1,
-            },
-            {
-              label: "Negative correlation",
-              data: negativePoints,
-              backgroundColor: "rgba(225, 87, 89, 0.6)",
-              borderColor: "rgba(225, 87, 89, 1)",
-              borderWidth: 1,
-            },
-          ],
+          labels: displayCols,
+          datasets: [{ data: heatmapData }],
         },
         options: {
           plugins: {
-            title: { display: true, text: "Correlation Matrix (bubble size = |r|)", font: { size: 16 } },
-            tooltip: {
-              callbacks: {
-                label: (ctx: any) => {
-                  const d = ctx.raw;
-                  return `r = ${d.corr}`;
-                },
-              },
-            },
-          },
-          scales: {
-            x: {
-              type: "linear",
-              min: -0.5,
-              max: cols.length - 0.5,
-              ticks: {
-                stepSize: 1,
-                callback: (val: number) => displayCols[val] || "",
-              },
-              title: { display: false },
-            },
-            y: {
-              type: "linear",
-              min: -0.5,
-              max: cols.length - 0.5,
-              ticks: {
-                stepSize: 1,
-                callback: (val: number) => displayCols[val] || "",
-              },
-              title: { display: false },
-              reverse: true,
-            },
+            title: { display: true, text: "Correlation Matrix", font: { size: 16 } },
           },
         },
       },
