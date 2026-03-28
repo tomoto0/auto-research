@@ -73,13 +73,28 @@ function isSvgBuffer(buffer: Buffer): boolean {
 }
 
 async function ensurePdfEmbeddableImage(buffer: Buffer): Promise<Buffer | null> {
-  if (!isSvgBuffer(buffer)) return buffer;
+  if (!isSvgBuffer(buffer)) {
+    // Validate it's actually a PNG/JPEG by checking magic bytes
+    if (buffer.length < 8) return null;
+    const isPng = buffer[0] === 0x89 && buffer[1] === 0x50;
+    const isJpeg = buffer[0] === 0xFF && buffer[1] === 0xD8;
+    if (!isPng && !isJpeg) {
+      console.warn(`[PDF] Image buffer is neither PNG, JPEG, nor SVG (first bytes: ${buffer[0].toString(16)} ${buffer[1].toString(16)})`);
+      return null;
+    }
+    return buffer;
+  }
   try {
     const sharp = (await import("sharp")).default;
-    const pngBuffer = await sharp(buffer).png().toBuffer();
-    if (pngBuffer[0] === 0x89 && pngBuffer[1] === 0x50) {
+    const pngBuffer = await sharp(buffer)
+      .resize({ width: 900, height: 560, fit: "inside", withoutEnlargement: true })
+      .png()
+      .toBuffer();
+    if (pngBuffer[0] === 0x89 && pngBuffer[1] === 0x50 && pngBuffer.length > 500) {
+      console.log(`[PDF] SVG → PNG conversion successful: ${pngBuffer.length} bytes`);
       return pngBuffer;
     }
+    console.warn(`[PDF] SVG → PNG conversion produced invalid/tiny output (${pngBuffer.length} bytes)`);
     return null;
   } catch (err: any) {
     console.warn(`[PDF] SVG chart conversion failed: ${err?.message || "unknown error"}`);
@@ -125,6 +140,57 @@ function parseLatexToSections(
     chartUrlMap.set(`figure_${i + 1}.png`, c);
   });
 
+  // Build label→number map for cross-references (\ref{tab:X} → "1", \ref{fig:Y} → "2")
+  const labelMap = new Map<string, string>();
+  let figNum = 0, tabNum = 0;
+  // Scan for figure labels
+  const figEnvRegex = /\\begin\{figure\}[\s\S]*?\\end\{figure\}/g;
+  let figMatch: RegExpExecArray | null;
+  while ((figMatch = figEnvRegex.exec(tex)) !== null) {
+    figNum++;
+    const labelRegex = /\\label\{([^}]+)\}/g;
+    let lm: RegExpExecArray | null;
+    while ((lm = labelRegex.exec(figMatch[0])) !== null) {
+      labelMap.set(lm[1], String(figNum));
+    }
+  }
+  // Scan for table labels
+  const tabEnvRegex = /\\begin\{table\}[\s\S]*?\\end\{table\}/g;
+  let tabMatch: RegExpExecArray | null;
+  while ((tabMatch = tabEnvRegex.exec(tex)) !== null) {
+    tabNum++;
+    const labelRegex = /\\label\{([^}]+)\}/g;
+    let lm: RegExpExecArray | null;
+    while ((lm = labelRegex.exec(tabMatch[0])) !== null) {
+      labelMap.set(lm[1], String(tabNum));
+    }
+  }
+  // Scan for section labels
+  let secNum = 0;
+  const secLabelRegex = /\\section\*?\{[^}]+\}\s*\\label\{([^}]+)\}/g;
+  let sm: RegExpExecArray | null;
+  while ((sm = secLabelRegex.exec(tex)) !== null) {
+    secNum++;
+    labelMap.set(sm[1], String(secNum));
+  }
+
+  // Build citation key→number map from bibliography
+  const citationMap = new Map<string, string>();
+  const bibMatch2 = tex.match(/\\begin\{thebibliography\}\{[^}]*\}([\s\S]*?)\\end\{thebibliography\}/);
+  if (bibMatch2) {
+    let citNum = 0;
+    const bibItemRegex = /\\bibitem\{([^}]+)\}/g;
+    let bm: RegExpExecArray | null;
+    while ((bm = bibItemRegex.exec(bibMatch2[1])) !== null) {
+      citNum++;
+      citationMap.set(bm[1], String(citNum));
+    }
+  }
+
+  // Store maps in module-level variables for cleanLatexInline to use
+  _activeLabelMap = labelMap;
+  _activeCitationMap = citationMap;
+
   // Extract title
   const titleMatch = tex.match(/\\title\{([^}]+)\}/);
   const paperTitle = titleMatch ? cleanLatexInline(titleMatch[1]) : title;
@@ -137,9 +203,11 @@ function parseLatexToSections(
       .replace(/\\\\+/g, ", ") // line breaks to commas
       .replace(/\\and/g, ", ") // \and to commas
       .replace(/\\texttt\{[^}]*\}/g, "") // remove email
+      .replace(/\\thanks\{[^}]*\}/g, "") // remove \thanks (like footnote)
       .replace(/\\footnote\{[^}]*\}/g, "") // remove footnotes
       .replace(/\\affilimark\{[^}]*\}/g, "") // remove affiliation marks
       .replace(/\\inst\{[^}]*\}/g, "") // remove inst markers
+      .replace(/\\textsuperscript\{[^}]*\}/g, "") // remove superscript markers
       .replace(/\\\w+\{([^}]*)\}/g, "$1") // strip remaining commands
       .replace(/[{}]/g, "") // remove stray braces
       .replace(/\s+/g, " ") // collapse whitespace
@@ -496,7 +564,22 @@ function parseTabularContent(content: string): { headers: string[]; rows: string
     row = row.replace(/\\cline\{[^}]*\}\s*/g, "").trim();
     if (!row) continue;
 
-    const cells = row.split("&").map(c => cleanLatexInline(c.trim()));
+    const cells = row.split("&").map(c => {
+      let cell = cleanLatexInline(c.trim());
+      // Format very large/small numbers to scientific notation to prevent overflow
+      cell = cell.replace(/(-?\d+\.\d{4,}(?:e[+-]?\d+)?)/gi, (match) => {
+        const n = parseFloat(match);
+        if (!isFinite(n)) return match;
+        if (Math.abs(n) >= 1e6 || (Math.abs(n) < 0.001 && Math.abs(n) > 0)) {
+          return n.toExponential(3);
+        }
+        if (match.length > 10) {
+          return n.toPrecision(6);
+        }
+        return match;
+      });
+      return cell;
+    });
     if (headers.length === 0) {
       headers.push(...cells);
     } else {
@@ -681,19 +764,31 @@ export function latexMathToUnicode(math: string): string {
 }
 
 /**
+ * Sanitize ANY text for PDFKit rendering with built-in fonts (Times-Roman, Courier).
+ * Built-in fonts only support Basic Latin (U+0020–U+007E) and Latin-1 Supplement (U+00A0–U+00FF).
+ * Any character outside these ranges will be invisible but PDFKit still allocates layout space,
+ * causing blank pages when non-Latin text (e.g. Japanese/Chinese) is present.
+ */
+function sanitizeForPdf(text: string | undefined | null): string {
+  if (!text) return "";
+  if (typeof text !== "string") text = String(text);
+  let safe = text.replace(/[^\x20-\x7E\xA0-\xFF\n]/g, "");
+  // Collapse runs of spaces (but keep newlines)
+  safe = safe.replace(/[^\S\n]+/g, " ");
+  // Remove lines that became empty after stripping
+  safe = safe.replace(/^\s+$/gm, "");
+  // Collapse multiple blank lines
+  safe = safe.replace(/\n{3,}/g, "\n\n");
+  return safe.trim();
+}
+
+/**
  * Sanitize math text for PDFKit rendering.
  * Since latexMathToUnicode now outputs ASCII-safe text, this only needs
  * to handle edge cases where non-ASCII characters slip through.
  */
 function sanitizePdfMathText(text: string): string {
-  if (!text) return text;
-  // Replace any remaining non-ASCII characters with safe fallbacks
-  let safe = text.replace(/[^\x20-\x7E]/g, (ch) => {
-    // Keep Latin-1 supplement chars that Times-Roman supports
-    if (ch.charCodeAt(0) >= 0xA0 && ch.charCodeAt(0) <= 0xFF) return ch;
-    return "";
-  });
-  return safe.replace(/\s+/g, " ").trim();
+  return sanitizeForPdf(text);
 }
 
 /**
@@ -738,6 +833,10 @@ function toSubscript(text: string): string {
   return Array.from(text).map(ch => subMap[ch] || ch).join("");
 }
 
+// Module-level maps populated by parseLatexToSections for use in cleanLatexInline
+let _activeLabelMap: Map<string, string> = new Map();
+let _activeCitationMap: Map<string, string> = new Map();
+
 function cleanLatexInline(text: string): string {
   let result = text;
 
@@ -769,31 +868,57 @@ function cleanLatexInline(text: string): string {
   result = result.replace(/\\mathit\{([^}]+)\}/g, "$1");
   result = result.replace(/\\boldsymbol\{([^}]+)\}/g, "$1");
 
-  // Citations and references
-  result = result.replace(/\\cite(?:p|t|author|year)?\{([^}]+)\}/g, "[$1]");
-  // Resolve \ref{} to numbered references (Figure X, Table X, Section X)
-  result = result.replace(/\\ref\{fig:([^}]+)\}/g, (_m, label) => {
-    // Try to extract number from label like "figure_1" or "fig1"
-    const numMatch = label.match(/(\d+)/);
-    return numMatch ? `Figure ${numMatch[1]}` : `Figure`;
+  // Citations: resolve \cite{refN} → [N] using citation map, or extract number from key
+  result = result.replace(/\\cite(?:p|t|author|year)?\{([^}]+)\}/g, (_m: string, keys: string) => {
+    const resolved = keys.split(/\s*,\s*/).map(key => {
+      const k = key.trim();
+      // Use citation map first
+      if (_activeCitationMap.has(k)) return _activeCitationMap.get(k)!;
+      // Fallback: extract number from refN pattern
+      const numMatch = k.match(/(\d+)/);
+      return numMatch ? numMatch[1] : k;
+    });
+    return `[${resolved.join(", ")}]`;
   });
-  result = result.replace(/\\ref\{tab:([^}]+)\}/g, (_m: string, label: string) => {
-    const numMatch = label.match(/(\d+)/);
-    return numMatch ? `Table ${numMatch[1]}` : `Table`;
-  });
-  result = result.replace(/\\ref\{sec:([^}]+)\}/g, (_m: string, label: string) => {
-    // Convert section label to readable form
-    return label.replace(/_/g, " ").replace(/^\w/, (c: string) => c.toUpperCase());
+
+  // Resolve \ref{} to numbered references using label map
+  const resolveRef = (fullLabel: string, prefix: string): string => {
+    // Try label map first (populated from LaTeX source)
+    if (_activeLabelMap.has(fullLabel)) {
+      return `${prefix}${_activeLabelMap.get(fullLabel)!}`;
+    }
+    // Fallback: extract number from label name
+    const numMatch = fullLabel.match(/(\d+)/);
+    if (numMatch) return `${prefix}${numMatch[1]}`;
+    // Last resort: return just the number placeholder
+    return prefix.trim();
+  };
+  result = result.replace(/\\ref\{(fig:[^}]+)\}/g, (_m, label) => resolveRef(label, ""));
+  result = result.replace(/\\ref\{(tab:[^}]+)\}/g, (_m: string, label: string) => resolveRef(label, ""));
+  result = result.replace(/\\ref\{(sec:[^}]+)\}/g, (_m: string, label: string) => {
+    if (_activeLabelMap.has(label)) return _activeLabelMap.get(label)!;
+    const cleanLabel = label.replace(/^sec:/, "").replace(/_/g, " ");
+    return cleanLabel.replace(/^\w/, (c: string) => c.toUpperCase());
   });
   result = result.replace(/\\ref\{([^}]+)\}/g, (_m: string, label: string) => {
+    if (_activeLabelMap.has(label)) return _activeLabelMap.get(label)!;
     const numMatch = label.match(/(\d+)/);
     if (numMatch) return numMatch[1];
     return label.replace(/_/g, " ");
   });
-  result = result.replace(/\\eqref\{([^}]+)\}/g, "(Eq. $1)");
+  result = result.replace(/\\eqref\{([^}]+)\}/g, (_m: string, label: string) => {
+    if (_activeLabelMap.has(label)) return `(${_activeLabelMap.get(label)!})`;
+    return "(Eq.)";
+  });
   result = result.replace(/\\autoref\{([^}]+)\}/g, (_m: string, label: string) => {
-    if (label.startsWith("fig:")) return `Figure ${(label.match(/(\d+)/) || ["?"])[0]}`;
-    if (label.startsWith("tab:")) return `Table ${(label.match(/(\d+)/) || ["?"])[0]}`;
+    if (_activeLabelMap.has(label)) {
+      const num = _activeLabelMap.get(label)!;
+      if (label.startsWith("fig:")) return `Figure ${num}`;
+      if (label.startsWith("tab:")) return `Table ${num}`;
+      return num;
+    }
+    if (label.startsWith("fig:")) return `Figure ${(label.match(/(\d+)/) || [""])[0] || ""}`.trim();
+    if (label.startsWith("tab:")) return `Table ${(label.match(/(\d+)/) || [""])[0] || ""}`.trim();
     if (label.startsWith("sec:")) return label.replace(/^sec:/, "").replace(/_/g, " ");
     return label.replace(/_/g, " ");
   });
@@ -817,6 +942,7 @@ function cleanLatexInline(text: string): string {
   result = result.replace(/\\(?:footnotesize|scriptsize|tiny|small|normalsize|large|Large|LARGE|huge|Huge|bfseries|itshape|normalfont|rmfamily|sffamily|ttfamily)\b\s*/g, "");
 
   // Remove various commands with arguments
+  result = result.replace(/\\thanks\{[^}]*\}/g, ""); // \thanks (footnote-like)
   result = result.replace(/\\footnote\{[^}]*\}/g, "");
   result = result.replace(/\\label\{[^}]*\}/g, "");
   result = result.replace(/\\caption\*?\{[^}]*\}/g, "");
@@ -1008,7 +1134,7 @@ async function renderSectionsToPdf(
         switch (section.type) {
           case "title": {
             doc.font(FONT_SERIF_BOLD).fontSize(18);
-            const titleText = section.text || "";
+            const titleText = sanitizeForPdf(section.text || "");
             doc.text(titleText, MARGIN_LEFT, doc.y, {
               width: CONTENT_WIDTH,
               align: "center",
@@ -1020,14 +1146,14 @@ async function renderSectionsToPdf(
 
           case "author": {
             doc.font(FONT_SERIF).fontSize(11).fillColor("#333333");
-            doc.text(section.text || "", { width: CONTENT_WIDTH, align: "center" });
+            doc.text(sanitizeForPdf(section.text || ""), { width: CONTENT_WIDTH, align: "center" });
             doc.fillColor("#000000");
             doc.moveDown(0.2);
             break;
           }
 
           case "conference": {
-            const confText = section.text || "";
+            const confText = sanitizeForPdf(section.text || "");
             if (confText) {
               doc.font(FONT_SERIF).fontSize(9).fillColor("#666666");
               doc.text(confText, { width: CONTENT_WIDTH, align: "center" });
@@ -1055,7 +1181,7 @@ async function renderSectionsToPdf(
             doc.text("Abstract", MARGIN_LEFT + 20, doc.y, { width: CONTENT_WIDTH - 40 });
             doc.moveDown(0.3);
             doc.font(FONT_SERIF).fontSize(9.5);
-            doc.text(section.text || "", MARGIN_LEFT + 20, doc.y, {
+            doc.text(sanitizeForPdf(section.text || ""), MARGIN_LEFT + 20, doc.y, {
               width: CONTENT_WIDTH - 40,
               align: "justify",
               lineGap: 2,
@@ -1075,7 +1201,7 @@ async function renderSectionsToPdf(
             ensureSpace(40);
             doc.moveDown(0.8);
             doc.font(FONT_SERIF_BOLD).fontSize(13);
-            doc.text(section.text || "", MARGIN_LEFT, doc.y, { width: CONTENT_WIDTH });
+            doc.text(sanitizeForPdf(section.text || ""), MARGIN_LEFT, doc.y, { width: CONTENT_WIDTH });
             doc.moveDown(0.15);
             // Subtle underline
             doc.moveTo(MARGIN_LEFT, doc.y).lineTo(PAGE_WIDTH - MARGIN_RIGHT, doc.y).strokeColor("#eeeeee").lineWidth(0.5).stroke();
@@ -1087,7 +1213,7 @@ async function renderSectionsToPdf(
             ensureSpace(30);
             doc.moveDown(0.5);
             doc.font(FONT_SERIF_BOLD).fontSize(11.5);
-            doc.text(section.text || "", MARGIN_LEFT, doc.y, { width: CONTENT_WIDTH });
+            doc.text(sanitizeForPdf(section.text || ""), MARGIN_LEFT, doc.y, { width: CONTENT_WIDTH });
             doc.moveDown(0.25);
             break;
           }
@@ -1096,15 +1222,17 @@ async function renderSectionsToPdf(
             ensureSpace(20);
             doc.moveDown(0.2);
             doc.font(FONT_SERIF_ITALIC).fontSize(11);
-            doc.text(section.text || "", MARGIN_LEFT, doc.y, { width: CONTENT_WIDTH });
+            doc.text(sanitizeForPdf(section.text || ""), MARGIN_LEFT, doc.y, { width: CONTENT_WIDTH });
             doc.moveDown(0.2);
             break;
           }
 
           case "paragraph": {
+            const paraText = sanitizeForPdf(section.text || "");
+            if (!paraText) break; // skip empty paragraphs after sanitization
             ensureSpace(20);
             doc.font(FONT_SERIF).fontSize(10.5);
-            doc.text(section.text || "", MARGIN_LEFT, doc.y, {
+            doc.text(paraText, MARGIN_LEFT, doc.y, {
               width: CONTENT_WIDTH,
               align: "justify",
               lineGap: 2,
@@ -1115,25 +1243,23 @@ async function renderSectionsToPdf(
           }
 
           case "figure": {
-            // Add spacing before figure
-            doc.moveDown(0.8);
+            let imageEmbedded = false;
 
             if (section.imageUrl) {
               try {
                 const rawBuffer = await fetchImageBuffer(section.imageUrl);
                 const imgBuffer = rawBuffer ? await ensurePdfEmbeddableImage(rawBuffer) : null;
-                if (imgBuffer && imgBuffer.length > 100) {
+                if (imgBuffer && imgBuffer.length > 500) {
                   // Calculate image dimensions to fit within content width
                   const maxImgWidth = CONTENT_WIDTH * 0.85;
                   const maxImgHeight = 280;
 
                   // Estimate actual rendered height for page-break calculation
-                  // PDFKit's image with fit returns the actual dimensions used
                   const captionHeight = section.caption ? 30 : 0;
-                  const totalFigureHeight = maxImgHeight + captionHeight + 40; // image + caption + margins
+                  const totalFigureHeight = maxImgHeight + captionHeight + 40;
                   ensureSpace(totalFigureHeight);
 
-                  // Draw light border around figure area
+                  doc.moveDown(0.8);
                   const figStartY = doc.y;
 
                   // Center the image
@@ -1144,7 +1270,6 @@ async function renderSectionsToPdf(
                   });
 
                   // PDFKit does not auto-advance y after image with fit; manually advance
-                  // Calculate actual image height from aspect ratio
                   try {
                     const sizeOf = (await import("image-size")).default;
                     const dims = sizeOf(imgBuffer);
@@ -1156,29 +1281,44 @@ async function renderSectionsToPdf(
                       doc.y = figStartY + maxImgHeight + 8;
                     }
                   } catch {
-                    // If image-size fails, use maxImgHeight as fallback
                     doc.y = figStartY + maxImgHeight + 8;
                   }
+                  imageEmbedded = true;
+                } else {
+                  console.warn(`[PDF] Image buffer too small or invalid for ${section.caption || "figure"}`);
                 }
               } catch (imgErr: any) {
                 console.warn(`[PDF] Failed to embed image: ${imgErr.message}`);
-                doc.font(FONT_SERIF_ITALIC).fontSize(9).fillColor("#999999");
-                doc.text("[Image could not be loaded]", { width: CONTENT_WIDTH, align: "center" });
-                doc.fillColor("#000000");
-                doc.moveDown(0.3);
               }
             }
+
+            if (!imageEmbedded) {
+              // Show a placeholder box for the missing figure
+              ensureSpace(60);
+              doc.moveDown(0.4);
+              const placeholderY = doc.y;
+              doc.rect(MARGIN_LEFT + 40, placeholderY, CONTENT_WIDTH - 80, 40)
+                .fillOpacity(0.04).fill("#666666");
+              doc.fillOpacity(1).fillColor("#999999");
+              doc.font(FONT_SERIF_ITALIC).fontSize(9);
+              doc.text("[Figure image not available]", MARGIN_LEFT, placeholderY + 14, {
+                width: CONTENT_WIDTH, align: "center",
+              });
+              doc.fillColor("#000000");
+              doc.y = placeholderY + 48;
+            }
+
             if (section.caption) {
               ensureSpace(25);
               doc.font(FONT_SERIF_ITALIC).fontSize(9);
-              doc.text(section.caption, MARGIN_LEFT + 20, doc.y, {
+              doc.text(sanitizeForPdf(section.caption), MARGIN_LEFT + 20, doc.y, {
                 width: CONTENT_WIDTH - 40,
                 align: "center",
               });
               doc.moveDown(0.3);
             }
             // Add spacing after figure
-            doc.moveDown(0.8);
+            doc.moveDown(0.5);
             break;
           }
 
@@ -1196,7 +1336,7 @@ async function renderSectionsToPdf(
             // Table caption
             if (section.tableCaption) {
               doc.font(FONT_SERIF_BOLD).fontSize(9);
-              doc.text(section.tableCaption, MARGIN_LEFT, doc.y, { width: CONTENT_WIDTH });
+              doc.text(sanitizeForPdf(section.tableCaption), MARGIN_LEFT, doc.y, { width: CONTENT_WIDTH });
               doc.moveDown(0.3);
             }
 
@@ -1222,7 +1362,7 @@ async function renderSectionsToPdf(
               const cellX = tableStartX + i * colWidth + cellPadding;
               doc.font(FONT_SERIF_BOLD).fontSize(fontSize);
               doc.text(
-                (section.headers[i] || "").substring(0, Math.floor(colWidth / (fontSize * 0.5))),
+                sanitizeForPdf((section.headers[i] || "").substring(0, Math.floor(colWidth / (fontSize * 0.5)))),
                 cellX,
                 headerY + cellPadding,
                 { width: colWidth - cellPadding * 2, align: "left", lineBreak: false }
@@ -1255,7 +1395,7 @@ async function renderSectionsToPdf(
                   const cellX = tableStartX + i * colWidth + cellPadding;
                   doc.font(FONT_SERIF_BOLD).fontSize(fontSize);
                   doc.text(
-                    (section.headers[i] || "").substring(0, Math.floor(colWidth / (fontSize * 0.5))),
+                    sanitizeForPdf((section.headers[i] || "").substring(0, Math.floor(colWidth / (fontSize * 0.5)))),
                     cellX,
                     continuedHeaderY + cellPadding,
                     { width: colWidth - cellPadding * 2, align: "left", lineBreak: false }
@@ -1271,7 +1411,7 @@ async function renderSectionsToPdf(
               }
               for (let i = 0; i < numCols; i++) {
                 const cellX = tableStartX + i * colWidth + cellPadding;
-                const cellText = (row[i] || "").substring(0, Math.floor(colWidth / (fontSize * 0.45)));
+                const cellText = sanitizeForPdf((row[i] || "").substring(0, Math.floor(colWidth / (fontSize * 0.45))));
                 doc.text(cellText, cellX, currentY + cellPadding, {
                   width: colWidth - cellPadding * 2,
                   align: "left",
@@ -1293,11 +1433,12 @@ async function renderSectionsToPdf(
 
           case "equation": {
             // Display math equation - centered with subtle background
-            const eqText = section.text || "";
+            const eqText = sanitizeForPdf(section.text || "");
+            if (!eqText) break; // skip empty equations after sanitization
             const eqLines = eqText
               .split("\n")
-              .map((l: string) => sanitizePdfMathText(l))
-              .filter((l: string) => l.trim());
+              .map((l: string) => l.trim())
+              .filter((l: string) => l.length > 0);
             const lineHeight = 14;
             const eqTotalHeight = eqLines.length * lineHeight + 24; // padding top/bottom
             ensureSpace(eqTotalHeight + 20);
@@ -1340,8 +1481,10 @@ async function renderSectionsToPdf(
             ensureSpace(20);
             doc.font(FONT_SERIF).fontSize(10.5);
             for (const item of (section.items || [])) {
+              const listText = sanitizeForPdf(item);
+              if (!listText) continue; // skip empty items after sanitization
               ensureSpace(15);
-              doc.text(`  •  ${item}`, MARGIN_LEFT + 10, doc.y, {
+              doc.text(`  •  ${listText}`, MARGIN_LEFT + 10, doc.y, {
                 width: CONTENT_WIDTH - 20,
                 lineGap: 2,
               });
@@ -1362,8 +1505,10 @@ async function renderSectionsToPdf(
 
             doc.font(FONT_SERIF).fontSize(9.5);
             (section.items || []).forEach((item, i) => {
+              const bibText = sanitizeForPdf(item);
+              if (!bibText) return; // skip empty bibliography entries
               ensureSpace(15);
-              doc.text(`[${i + 1}] ${item}`, MARGIN_LEFT + 5, doc.y, {
+              doc.text(`[${i + 1}] ${bibText}`, MARGIN_LEFT + 5, doc.y, {
                 width: CONTENT_WIDTH - 10,
                 lineGap: 1.5,
               });

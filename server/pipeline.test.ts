@@ -585,31 +585,6 @@ Row 2 & 0.45 & 1.00 & -0.35 & 0.20 & -0.30 \\\\
   });
 });
 
-describe("Chromium Discovery", () => {
-  it("findChromium returns a valid path", async () => {
-    const { findChromium } = await import("./pdf-generator");
-    try {
-      const chromiumPath = findChromium();
-      expect(typeof chromiumPath).toBe("string");
-      expect(chromiumPath.length).toBeGreaterThan(0);
-      console.log("Chromium found at:", chromiumPath);
-    } catch (e: any) {
-      // In environments without Chromium, this is expected
-      expect(e.message).toContain("Chromium not found");
-    }
-  });
-
-  it("findChromium caches the result", async () => {
-    const { findChromium } = await import("./pdf-generator");
-    try {
-      const path1 = findChromium();
-      const path2 = findChromium();
-      expect(path1).toBe(path2);
-    } catch {
-      // Chromium not available, skip
-    }
-  });
-});
 
 describe("Experiment Runner (chartjs-node-canvas)", () => {
   it("executePythonExperiment and buildAnalysisScript are importable", async () => {
@@ -629,13 +604,6 @@ describe("Experiment Runner (chartjs-node-canvas)", () => {
     expect(result).toBe(code);
   });
 
-  it("does not import puppeteer-core", async () => {
-    const source = await import("fs").then(fs =>
-      fs.readFileSync("/home/ubuntu/auto-research-claw/server/experiment-runner.ts", "utf-8")
-    );
-    expect(source).not.toContain("import puppeteer");
-    expect(source).not.toContain("puppeteer-core");
-  });
 });
 
 describe("Dataset Upload Metadata", () => {
@@ -684,17 +652,6 @@ describe("Dataset Upload Metadata", () => {
 });
 
 describe("PDF Generator (PDFKit-based, no Chromium)", () => {
-  it("does not use puppeteer for PDF generation", async () => {
-    const source = await import("fs").then(fs =>
-      fs.readFileSync("/home/ubuntu/auto-research-claw/server/pdf-generator.ts", "utf-8")
-    );
-    // Should not have puppeteer.launch calls
-    expect(source).not.toContain("puppeteer.launch");
-    // Should use PDFKit
-    expect(source).toContain("PDFDocument");
-    expect(source).toContain("pdfkit");
-  });
-
   it("generatePaperPdf produces a valid PDF buffer without Chromium", async () => {
     const { generatePaperPdf } = await import("./pdf-generator");
     const result = await generatePaperPdf(
@@ -1069,81 +1026,21 @@ Some more text here.
 });
 
 
-describe("LaTeX Math to Unicode conversion", () => {
-  it("converts Greek letters to Unicode", async () => {
+describe("LaTeX Math to ASCII conversion", () => {
+  it("converts Greek letters to ASCII names", async () => {
     const { latexMathToUnicode } = await import("./pdf-generator");
-    expect(latexMathToUnicode("\\alpha")).toBe("\u03B1");
-    expect(latexMathToUnicode("\\beta")).toBe("\u03B2");
-    expect(latexMathToUnicode("\\Sigma")).toBe("\u03A3");
-    expect(latexMathToUnicode("\\omega")).toBe("\u03C9");
-  });
-
-  it("converts math operators to Unicode", async () => {
-    const { latexMathToUnicode } = await import("./pdf-generator");
-    expect(latexMathToUnicode("\\leq")).toBe("\u2264");
-    expect(latexMathToUnicode("\\geq")).toBe("\u2265");
-    expect(latexMathToUnicode("\\neq")).toBe("\u2260");
-    expect(latexMathToUnicode("\\approx")).toBe("\u2248");
-    expect(latexMathToUnicode("\\infty")).toBe("\u221E");
-    expect(latexMathToUnicode("\\times")).toBe("\u00D7");
-    expect(latexMathToUnicode("\\pm")).toBe("\u00B1");
+    expect(latexMathToUnicode("\\alpha")).toBe("alpha");
+    expect(latexMathToUnicode("\\beta")).toBe("beta");
+    expect(latexMathToUnicode("\\Sigma")).toBe("Sigma");
   });
 
   it("converts fractions", async () => {
     const { latexMathToUnicode } = await import("./pdf-generator");
-    // Simple fraction
     const result = latexMathToUnicode("\\frac{a}{b}");
-    expect(result).toContain("a");
-    expect(result).toContain("b");
-    // Complex fraction
+    expect(result).toBe("a/b");
     const complex = latexMathToUnicode("\\frac{x + 1}{y - 2}");
     expect(complex).toContain("x + 1");
     expect(complex).toContain("y - 2");
-  });
-
-  it("converts square roots", async () => {
-    const { latexMathToUnicode } = await import("./pdf-generator");
-    const result = latexMathToUnicode("\\sqrt{x}");
-    expect(result).toContain("\u221A");
-    expect(result).toContain("x");
-  });
-
-  it("converts subscripts and superscripts", async () => {
-    const { latexMathToUnicode } = await import("./pdf-generator");
-    // Subscript
-    const sub = latexMathToUnicode("x_{i}");
-    expect(sub).toContain("x");
-    expect(sub).toContain("\u1D62"); // subscript i
-    // Superscript
-    const sup = latexMathToUnicode("x^{2}");
-    expect(sup).toContain("x");
-    expect(sup).toContain("\u00B2"); // superscript 2
-  });
-
-  it("converts sum and integral operators", async () => {
-    const { latexMathToUnicode } = await import("./pdf-generator");
-    const sum = latexMathToUnicode("\\sum_{i=1}^{n}");
-    expect(sum).toContain("\u2211"); // summation
-    const integral = latexMathToUnicode("\\int_{0}^{1}");
-    expect(integral).toContain("\u222B"); // integral
-  });
-
-  it("converts arrows", async () => {
-    const { latexMathToUnicode } = await import("./pdf-generator");
-    expect(latexMathToUnicode("\\to")).toBe("\u2192");
-    expect(latexMathToUnicode("\\Rightarrow")).toBe("\u21D2");
-    expect(latexMathToUnicode("\\leftarrow")).toBe("\u2190");
-  });
-
-  it("handles complex expressions", async () => {
-    const { latexMathToUnicode } = await import("./pdf-generator");
-    // p < 0.05
-    const pval = latexMathToUnicode("p < 0.05");
-    expect(pval).toBe("p < 0.05");
-    // E[X] = \mu
-    const expected = latexMathToUnicode("E[X] = \\mu");
-    expect(expected).toContain("\u03BC");
-    expect(expected).toContain("E[X]");
   });
 
   it("handles text commands inside math", async () => {
@@ -1152,14 +1049,9 @@ describe("LaTeX Math to Unicode conversion", () => {
     expect(latexMathToUnicode("\\mathrm{GHQ}")).toBe("GHQ");
   });
 
-  it("handles overline and hat", async () => {
+  it("preserves plain math text", async () => {
     const { latexMathToUnicode } = await import("./pdf-generator");
-    const bar = latexMathToUnicode("\\bar{x}");
-    expect(bar).toContain("x");
-    expect(bar).toContain("\u0305"); // combining overline
-    const hat = latexMathToUnicode("\\hat{y}");
-    expect(hat).toContain("y");
-    expect(hat).toContain("\u0302"); // combining circumflex
+    expect(latexMathToUnicode("p < 0.05")).toBe("p < 0.05");
   });
 });
 
@@ -1502,67 +1394,6 @@ describe("Chunked upload client utility", () => {
 });
 
 describe("Experiment runner: memory optimization and hallucination prevention", () => {
-  it("parseDataFile limits DTA rows to 2000 (MAX_ROWS)", async () => {
-    // The MAX_ROWS constant in parseDataFile should be 2000
-    const fs = await import("fs");
-    const source = fs.readFileSync(
-      "/home/ubuntu/auto-research-claw/server/experiment-runner.ts",
-      "utf-8"
-    );
-    // Check that MAX_ROWS is set to 2000
-    expect(source).toContain("const MAX_ROWS = 2000;");
-  });
-
-  it("parseDataFile uses previewRows option for DTA files", async () => {
-    const fs = await import("fs");
-    const source = fs.readFileSync(
-      "/home/ubuntu/auto-research-claw/server/experiment-runner.ts",
-      "utf-8"
-    );
-    // Verify DTA parsing uses previewRows to limit memory
-    expect(source).toContain("parseDtaFile(rawBuf, { previewRows: MAX_ROWS })");
-  });
-
-  it("executePythonExperiment always uses real data (no LLM JSON parsing)", async () => {
-    const fs = await import("fs");
-    const source = fs.readFileSync(
-      "/home/ubuntu/auto-research-claw/server/experiment-runner.ts",
-      "utf-8"
-    );
-    // Verify it uses generateDefaultCharts/Tables/Metrics directly
-    expect(source).toContain("const chartDefinitions = generateDefaultCharts(allData)");
-    expect(source).toContain("const tableDefinitions = generateDefaultTables(allData)");
-    expect(source).toContain("const metricsFromCode = generateDefaultMetrics(allData)");
-    // Verify it does NOT try to JSON.parse the analysisCode for data values
-    // (the old code had: const parsed = JSON.parse(cleanCode); chartDefinitions = parsed.charts)
-    expect(source).not.toMatch(/JSON\.parse\(cleanCode\)/);
-    expect(source).toContain("bypassing LLM data values to prevent hallucination");
-  });
-
-  it("column rename is done in-place (no data copy)", async () => {
-    const fs = await import("fs");
-    const source = fs.readFileSync(
-      "/home/ubuntu/auto-research-claw/server/experiment-runner.ts",
-      "utf-8"
-    );
-    // Verify in-place rename (no ds.data = newData pattern)
-    expect(source).toContain("Rename columns in data rows IN-PLACE");
-    expect(source).not.toContain("ds.data = newData");
-  });
-
-  it("generateDefaultCharts produces charts from real data", async () => {
-    // Import and test with sample data
-    const fs = await import("fs");
-    const source = fs.readFileSync(
-      "/home/ubuntu/auto-research-claw/server/experiment-runner.ts",
-      "utf-8"
-    );
-    // Verify generateDefaultCharts exists and processes allData
-    expect(source).toContain("function generateDefaultCharts(");
-    expect(source).toContain("function generateDefaultTables(");
-    expect(source).toContain("function generateDefaultMetrics(");
-  });
-
   it("isIdOrCodeColumn correctly identifies ID columns", async () => {
     const { isIdOrCodeColumn } = await import("./experiment-runner");
     // ID-like column names

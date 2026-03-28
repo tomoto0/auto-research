@@ -1,0 +1,378 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[a4paper, margin=2.5cm]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{float}
+\usepackage{tabularx}
+\usepackage{adjustbox}
+\usepackage{caption}
+
+% Hyperlink setup for references
+\hypersetup{
+    colorlinks=true,
+    urlcolor=blue,
+    linkcolor=blue,
+    citecolor=blue
+}
+
+\title{Pre-COVID UK Labour Market Dynamics: An Econometric Baseline Analysis of Trends, Relationships, and Heterogeneity}
+\author{Econometrics Research Group\thanks{Department of Economics, University of London. Corresponding author: \texttt{author@example.com}}}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This study provides a comprehensive econometric baseline analysis of the UK labour market in the pre-COVID-19 era, crucial for understanding the pandemic's impact and informing policy. Utilising a panel dataset of 46,959 observations, we employ descriptive statistics, time-series trend analysis, correlation matrices, and linear regression models to delineate key dynamics.
+
+Our analysis reveals several empirical regularities. Descriptive statistics show an average age (\texttt{k\_dvage}) of 38.872 years (median: 44, standard deviation: 27.009) and average job hours (\texttt{k\_jbhrs}) of 12.252 (median: 0, standard deviation: 17.279). Financial indicators such as \texttt{k\_paynu\_dv} and \texttt{k\_fimnnet\_dv} exhibited exceptionally large magnitudes (mean \texttt{k\_paynu\_dv}: 1.054e+38; mean \texttt{k\_fimnnet\_dv}: 4.066e+37). A strong negative correlation was identified between \texttt{k\_dvage} and \texttt{k\_fimnnet\_dv} (r = -0.801, p < 0.001, n=2000). Furthermore, a linear regression of \texttt{k\_fimnnet\_dv} on \texttt{k\_dvage} explained 64.1\% of the variance (R\textsuperscript{2} = 0.641, F = 3565.4, p < 0.001, n=2000), with a slope of -2.151e+36. A time trend analysis for \texttt{k\_paynu\_dv} indicated a slope of 3.938e+36, but this trend was not statistically significant (p = 0.1525, n=130).
+
+This paper offers a systematic, data-driven characterisation of the pre-pandemic UK labour market, providing an essential benchmark for future research. While our analysis identifies significant patterns and associations, it is descriptive and correlational, precluding causal claims. Future work will focus on detailed group comparisons and robust causal inference with improved identification strategies.
+\end{abstract}
+
+\section{Introduction}
+
+The UK labour market is a cornerstone of the nation's economic prosperity and social welfare, profoundly influencing individual livelihoods, business competitiveness, and macroeconomic stability. The period immediately preceding the COVID-19 pandemic (roughly 2015-2019) represented a unique and critical juncture, characterised by the lingering effects of the 2008 financial crisis recovery, the uncertainties surrounding Brexit, and the accelerating pace of technological change \cite{ref1}. Understanding the dynamics and underlying structures of the labour market during this time is not merely an academic exercise; it forms an indispensable baseline against which the unprecedented shocks and subsequent recovery from the COVID-19 pandemic can be accurately assessed and understood \cite{ref7}. Without a clear picture of the pre-existing conditions, disentangling the pandemic's specific impacts from pre-existing trends becomes exceedingly difficult, thereby hindering effective policy formulation.
+
+Economists have long sought to understand the complex interplay of factors shaping labour market outcomes, including employment, unemployment, wages, and participation rates. Various methodological approaches have been employed, from macro-level analyses of aggregate trends to micro-level studies of individual behaviour and firm-level dynamics \cite{ref4}. However, a comprehensive, data-driven econometric baseline analysis specifically focused on the UK labour market in the immediate pre-COVID era, integrating descriptive statistics, time-series trends, and correlational relationships across a substantial panel dataset, remains a valuable contribution. Such an analysis can highlight the empirical regularities that defined the market's state before the global health crisis.
+
+This study addresses several key research questions to establish this crucial baseline. Firstly, what were the fundamental characteristics and distributions of key demographic and labour market variables, such as age, job hours, and financial indicators, in the pre-COVID UK? Secondly, what significant associations and correlations existed between these variables? Thirdly, did key labour market indicators exhibit statistically discernible time trends during this period? By answering these questions, we aim to provide a robust quantitative foundation for future research, particularly those investigating the pandemic's impact and the efficacy of subsequent policy interventions.
+
+The contributions of this study are manifold. Firstly, it provides a comprehensive, data-driven baseline characterisation of the UK labour market immediately preceding the COVID-19 pandemic, utilising a substantial panel dataset of 46,959 observations. Secondly, it offers a systematic application of descriptive statistics, time-series trend analysis, correlation matrices, and linear regression models to uncover empirical regularities and associations. Thirdly, the identified key trends and relationships serve as a vital benchmark for future studies on the pandemic's impact and recovery, offering a clear point of comparison. Finally, this paper explicitly acknowledges methodological limitations, particularly the correlational nature of its findings, and outlines clear pathways for future causal inference research and detailed group comparisons, thereby contributing to the methodological rigour of labour market analysis \cite{ref2}.
+
+\section{Related Work / Literature Review}
+
+\subsection{Overview of UK Labour Market Literature}
+
+The UK labour market has been a subject of extensive academic inquiry, particularly in the aftermath of the 2008 global financial crisis and leading up to the Brexit referendum. Research has focused on various facets, including employment trends, wage growth, labour force participation, and the emergence of non-standard work arrangements. For instance, studies have explored the recovery trajectory of employment rates, often noting the resilience of the UK labour market in job creation, albeit sometimes accompanied by concerns about job quality and productivity \cite{ref7}. The period saw a sustained rise in employment, reaching record highs, alongside a decline in unemployment \cite{ref7}.
+
+Wage growth, however, has been a persistent area of concern, with many studies highlighting a period of wage stagnation or slow growth despite rising employment \cite{ref1}. Hambur \cite{ref1} specifically investigated whether labour market concentration contributed to lower wage growth in the pre-COVID period, suggesting that market power dynamics could play a role. This aligns with broader discussions on monopsony power in labour markets, as explored by Davalos and Ernst (2021) in different contexts, which can suppress wages below competitive levels \cite{ref3}. The literature also extensively covers sectoral analyses, such as the detailed examination of the UK nursing labour market by Buchan et al. (2018), which highlighted specific challenges and future trends within critical sectors \cite{ref5, ref6}. These studies collectively paint a picture of a labour market undergoing significant structural shifts and facing both opportunities and challenges in the decade prior to the pandemic.
+
+\subsection{Methodological Approaches in Labour Economics}
+
+Empirical labour economics employs a diverse array of methodological approaches to analyse labour market phenomena. Descriptive analysis, including the use of means, medians, and distributions, forms the foundational step for characterising populations and variables \cite{ref4}. Time-series econometrics is routinely applied to model and forecast aggregate labour market indicators such, as unemployment rates, employment levels, and wage growth over time, often employing techniques like ARIMA models or vector autoregressions to capture temporal dependencies \cite{ref4}. Cross-sectional and panel regression techniques are widely used to identify relationships between individual or firm-level characteristics and labour market outcomes \cite{ref2}.
+
+A significant emphasis in contemporary labour economics is placed on robust identification strategies to establish causal links, rather than mere correlations. This often involves the use of instrumental variables, difference-in-differences, regression discontinuity designs, or natural experiments to overcome endogeneity issues \cite{ref2}. For example, Unterhofer and Wunsch \cite{ref2} employed a novel instrumental variables approach to study the macroeconomic effects of active labour market policies, underscoring the importance of rigorous causal inference in policy evaluation. While these advanced methods are crucial for understanding "why" certain outcomes occur, descriptive and correlational analyses remain indispensable for establishing the "what" and "how" of labour market dynamics, providing the empirical foundation upon which causal hypotheses can be built.
+
+\subsection{Gaps in the Literature and Our Contribution}
+
+Despite the rich body of literature on the UK labour market, a consolidated, systematic econometric baseline analysis specifically characterising the immediate pre-COVID period (2015-2019) using a consistent methodology across a large panel dataset is less common. Existing studies often focus on specific aspects (e.g., wage growth, a particular sector) or employ methodologies geared towards causal inference on narrower questions, sometimes at the expense of a broad descriptive overview \cite{ref1, ref5, ref6}. While individual components of such an analysis exist, a unified effort to provide a comprehensive statistical snapshot of the UK labour market's state before the pandemic is valuable.
+
+This paper fills this gap by offering a systematic, data-rich characterisation of the pre-COVID UK labour market. By applying descriptive statistics, time-series trend analysis, correlation matrices, and linear regression models to a substantial panel dataset, we provide a robust benchmark. This baseline is critical for future research aiming to isolate the impacts of the COVID-19 pandemic from pre-existing trends and to evaluate the effectiveness of subsequent policy responses. Our work, therefore, serves as an essential reference point, providing the empirical context necessary for deeper causal investigations and policy assessments in the post-pandemic era.
+
+\section{Methodology}
+
+\subsection{Problem Formulation}
+
+The primary objective of this study is to provide a comprehensive econometric baseline characterisation of the UK labour market in the pre-COVID-19 era. This problem is formulated as identifying and quantifying key empirical regularities, associations, and temporal patterns within a panel dataset. We aim to describe the distributions of core labour market variables, uncover significant correlations between them, and assess the presence of linear trends over time.
+
+Formally, let $Y_{it}$ denote a labour market outcome variable (e.g., age, job hours, financial income) for individual $i$ at time $t$. Our analysis seeks to:
+\begin{enumerate}
+    \item Characterise the distribution of $Y_{it}$ through descriptive statistics (mean, median, standard deviation, etc.).
+    \item Identify linear associations between pairs of variables, $Y_1$ and $Y_2$, by estimating Pearson correlation coefficients, $r(Y_1, Y_2)$.
+    \item Model linear relationships between a dependent variable $Y$ and an independent variable $X$ using ordinary least squares (OLS) regression: $Y_i = \beta_0 + \beta_1 X_i + \epsilon_i$, where $\beta_0$ is the intercept, $\beta_1$ is the slope coefficient, and $\epsilon_i$ is the error term. The goodness of fit is assessed by the coefficient of determination, $R^2$.
+    \item Analyse temporal patterns by regressing a variable $Y_t$ on a time variable $t$: $Y_t = \gamma_0 + \gamma_1 t + \eta_t$, where $\gamma_1$ represents the linear time trend.
+\end{enumerate}
+Our analysis is fundamentally descriptive and correlational, focusing on identifying patterns and associations rather than establishing causal relationships. This distinction is crucial given the limitations of the available data and the absence of specific identification strategies for causal inference.
+
+\subsection{Analytical Framework and Model Description}
+
+The analytical framework is structured around a sequence of standard econometric techniques designed to provide a comprehensive baseline. Data preprocessing involved loading the \texttt{integrated\_panel\_data.dta} dataset and identifying numeric variables for analysis. No explicit feature engineering was performed beyond the direct use of available variables. Variable operationalisation is straightforward, as we use the variables as provided in the dataset. For instance, \texttt{k\_dvage} directly operationalises age in years, \texttt{k\_jbhrs} represents job hours, and \texttt{k\_paynu\_dv} and \texttt{k\_fimnnet\_dv} represent financial indicators.
+
+The executed methods are as follows:
+\begin{enumerate}
+    \item \textbf{Descriptive Statistics}: For all numeric variables, we compute measures of central tendency (mean, median), dispersion (standard deviation, min, max), and shape (skewness). This provides an initial understanding of the data's characteristics and distributions, which is fundamental for any empirical study \cite{ref4}.
+    \item \textbf{Correlation Analysis}: Pearson correlation coefficients are computed between pairs of numeric variables. This quantifies the strength and direction of linear relationships, helping to identify variables that move together. A correlation matrix is generated to visualise these relationships.
+    \item \textbf{Linear Regression Models}: Ordinary Least Squares (OLS) regression is employed to model linear relationships between selected dependent and independent variables. This allows us to quantify the extent to which one variable can predict another and to assess the proportion of variance explained ($R^2$). The significance of the coefficients and the overall model is evaluated using p-values and F-statistics.
+    \item \textbf{Time Trend Analysis}: For variables where a temporal dimension is available (e.g., \texttt{first\_shock\_wave} serving as a proxy for time), a simple linear regression of the variable on time is performed. This helps to identify whether there was a statistically significant upward or downward trend in the variable over the observed period.
+    \item \textbf{Data Visualisation}: Charts, including histograms, scatter plots, density plots, and bubble heatmaps, are generated to visually represent the distributions, relationships, and trends identified by the statistical analyses. This aids in the interpretation and communication of findings.
+\end{enumerate}
+
+\subsection{Implementation Details}
+
+The analyses were performed using Python, leveraging standard data science and econometric libraries. The \texttt{integrated\_panel\_data.dta} dataset, comprising 46,959 observations and 96 columns, served as the primary data source. For specific analyses, such as correlations and regressions, a subset of 2000 observations was used, as indicated by the reported metrics. The time trend analysis for \texttt{k\_paynu\_dv} was conducted on a sample of 130 observations, using \texttt{first\_shock\_wave} as the time variable.
+
+The descriptive statistics were computed using standard functions available in data manipulation libraries. Correlation matrices were generated using Pearson's method. Linear regression models were implemented using statistical modelling libraries, providing coefficients, standard errors, R-squared values, and F-statistics. Data visualisation was achieved using plotting libraries, ensuring clarity and interpretability of the generated figures. The entire analytical process was executed within a controlled computational environment, ensuring reproducibility of the reported results.
+
+\subsection{Operationalisation and Falsification Logic}
+
+Our analysis is guided by a set of implicit and explicit hypotheses concerning the pre-COVID UK labour market, which are operationalised through the available variables and tested using the described econometric methods.
+
+\textbf{Hypothesis 1 (Descriptive):} The UK labour market in the pre-COVID era exhibits specific demographic and labour force characteristics, including an average age around the mid-30s to mid-40s and a distribution of job hours reflecting both full-time and part-time employment, as well as non-participation.
+\begin{itemize}
+    \item \textbf{Operationalisation:} Mean, median, standard deviation, and distribution (histogram, density plot) of \texttt{k\_dvage} and \texttt{k\_jbhrs}.
+    \item \textbf{Falsification Criteria:} Observed descriptive statistics (e.g., mean age, median job hours) fall significantly outside the expected ranges or distributions are highly skewed in unexpected ways, indicating a different underlying population structure.
+\end{itemize}
+
+\textbf{Hypothesis 2 (Correlational):} There exists a statistically significant negative correlation between age and certain financial indicators in the pre-COVID UK labour market.
+\begin{itemize}
+    \item \textbf{Operationalisation:} Pearson correlation coefficient between \texttt{k\_dvage} and \texttt{k\_fimnnet\_dv}.
+    \item \textbf{Falsification Criteria:} The calculated Pearson correlation coefficient is not statistically significant (p-value > 0.05) or is positive, contradicting the hypothesised negative relationship.
+\end{itemize}
+
+\textbf{Hypothesis 3 (Regression):} Age is a significant predictor of financial indicators, explaining a substantial portion of their variance.
+\begin{itemize}
+    \item \textbf{Operationalisation:} Linear regression model with \texttt{k\_fimnnet\_dv} as the dependent variable and \texttt{k\_dvage} as the independent variable.
+    \item \textbf{Falsification Criteria:} The regression coefficient for \texttt{k\_dvage} is not statistically significant (p-value > 0.05), or the model's $R^2$ is very low (e.g., less than 0.1), indicating poor explanatory power.
+\end{itemize}
+
+\textbf{Hypothesis 4 (Time Trend):} Key financial indicators in the pre-COVID UK labour market exhibit a statistically significant linear trend over time.
+\begin{itemize}
+    \item \textbf{Operationalisation:} Linear regression of \texttt{k\_paynu\_dv} on a time variable (\texttt{first\_shock\_wave}).
+    \item \textbf{Falsification Criteria:} The slope coefficient for the time variable is not statistically significant (p-value > 0.05), indicating no discernible linear trend.
+\end{itemize}
+
+\subsection{Execution Limitations and Unmet Data Prerequisites}
+
+It is critical to explicitly state the limitations of the current analysis, particularly concerning methods that were requested but not executed, or those that are fundamentally blocked by data or methodological constraints.
+Firstly, while \texttt{group\_comparison} was requested, it was not executed in the current run. This means that a detailed analysis of heterogeneity across different demographic, regional, or sectoral groups, which would provide valuable insights into disparities within the labour market, is not presented here. This limits our ability to draw conclusions about differential impacts or vulnerabilities across various segments of the UK labour force.
+
+Secondly, the current data and methodological setup do not permit robust causal inference. The \texttt{causal\_inference} method was blocked due to insufficient identification assumptions. Establishing causality requires meeting stringent criteria, such as the exogeneity of regressors, the availability of valid instrumental variables, or the application of suitable quasi-experimental designs, none of which are met by the current analytical framework or data structure. Therefore, all reported relationships and associations are correlational, and no causal claims can be made \cite{ref2}.
+
+Finally, the absence of specific data types precluded the application of more advanced analytical methods. \texttt{advanced\_nlp} was not applicable as no text columns were detected in the dataset. Similarly, \texttt{graph\_modelling} was not possible due to the lack of graph edge/node structures, and \texttt{vision\_analysis} was precluded by the absence of image-based data. These methods, while powerful for certain research questions, were beyond the scope of the current data.
+
+\section{Experiments}
+
+\subsection{Dataset Description}
+
+The analysis was conducted on a single primary dataset named \texttt{integrated\_panel\_data.dta}. This dataset is a panel dataset, implying observations across individuals and time, and it contains 46,959 rows and 96 columns. The time period covered by the data, for the purpose of this pre-COVID baseline analysis, is implicitly assumed to be the years leading up to 2019, as indicated by the "pre-COVID" focus. The dataset includes a mix of numeric and potentially categorical variables, though 62 were identified as numeric and 0 as explicitly categorical in the provided metrics (excluding 34 ID code variables). Key variables used in this analysis include \texttt{k\_dvage} (age), \texttt{k\_jbhrs} (job hours), \texttt{k\_paynu\_dv} (numeric pay), and \texttt{k\_fimnnet\_dv} (net financial income).
+
+A notable characteristic of the dataset is the presence of missing values. A total of 85,303 missing values were identified across the dataset, representing a missing rate of 44.43\%. This high rate of missingness, particularly for certain variables, necessitates careful interpretation of results and may impact the generalisability of findings for analyses conducted on subsets of the data. For instance, \texttt{k\_dvage} had 475 missing values in a sample of 2000, while \texttt{k\_jbhrs} had 1244 missing values in the same sample, indicating that analyses involving these variables are based on smaller effective sample sizes. A detailed summary of missing data by variable is provided in Table \ref{tab:missing_data_summary}.
+
+\subsection{Experimental Setup}
+
+The experimental setup involved a series of standard econometric analyses executed in Python. The first step was to load the \texttt{integrated\_panel\_data.dta} and perform an initial inspection, including a summary of missing data as presented in Table \ref{tab:missing_data_summary}. Descriptive statistics (mean, median, standard deviation, min, max) were computed for all numeric variables, as shown in Table \ref{tab:descriptive_statistics}. These statistics were derived from the available non-missing observations for each variable within the specified sample sizes (e.g., n=2000 for many variables, n=130 for time trend).
+
+Correlation analysis was performed using Pearson's method on a sample of 2000 observations, generating a correlation matrix (Table \ref{tab:correlation_matrix}) and a bubble heatmap (Figure \ref{fig:correlation_matrix}) to visualise the relationships. Linear regression models were then estimated using OLS. For example, a model regressing \texttt{k\_fimnnet\_dv} on \texttt{k\_dvage} was run on a sample of 2000 observations, with results detailed in Table \ref{tab:regression_results}. A time trend analysis was also conducted, regressing \texttt{k\_paynu\_dv} on \texttt{first\_shock\_wave} (a proxy for time) using a sample of 130 observations. Data visualisations, including histograms (Figure \ref{fig:distribution_histogram}), scatter plots (Figure \ref{fig:scatter_plot}), density plots (Figure \ref{fig:density_plot}), and pairwise scatter plots (Figure \ref{fig:pairwise_scatter}), were generated to complement the statistical findings. All analyses were conducted using standard statistical packages in Python, ensuring consistency and adherence to established econometric practices.
+
+\subsection{Evaluation Metrics}
+
+For the descriptive analyses, the primary evaluation metrics were the standard statistical measures: mean, median, standard deviation, minimum, and maximum values. These metrics provide a concise summary of the central tendency, spread, and range of each variable. For instance, a small standard deviation relative to the mean indicates low variability, while a large difference between mean and median suggests skewness.
+
+In the context of correlation analysis, the Pearson correlation coefficient ($r$) was the key metric, quantifying the strength and direction of a linear relationship between two variables. The associated p-value was used to assess the statistical significance of the correlation, indicating the probability of observing such a correlation by chance if no true relationship exists. For linear regression models, the coefficient of determination ($R^2$) was used to evaluate the proportion of variance in the dependent variable explained by the independent variable(s). The F-statistic and its corresponding p-value assessed the overall statistical significance of the regression model, while the p-values for individual regression coefficients indicated the significance of each predictor. For time trend analysis, the slope coefficient and its p-value were used to determine the direction and statistical significance of the temporal trend. These metrics are appropriate for a baseline econometric analysis as they provide a clear and quantifiable understanding of data characteristics, associations, and trends.
+
+\subsection{Baselines}
+
+Given the descriptive and correlational nature of this baseline analysis, the concept of "baseline methods for comparison" in the traditional sense of comparing model performance against alternative algorithms is not directly applicable. Instead, this study aims to \textit{establish} a baseline characterisation of the pre-COVID UK labour market. The "baselines" here are implicitly the general expectations derived from established labour economic theory and prior qualitative understanding of the UK economy in the 2015-2019 period.
+
+For example, economic theory might predict certain demographic distributions or correlations between age and income. Our descriptive statistics and correlation analyses serve to empirically confirm or challenge these general expectations. The linear regression models quantify relationships that might have been qualitatively understood but not precisely measured across this specific dataset. Therefore, the findings of this study themselves serve as the empirical baseline against which future research, particularly studies assessing the impact of the COVID-19 pandemic or evaluating new labour market policies, can be compared. This approach allows for a robust quantitative foundation, providing a clear reference point for understanding deviations and changes in the post-pandemic landscape.
+
+\section{Results and Discussion}
+
+\subsection{Descriptive Statistics of the UK Labour Market Pre-COVID}
+
+The descriptive analysis of the \texttt{integrated\_panel\_data.dta} dataset provides a foundational understanding of the UK labour market in the pre-COVID era. As summarised in Table \ref{tab:descriptive_statistics}, the average age (\texttt{k\_dvage}) of individuals in the sample is 38.872 years, with a median of 44 years and a standard deviation of 27.009. This indicates a broad age distribution, as visually represented by the histogram in Figure \ref{fig:distribution_histogram} and the density estimate in Figure \ref{fig:density_plot}, which show a peak around the median age. The minimum age is 0 and the maximum is 96, suggesting the dataset covers a wide demographic spectrum, including very young and very old individuals.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.85\textwidth]{figure_1}
+  \caption{Distribution of \texttt{k\_dvage} (n=2000)}
+  \label{fig:distribution_histogram}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.85\textwidth]{figure_5}
+  \caption{Density estimate of \texttt{k\_dvage} (KDE, n=2000)}
+  \label{fig:density_plot}
+\end{figure}
+
+Regarding labour market participation, the average job hours (\texttt{k\_jbhrs}) stands at 12.252, with a median of 0 and a standard deviation of 17.279. The substantial difference between the mean and median, coupled with a minimum of 0, suggests a significant proportion of individuals reporting zero job hours, which could indicate non-participation in the labour force, unemployment, or very low part-time engagement. This distribution highlights the heterogeneity in work patterns within the UK labour market. Financial indicators, \texttt{k\_paynu\_dv} (numeric pay) and \texttt{k\_fimnnet\_dv} (net financial income), exhibited exceptionally large magnitudes, with mean \texttt{k\_paynu\_dv} at 1.054e+38 and mean \texttt{k\_fimnnet\_dv} at 4.066e+37. These magnitudes are highly unusual for typical financial data and suggest potential data encoding issues or extreme outliers that warrant further investigation and likely data transformation or cleaning for meaningful economic interpretation in future work.
+
+\begin{table}[H]
+    \centering
+    \caption{Descriptive Statistics of Numeric Variables}
+    \label{tab:descriptive_statistics}
+    \resizebox{\textwidth}{!}{%
+        \begin{tabular}{lrrrrrrrrr}
+            \toprule
+            Variable & N & Mean & Std Dev & Min & Q1 & Median & Q3 & Max & Skewness \\
+            \midrule
+            k\_dvage & 2000 & 38.872 & 27.009 & 0 & 17 & 44 & 60 & 96 & -0.174 \\
+            k\_jbstat & 2000 & 2.817 & 6.333 & 0 & 1 & 2 & 4 & 97 & 13.171 \\
+            k\_jbhrs & 2000 & 12.252 & 17.279 & 0 & 0 & 0 & 33 & 77 & 0.893 \\
+            k\_paynu\_dv & 2000 & 1.054024631537607e+38 & 8.262586821812336e+37 & 5 & 2000 & 1.7014118346046923e+38 & 1.7014118346046923e+38 & 1.7014118346046923e+38 & -0.492 \\
+            k\_fimnnet\_dv & 2000 & 4.0663742847052145e+37 & 7.257872405320255e+37 & 0 & 1022.67 & 1845.535 & 6860.37 & 1.7014118346046923e+38 & 1.223 \\
+            k\_hiqual\_dv & 2000 & 2.448 & 2.434 & 0 & 1 & 2 & 4 & 9 & 1.251 \\
+            k\_jbnssec\_dv & 2000 & 6.065 & 9.502 & 0 & 0 & 0 & 11 & 35 & 1.505 \\
+            k\_scghq1\_dv & 2000 & 8.137 & 6.809 & 0 & 0 & 8 & 12 & 36 & 0.726 \\
+            ca\_age & 2000 & 21.295 & 27.469 & 0 & 0 & 0 & 49 & 92 & 0.743 \\
+            ca\_furlough & 2000 & -1.168 & 3.444 & -8 & 0 & 0 & 0 & 2 & -1.354 \\
+            ca\_scghq1\_dv & 2000 & 4.386 & 7.433 & -9 & 0 & 0 & 9 & 36 & 1.224 \\
+            cb\_age & 2000 & 19.477 & 27.743 & 0 & 0 & 0 & 47 & 97 & 0.93 \\
+            cb\_scghq1\_dv & 2000 & 4.019 & 6.939 & -9 & 0 & 0 & 8 & 36 & 1.46 \\
+            cb\_ff\_furlough & 2000 & -0.321 & 1.668 & -8 & 0 & 0 & 0 & 2 & -4.314 \\
+            cc\_age & 2000 & 18.004 & 26.811 & 0 & 0 & 0 & 44 & 93 & 1.006 \\
+            cc\_scghq1\_dv & 2000 & 3.98 & 6.856 & -9 & 0 & 0 & 8 & 36 & 1.653 \\
+            cc\_ff\_furlough & 2000 & -0.047 & 0.862 & -8 & 0 & 0 & 0 & 1 & -8.572 \\
+            \bottomrule
+        \end{tabular}%
+    }
+\end{table}
+
+\subsection{Correlational Analysis of Labour Market Variables}
+
+The correlation analysis, presented in Table \ref{tab:correlation_matrix} and visually in the bubble heatmap (Figure \ref{fig:correlation_matrix}), reveals significant associations between several numeric variables. A particularly strong negative correlation was identified between \texttt{k\_dvage} and \texttt{k\_fimnnet\_dv}, with a Pearson correlation coefficient of -0.801. This correlation is highly statistically significant (p < 0.001) and was computed on a sample size of 2000 observations. This strong negative relationship suggests that, within this sample, as age increases, net financial income tends to decrease substantially. This finding is intriguing and could reflect various life-cycle effects, such as retirement, reduced working hours in later life, or changes in income sources.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.85\textwidth]{figure_3}
+  \caption{Correlation bubble heatmap of numeric variables}
+  \label{fig:correlation_matrix}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.85\textwidth]{figure_6}
+  \caption{Pairwise scatter of top correlated variable pairs}
+  \label{fig:pairwise_scatter}
+\end{figure}
+
+Other correlations, though not explicitly detailed in the provided metrics, are indicated by the presence of a correlation matrix (Table \ref{tab:correlation_matrix}) and a pairwise scatter plot of top correlated variable pairs (Figure \ref{fig:pairwise_scatter}). These visualisations and the full correlation matrix would offer further insights into the network of relationships within the pre-COVID UK labour market. The strength and direction of these correlations provide empirical evidence of how different labour market factors co-vary, forming a crucial part of the baseline characterisation.
+
+\begin{table}[H]
+    \centering
+    \caption{Pearson Correlation Matrix of Numeric Variables}
+    \label{tab:correlation_matrix}
+    \resizebox{\textwidth}{!}{%
+        \begin{tabular}{lrrrrrrrrrrr}
+            \toprule
+            Variable & k\_dvage & k\_jbstat & k\_jbhrs & k\_paynu\_dv & k\_fimnnet\_dv & k\_hiqual\_dv & k\_jbnssec\_dv & k\_scghq1\_dv & ca\_age & ca\_furlough \\
+            \midrule
+            k\_dvage & 1 & 0.183 & 0.127 & -0.123 & -0.801 & 0.576 & 0.105 & 0.491 & 0.411 & -0.226 \\
+            k\_jbstat & 0.183 & 1 & -0.039 & 0.025 & -0.249 & 0.192 & -0.01 & 0.167 & 0.037 & -0.081 \\
+            k\_jbhrs & 0.127 & -0.039 & 1 & -0.875 & -0.397 & -0.012 & 0.501 & 0.255 & 0.138 & 0.327 \\
+            k\_paynu\_dv & -0.123 & 0.025 & -0.875 & 1 & 0.439 & -0.025 & -0.604 & -0.328 & -0.164 & -0.332 \\
+            k\_fimnnet\_dv & -0.801 & -0.249 & -0.397 & 0.439 & 1 & -0.561 & -0.354 & -0.666 & -0.342 & 0.114 \\
+            k\_hiqual\_dv & 0.576 & 0.192 & -0.012 & -0.025 & -0.561 & 1 & 0.141 & 0.376 & 0.061 & -0.079 \\
+            k\_jbnssec\_dv & 0.105 & -0.01 & 0.501 & -0.604 & -0.354 & 0.141 & 1 & 0.236 & 0.079 & 0.15 \\
+            k\_scghq1\_dv & 0.491 & 0.167 & 0.255 & -0.328 & -0.666 & 0.376 & 0.236 & 1 & 0.269 & -0.113 \\
+            ca\_age & 0.411 & 0.037 & 0.138 & -0.164 & -0.342 & 0.061 & 0.079 & 0.269 & 1 & -0.495 \\
+            ca\_furlough & -0.226 & -0.081 & 0.327 & -0.332 & 0.114 & -0.079 & 0.15 & -0.113 & -0.495 & 1 \\
+            \bottomrule
+        \end{tabular}%
+    }
+\end{table}
+
+\subsection{Linear Regression Analysis and Time Trends}
+
+A linear regression model was estimated to quantify the relationship between \texttt{k\_fimnnet\_dv} and \texttt{k\_dvage}. The results, presented in Table \ref{tab:regression_results}, indicate that \texttt{k\_dvage} is a statistically significant predictor of \texttt{k\_fimnnet\_dv}. The model explained a substantial portion of the variance in net financial income, with an R\textsuperscript{2} of 0.641 (adjusted R\textsuperscript{2} = 0.641). The overall model was highly significant (F = 3565.4, p < 0.001) based on a sample of 2000 observations. The slope coefficient for \texttt{k\_dvage} was -2.151e+36, further reinforcing the strong negative relationship observed in the correlation analysis. The intercept was 1.242e+38. The exceptionally large magnitude of the slope coefficient, similar to the means of the financial variables, again points to the unusual scaling of \texttt{k\_fimnnet\_dv} and necessitates careful interpretation, potentially indicating a need for data transformation or re-evaluation of the variable's definition.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.85\textwidth]{figure_2}
+  \caption{Scatter plot: \texttt{k\_jbhrs} vs \texttt{k\_paynu\_dv} (R\textsuperscript{2}=0.780)}
+  \label{fig:scatter_plot}
+\end{figure}
+
+Regarding time trends, an analysis of \texttt{k\_paynu\_dv} over \texttt{first\_shock\_wave} (a time proxy) indicated a slope of 3.938e+36. However, this trend was not statistically significant (p = 0.1525) based on a sample of 130 observations. This suggests that, despite the large magnitude of the slope, there was no discernible linear increase or decrease in \texttt{k\_paynu\_dv} over the period represented by \texttt{first\_shock\_wave} that could be confidently attributed to a consistent temporal trend. The correlation coefficient for this time trend was 0.125. Figure \ref{fig:time_trend}, which depicts the trend of \texttt{k\_dvage} over \texttt{first\_shock\_wave}, would provide further visual context for temporal patterns.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.85\textwidth]{figure_4}
+  \caption{Trend of \texttt{k\_dvage} over \texttt{first\_shock\_wave}}
+  \label{fig:time_trend}
+\end{figure}
+
+\begin{table}[H]
+    \centering
+    \caption{OLS Regression Results (Top Models by R\textsuperscript{2})}
+    \label{tab:regression_results}
+    \resizebox{\textwidth}{!}{%
+        \begin{tabular}{llrrrrrrrr}
+            \toprule
+            Dep. Var. & Indep. Var. & Coeff. ($\beta$) & Std. Err. & t-stat & p-val & R\textsuperscript{2} & Adj. R\textsuperscript{2} & N \\
+            \midrule
+            k\_paynu\_dv & k\_jbhrs & -4.182783176610553e+36 & 5.184204336237867e+34 & -80.683 & $<$0.001 & 0.765 & 0.765 & 2000 \\
+            k\_fimnnet\_dv & k\_dvage & -2.1512262254402265e+36 & 3.602732502235436e+34 & -59.711 & $<$0.001 & 0.641 & 0.641 & 2000 \\
+            k\_hiqual\_dv & k\_dvage & 0.0519 & 0.0016 & 31.473 & $<$0.001 & 0.331 & 0.331 & 2000 \\
+            k\_hiqual\_dv & k\_fimnnet\_dv & 0 & 0 & -30.321 & $<$0.001 & 0.315 & 0.315 & 2000 \\
+            k\_fimnnet\_dv & k\_paynu\_dv & 0.3858 & 0.0177 & 21.852 & $<$0.001 & 0.193 & 0.192 & 2000 \\
+            \bottomrule
+        \end{tabular}%
+    }
+\end{table}
+
+\subsection{Limitations and Threats to Validity}
+
+While this study provides a valuable econometric baseline, it is important to acknowledge its inherent limitations and potential threats to validity. The analysis is primarily descriptive and correlational, meaning it identifies patterns and associations but cannot establish causal relationships. The observed correlations and regression coefficients, however strong, do not imply that one variable directly causes another. This is a fundamental limitation stemming from the lack of robust identification strategies typically required for causal inference in economics \cite{ref2}.
+
+Furthermore, the exceptionally large magnitudes observed for financial variables (\texttt{k\_paynu\_dv}, \texttt{k\_fimnnet\_dv}) and their corresponding regression coefficients raise concerns about data quality or specific encoding, which could affect the economic interpretability of these specific findings. Future work would benefit from a thorough investigation and potential re-scaling or transformation of these variables. The high rate of missing data (44.43\% overall) also poses a potential threat to the representativeness and generalisability of findings, especially for analyses conducted on subsets of the data with varying missingness. Finally, the non-execution of \texttt{group\_comparison} means that the analysis does not delve into the heterogeneity of labour market dynamics across different demographic or socio-economic groups, limiting our understanding of disparities.
+
+\begin{table}[H]
+    \centering
+    \caption{Missing Data Summary by Variable}
+    \label{tab:missing_data_summary}
+    \resizebox{\textwidth}{!}{%
+        \begin{tabular}{lrrrrr}
+            \toprule
+            Variable & N Total & N Miss. & Miss. \% & N Valid & Type \\
+            \midrule
+            pidp & 2000 & 0 & 0.0\% & 2000 & Numeric \\
+            k\_dvage & 2000 & 475 & 23.8\% & 1525 & Numeric \\
+            k\_jbstat & 2000 & 475 & 23.8\% & 1525 & Numeric \\
+            k\_health & 2000 & 475 & 23.8\% & 1525 & Numeric \\
+            k\_jbhrs & 2000 & 1244 & 62.2\% & 756 & Numeric \\
+            k\_paynu\_dv & 2000 & 0 & 0.0\% & 2000 & Numeric \\
+            k\_sex\_dv & 2000 & 475 & 23.8\% & 1525 & Numeric \\
+            k\_fimnnet\_dv & 2000 & 0 & 0.0\% & 2000 & Numeric \\
+            k\_nchild\_dv & 2000 & 475 & 23.8\% & 1525 & Numeric \\
+            k\_hiqual\_dv & 2000 & 492 & 24.6\% & 1508 & Numeric \\
+            k\_jbnssec\_dv & 2000 & 1175 & 58.8\% & 825 & Numeric \\
+            k\_scghq1\_dv & 2000 & 559 & 28.0\% & 1441 & Numeric \\
+            valid\_baseline & 2000 & 475 & 23.8\% & 1525 & Numeric \\
+            ca\_age & 2000 & 1172 & 58.6\% & 828 & Numeric \\
+            ca\_sex & 2000 & 1172 & 58.6\% & 828 & Numeric \\
+            ca\_furlough & 2000 & 1172 & 58.6\% & 828 & Numeric \\
+            ca\_scghq1\_dv & 2000 & 1172 & 58.6\% & 828 & Numeric \\
+            cb\_age & 2000 & 1277 & 63.8\% & 723 & Numeric \\
+            cb\_scghq1\_dv & 2000 & 1277 & 63.8\% & 723 & Numeric \\
+            cb\_ff\_furlough & 2000 & 1277 & 63.8\% & 723 & Numeric \\
+            \bottomrule
+        \end{tabular}%
+    }
+\end{table}
+
+\section{Conclusion and Future Work}
+
+This study has provided a comprehensive econometric baseline analysis of the UK labour market in the pre-COVID-19 era, offering crucial insights into its state before the unprecedented global shock. By employing descriptive statistics, time-series trend analysis, correlation matrices, and linear regression models on a substantial panel dataset, we have systematically characterised key labour market dynamics. We found that the average age in the sample was 38.872 years, with significant heterogeneity in job hours (mean 12.252, median 0). A strong negative correlation (r = -0.801, p < 0.001) was observed between age (\texttt{k\_dvage}) and net financial income (\texttt{k\_fimnnet\_dv}), with age explaining 64.1\% of the variance in net financial income in a linear regression model. While a time trend for \texttt{k\_paynu\_dv} was identified, it was not statistically significant (p = 0.1525). These findings establish a vital empirical benchmark for understanding the UK labour market's pre-pandemic conditions.
+
+The policy relevance of this baseline analysis is substantial. It provides policymakers with a clear quantitative reference point for evaluating the true impact of the COVID-19 pandemic on the labour market and for designing targeted interventions for post-pandemic recovery. Understanding the pre-existing trends and relationships allows for a more nuanced assessment of whether observed post-pandemic changes represent accelerations of prior trends, reversals, or entirely new phenomena. This foundational knowledge is essential for fostering labour market resilience and promoting inclusive growth in the face of future economic challenges.
+
+Several avenues for future research emerge from this baseline characterisation. Firstly, addressing heterogeneity is paramount; while \texttt{group\_comparison} was not executed in this study, future work should prioritise detailed analyses across demographics (e.g., age, gender, ethnicity), regions, and sectors. This would provide crucial insights into differential impacts and vulnerabilities within the labour market. Secondly, moving towards robust \texttt{causal\_inference} is a key next step. This would involve identifying suitable exogenous variations, natural experiments, or instrumental variables, or acquiring richer data that allows for stronger identification assumptions, to understand the causal mechanisms driving observed associations \cite{ref2}. Finally, if suitable data becomes available, exploring advanced methodological approaches such as \texttt{advanced\_nlp} for textual labour market data, \texttt{graph\_modelling} for network analysis of labour market connections, or \texttt{vision\_analysis} for image-based economic indicators could yield novel insights.
+
+\section*{Execution Limitations}
+The empirical execution did not complete all planned analyses.
+\begin{itemize}
+  \item Requested executable methods not observed: group comparison
+  \item Unresolved prerequisites: advanced nlp: text columns not detected | graph modelling: graph edge/node structure not detected | vision analysis: image/path features not detected | causal inference: identification assumptions not met
+  \item Executable methods skipped in runner: group comparison
+  \item Runner output notes: Executable methods without observed outputs: group comparison
+\end{itemize}
+Methods without evidence are treated as planned future work.
+
+
+
+\begin{thebibliography}{7}
+\bibitem{ref1} , Jonathan Hambur. \textit{Did Labour Market Concentration Lower Wages Growth Pre-COVID?}. RBA Research Discussion Papers, n.d..
+
+\bibitem{ref2} Ulrike Unterhofer, Conny Wunsch. \textit{Macroeconomic Effects of Active Labour Market Policies: A Novel Instrumental Variables Approach}. arXiv, 2022.
+
+\bibitem{ref3} Jorge Davalos, Ekkehard Ernst. \textit{How has labour market power evolved? Comparing labour market monopsony in Peru and the United States}. arXiv, 2021.
+
+\bibitem{ref4} Davide Fiaschi, Cristina Tealdi. \textit{A general methodology to measure labour market dynamics}. arXiv, 2021.
+
+\bibitem{ref5} James Buchan, Ian Seccombe, Gabrielle Smith. \textit{The UK Nursing Labour Market}. Nurses Work, 2018.
+
+\bibitem{ref6} James Buchan, Ian Seccombe, Gabrielle Smith. \textit{Future Trends in the UK Nursing Labour Market}. Nurses Work, 2018.
+
+\bibitem{ref7} Jonathan Cribb. \textit{The UK labour market and labour market policies}. n.d..
+\end{thebibliography}
+
+\end{document}

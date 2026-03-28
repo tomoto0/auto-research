@@ -568,9 +568,11 @@ export function generateSvgFallbackChart(
   config = transliterateChartConfigSync(config);
 
   const rawTitle = config.options?.plugins?.title?.text;
-  const title = Array.isArray(rawTitle)
+  let title = Array.isArray(rawTitle)
     ? String(rawTitle.join(" "))
     : String(rawTitle || config.type || "Chart");
+  // Strip non-ASCII from title for safe SVG rendering
+  title = title.replace(/[^\x20-\x7E]/g, "").trim() || "Chart";
   const chartType = String(config.type || "bar").toLowerCase();
   const datasets: any[] = Array.isArray(config.data?.datasets) ? config.data.datasets : [];
   const labels: string[] = Array.isArray(config.data?.labels)
@@ -591,7 +593,10 @@ export function generateSvgFallbackChart(
     return [min, max];
   };
   const shortLabel = (value: unknown, maxLen = 22): string => {
-    const text = String(value ?? "");
+    let text = String(value ?? "");
+    // Strip non-ASCII characters as a safety net (labels should already be transliterated)
+    text = text.replace(/[^\x20-\x7E]/g, "").trim();
+    if (!text) text = "N/A";
     return text.length > maxLen ? `${text.slice(0, maxLen - 3)}...` : text;
   };
   const readRecord = (value: unknown): Record<string, unknown> =>
@@ -602,8 +607,11 @@ export function generateSvgFallbackChart(
   type LinePoint = { x: number; y: number };
   type RenderSeries<T> = { label: string; color: string; points: T[] };
 
-  // Use a font stack that includes CJK fonts available on most systems
-  const fontFamily = `'Noto Sans JP', 'Noto Sans CJK JP', 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Yu Gothic', 'Meiryo', 'MS Gothic', 'IPAGothic', 'IPAPGothic', 'TakaoPGothic', 'DejaVu Sans', 'Liberation Sans', sans-serif`;
+  // CRITICAL: Use ONLY the generic CSS keyword 'sans-serif' without quotes.
+  // Named fonts like 'DejaVu Sans', 'Arial' etc. cause sharp/librsvg to render ALL text
+  // as □□□□ replacement characters when those specific fonts aren't installed.
+  // The unquoted generic keyword 'sans-serif' always has a system fallback in librsvg.
+  const fontFamily = `sans-serif`;
 
   const padding = { top: 56, right: 36, bottom: 84, left: 64 };
   const plotX = padding.left;
@@ -636,7 +644,7 @@ export function generateSvgFallbackChart(
 
   const parts: string[] = [];
   parts.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`);
-  parts.push(`<style>text { font-family: ${fontFamily}; }</style>`);
+  parts.push(`<style>text { font-family: sans-serif; font-size: 12px; }</style>`);
   parts.push(`<rect width="${width}" height="${height}" fill="#ffffff"/>`);
   parts.push(`<text x="${width / 2}" y="30" text-anchor="middle" font-size="16" font-weight="bold" fill="#333">${escapeXml(shortLabel(title, 90))}</text>`);
 
@@ -794,11 +802,18 @@ export function generateSvgFallbackChart(
         }
       }
 
-      const tickStep = Math.max(1, Math.ceil(Math.max(labels.length, maxPoints) / 10));
-      for (let i = 0; i < Math.max(labels.length, maxPoints); i += tickStep) {
+      const lineTickMax = 12;
+      const lineTickStep = Math.max(1, Math.ceil(Math.max(labels.length, maxPoints) / lineTickMax));
+      const lineLabelCount = Math.max(labels.length, maxPoints);
+      const lineUseRotation = lineLabelCount / lineTickStep > 8;
+      for (let i = 0; i < lineLabelCount; i += lineTickStep) {
         const x = mapX(i);
-        const text = shortLabel(labels[i] || `${i + 1}`, 10);
-        parts.push(`<text x="${x}" y="${plotBottomY + 16}" text-anchor="middle" font-size="9" fill="#666">${escapeXml(text)}</text>`);
+        const text = shortLabel(labels[i] || `${i + 1}`, lineUseRotation ? 12 : 10);
+        if (lineUseRotation) {
+          parts.push(`<text x="${x}" y="${plotBottomY + 12}" text-anchor="end" font-size="8" fill="#666" transform="rotate(-35, ${x}, ${plotBottomY + 12})">${escapeXml(text)}</text>`);
+        } else {
+          parts.push(`<text x="${x}" y="${plotBottomY + 16}" text-anchor="middle" font-size="9" fill="#666">${escapeXml(text)}</text>`);
+        }
       }
     }
   } else {
@@ -854,11 +869,17 @@ export function generateSvgFallbackChart(
           }
         }
 
-        const tickStep = Math.max(1, Math.ceil(categoryCount / 12));
+        const maxTickLabels = 15;
+        const tickStep = Math.max(1, Math.ceil(categoryCount / maxTickLabels));
+        const useRotation = categoryCount > 8;
         for (let i = 0; i < categoryCount; i += tickStep) {
           const x = plotX + i * groupWidth + groupWidth / 2;
-          const text = shortLabel(labels[i] || `${i + 1}`, 10);
-          parts.push(`<text x="${x}" y="${plotBottomY + 16}" text-anchor="middle" font-size="9" fill="#666">${escapeXml(text)}</text>`);
+          const text = shortLabel(labels[i] || `${i + 1}`, useRotation ? 12 : 10);
+          if (useRotation) {
+            parts.push(`<text x="${x}" y="${plotBottomY + 12}" text-anchor="end" font-size="8" fill="#666" transform="rotate(-35, ${x}, ${plotBottomY + 12})">${escapeXml(text)}</text>`);
+          } else {
+            parts.push(`<text x="${x}" y="${plotBottomY + 16}" text-anchor="middle" font-size="9" fill="#666">${escapeXml(text)}</text>`);
+          }
         }
       }
     }
@@ -877,9 +898,9 @@ export function generateSvgFallbackChart(
       const x = plotX + col * legendCellW;
       const y = legendStartY + row * 14;
       const color = pickColor(i, datasets[i]?.backgroundColor || datasets[i]?.borderColor);
-      const label = shortLabel(datasets[i]?.label || `Dataset ${i + 1}`, 24);
+      const label = shortLabel(datasets[i]?.label || `Dataset ${i + 1}`, 28);
       parts.push(`<rect x="${x}" y="${y - 8}" width="9" height="9" fill="${color}"/>`);
-      parts.push(`<text x="${x + 13}" y="${y}" font-size="9.5" fill="#666">${escapeXml(label)}</text>`);
+      parts.push(`<text x="${x + 13}" y="${y}" font-size="9" fill="#666">${escapeXml(label)}</text>`);
     }
   }
 
@@ -1138,7 +1159,9 @@ async function transliterateChartConfigAsync(config: any): Promise<any> {
 }
 
 function escapeXml(str: string): string {
-  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  // Strip non-ASCII characters that would render as garbled text in SVG→PNG conversion
+  const ascii = str.replace(/[^\x20-\x7E]/g, "").trim();
+  return ascii.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
 /* ------------------------------------------------------------------ */
