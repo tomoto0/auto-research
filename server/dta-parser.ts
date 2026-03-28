@@ -335,9 +335,14 @@ function parseNewFormat(buf: Buffer, previewMaxRows?: number): DtaResult {
   const strlRefs: { rowIdx: number; varIdx: number; v: number; o: number }[] = [];
 
   for (let i = 0; i < iterRows; i++) {
+    // Safety: stop if we're about to read beyond the buffer
+    if (offset + 1 > buf.length) break;
     const row: Record<string, any> = {};
+    let rowOk = true;
     for (let j = 0; j < nvar; j++) {
       const typ = typlist[j];
+      const bytesNeeded = typ >= 1 && typ <= 2045 ? typ : typ === 32768 ? 8 : typ === 65530 ? 1 : typ === 65529 ? 2 : typ === 65528 ? 4 : typ === 65527 ? 4 : typ === 65526 ? 8 : 1;
+      if (offset + bytesNeeded > buf.length) { rowOk = false; break; }
 
       if (typ >= 1 && typ <= 2045) {
         // Fixed-length string
@@ -389,16 +394,28 @@ function parseNewFormat(buf: Buffer, previewMaxRows?: number): DtaResult {
         offset += 1;
       }
     }
+    if (!rowOk) break; // Reached end of loaded buffer
     data.push(row);
   }
 
-  // Resolve strL references
+  // Resolve strL references — but only if the <strls> tag is reachable within
+  // the loaded buffer.  For very large files in preview mode we may have loaded
+  // only the first portion of the file, so the strls section may be beyond our
+  // buffer.  In that case we leave the placeholder values as empty strings
+  // rather than crashing or scanning hundreds of MB.
   if (strlRefs.length > 0) {
     const strlsIdx = findTag(buf, "<strls>", offset);
     if (strlsIdx >= 0) {
+      // Build a set of (v,o) pairs we actually need so we can stop early
+      const neededKeys = new Set<string>();
+      for (const ref of strlRefs) {
+        neededKeys.add(`${ref.v}:${ref.o}`);
+      }
+
       // Parse GSO entries
       const strls: Record<string, Record<string, string>> = {};
       let pos = strlsIdx + 7;
+      let resolvedCount = 0;
 
       while (pos + 3 <= buf.length) {
         const marker = readFixedString(buf, pos, 3);
@@ -420,13 +437,19 @@ function parseNewFormat(buf: Buffer, previewMaxRows?: number): DtaResult {
         const len = littleEndian ? buf.readUInt32LE(pos) : buf.readUInt32BE(pos);
         pos += 4;
 
-        if (!strls[v]) strls[v] = {};
-        if (t === 130) {
-          // ASCII string (null-terminated)
-          strls[v][o] = readFixedString(buf, pos, len);
-        } else {
-          // Binary data - store as hex or skip
-          strls[v][o] = `[binary ${len} bytes]`;
+        if (neededKeys.has(`${v}:${o}`)) {
+          if (!strls[v]) strls[v] = {};
+          if (t === 130) {
+            strls[v][o] = readFixedString(buf, pos, len);
+          } else {
+            strls[v][o] = `[binary ${len} bytes]`;
+          }
+          resolvedCount++;
+          // Stop early once all needed refs are resolved
+          if (resolvedCount >= neededKeys.size) {
+            pos += len;
+            break;
+          }
         }
         pos += len;
       }
@@ -435,6 +458,16 @@ function parseNewFormat(buf: Buffer, previewMaxRows?: number): DtaResult {
       for (const ref of strlRefs) {
         if (ref.rowIdx < data.length && strls[ref.v] && strls[ref.v][ref.o] !== undefined) {
           data[ref.rowIdx][varlist[ref.varIdx]] = strls[ref.v][ref.o];
+        } else if (ref.rowIdx < data.length) {
+          // Could not resolve — set to empty string instead of null
+          data[ref.rowIdx][varlist[ref.varIdx]] = "";
+        }
+      }
+    } else {
+      // <strls> tag not found in buffer — set all strL refs to empty string
+      for (const ref of strlRefs) {
+        if (ref.rowIdx < data.length) {
+          data[ref.rowIdx][varlist[ref.varIdx]] = "";
         }
       }
     }
