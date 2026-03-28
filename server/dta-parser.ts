@@ -398,12 +398,21 @@ function parseNewFormat(buf: Buffer, previewMaxRows?: number): DtaResult {
     data.push(row);
   }
 
-  // Resolve strL references — but only if the <strls> tag is reachable within
-  // the loaded buffer.  For very large files in preview mode we may have loaded
-  // only the first portion of the file, so the strls section may be beyond our
-  // buffer.  In that case we leave the placeholder values as empty strings
-  // rather than crashing or scanning hundreds of MB.
-  if (strlRefs.length > 0) {
+  // Resolve strL references.
+  // In preview mode with many unread rows, the <strls> section is located
+  // AFTER the entire data section.  Scanning hundreds of MB of binary data
+  // to find it is extremely expensive, so we skip strL resolution when the
+  // remaining data would require scanning more than 10MB.
+  const remainingBytes = buf.length - offset;
+  const skipStrlResolution = previewMaxRows != null && iterRows < nobs && remainingBytes > 10 * 1024 * 1024;
+  if (skipStrlResolution && strlRefs.length > 0) {
+    // Set all unresolved strL values to empty string
+    for (const ref of strlRefs) {
+      if (ref.rowIdx < data.length) {
+        data[ref.rowIdx][varlist[ref.varIdx]] = "";
+      }
+    }
+  } else if (strlRefs.length > 0) {
     const strlsIdx = findTag(buf, "<strls>", offset);
     if (strlsIdx >= 0) {
       // Build a set of (v,o) pairs we actually need so we can stop early

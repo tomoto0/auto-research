@@ -369,8 +369,11 @@ function parseDataFile(
   }
 
   if (fileType === "dta") {
-    const rawBuf = fs.readFileSync(filePath);
+    let rawBuf: Buffer | null = fs.readFileSync(filePath);
     const result = parseDtaFile(rawBuf, { previewRows: MAX_ROWS });
+    // Release the large buffer immediately so GC can reclaim it
+    rawBuf = null;
+    try { global.gc?.(); } catch {}
     return {
       data: result.data.slice(0, MAX_ROWS),
       columns: result.columns,
@@ -1240,6 +1243,10 @@ export async function executePythonExperiment(
 
       try {
         const parsed = parseAndValidateDataFile(localPath, ds.fileType);
+        // Remove the local file immediately after parsing to free disk space
+        // and avoid keeping both on-disk and in-memory copies
+        try { fs.unlinkSync(localPath); } catch {}
+        try { global.gc?.(); } catch {}
         allData.push({ name: ds.originalName, ...parsed });
         logs.push(`[INFO] Parsed ${ds.originalName}: ${parsed.totalRows} rows, ${parsed.columns.length} columns (encoding: ${parsed.encoding || "native"})`);
         // Log first 20 column names for debugging
@@ -1257,6 +1264,8 @@ export async function executePythonExperiment(
         metrics[`${ds.originalName}_columns`] = parsed.columns.length;
       } catch (parseErr: any) {
         logs.push(`[WARN] Failed to parse ${ds.originalName}: ${parseErr.message}`);
+        // Clean up local file on parse failure too
+        try { fs.unlinkSync(localPath); } catch {}
       }
     }
 
