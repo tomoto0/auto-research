@@ -1,12 +1,15 @@
 // Preconfigured storage helpers for Manus WebDev templates
 // Uses the Biz-provided storage proxy (Authorization: Bearer <token>)
 
+import * as fs from "fs";
+import * as path from "path";
 import { ENV } from './_core/env';
 
 type StorageConfig = { baseUrl: string; apiKey: string };
 
 const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY = 1000; // 1s, 2s, 4s exponential backoff
+export const DATASET_UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024; // 8MB
 
 function getStorageConfig(): StorageConfig {
   const baseUrl = ENV.forgeApiUrl;
@@ -91,6 +94,27 @@ function normalizeKey(relKey: string): string {
   return relKey.replace(/^\/+/, "");
 }
 
+export function buildDatasetMultipartPrefix(uploadId: string): string {
+  return `datasets/${uploadId}/parts`;
+}
+
+export function buildDatasetMultipartPartKey(uploadId: string, partIndex: number): string {
+  return `${buildDatasetMultipartPrefix(uploadId)}/${String(partIndex).padStart(4, "0")}`;
+}
+
+export function parseDatasetMultipartUploadId(fileKey: string): string | null {
+  const normalized = normalizeKey(fileKey).replace(/\/+$/, "");
+  const directMatch = normalized.match(/^datasets\/([^/]+)\/parts$/);
+  if (directMatch) return directMatch[1];
+  const partMatch = normalized.match(/^datasets\/([^/]+)\/parts\/\d{4}$/);
+  return partMatch ? partMatch[1] : null;
+}
+
+export function estimateDatasetMultipartChunks(sizeBytes: number): number {
+  if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) return 0;
+  return Math.ceil(sizeBytes / DATASET_UPLOAD_CHUNK_SIZE);
+}
+
 function toFormData(
   data: Buffer | Uint8Array | string,
   contentType: string,
@@ -111,6 +135,45 @@ function buildAuthHeaders(apiKey: string): HeadersInit {
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function appendResponseBodyToWriteStream(
+  response: Response,
+  writeStream: fs.WriteStream,
+  partLabel: string,
+): Promise<void> {
+  if (!response.body) {
+    throw new Error(`Storage download returned empty body for ${partLabel}`);
+  }
+  const { Readable } = await import("stream");
+  const readable = Readable.fromWeb(response.body as any);
+  await new Promise<void>((resolve, reject) => {
+    const onDrain = () => readable.resume();
+    const onData = (chunk: Buffer) => {
+      const canContinue = writeStream.write(chunk);
+      if (!canContinue) readable.pause();
+    };
+    const onEnd = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = (err: unknown) => {
+      cleanup();
+      reject(err instanceof Error ? err : new Error(String(err)));
+    };
+    const cleanup = () => {
+      readable.off("data", onData);
+      readable.off("end", onEnd);
+      readable.off("error", onError);
+      writeStream.off("drain", onDrain);
+      writeStream.off("error", onError);
+    };
+    readable.on("data", onData);
+    readable.on("end", onEnd);
+    readable.on("error", onError);
+    writeStream.on("drain", onDrain);
+    writeStream.on("error", onError);
+  });
 }
 
 export async function storagePut(
@@ -225,4 +288,37 @@ export async function storageDownload(
     }
   }
   throw lastError || new Error(`Storage download failed after retries for ${relKey}`);
+}
+
+export async function storageDownloadDatasetMultipartToFile(params: {
+  uploadId: string;
+  totalChunks: number;
+  destinationPath: string;
+  timeoutMsPerPart?: number;
+}): Promise<void> {
+  const { uploadId, totalChunks, destinationPath, timeoutMsPerPart = 120000 } = params;
+  if (totalChunks < 1) {
+    throw new Error(`Invalid totalChunks for multipart download: ${totalChunks}`);
+  }
+
+  fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
+  const writeStream = fs.createWriteStream(destinationPath);
+  try {
+    for (let i = 0; i < totalChunks; i++) {
+      const partKey = buildDatasetMultipartPartKey(uploadId, i);
+      const resp = await storageDownload(partKey, { timeoutMs: timeoutMsPerPart });
+      await appendResponseBodyToWriteStream(resp, writeStream, `part ${i}`);
+    }
+    await new Promise<void>((resolve, reject) => {
+      const onError = (err: unknown) => reject(err instanceof Error ? err : new Error(String(err)));
+      writeStream.once("error", onError);
+      writeStream.end(() => {
+        writeStream.off("error", onError);
+        resolve();
+      });
+    });
+  } catch (err) {
+    writeStream.destroy();
+    throw err;
+  }
 }

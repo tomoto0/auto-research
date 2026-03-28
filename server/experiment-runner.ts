@@ -13,7 +13,12 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { nanoid } from "nanoid";
-import { storagePut } from "./storage";
+import {
+  storagePut,
+  parseDatasetMultipartUploadId,
+  estimateDatasetMultipartChunks,
+  storageDownloadDatasetMultipartToFile,
+} from "./storage";
 import { insertExperimentResult, updateExperimentResult } from "./db";
 import { parse as csvParse } from "csv-parse/sync";
 import * as XLSX from "xlsx";
@@ -29,6 +34,7 @@ export interface DatasetInfo {
   originalName: string;
   fileUrl: string;
   fileKey?: string;
+  sizeBytes?: number;
   fileType: string;
   columnNames?: string[];
   rowCount?: number;
@@ -194,7 +200,22 @@ function decodeFileBuffer(buffer: Buffer): { text: string; encoding: string } {
 /*  Data file parsing                                                  */
 /* ------------------------------------------------------------------ */
 
-async function downloadFile(url: string, destPath: string, fileKey?: string): Promise<void> {
+async function downloadFile(url: string, destPath: string, fileKey?: string, sizeBytes?: number): Promise<void> {
+  const multipartUploadId = fileKey ? parseDatasetMultipartUploadId(fileKey) : null;
+  if (multipartUploadId) {
+    const totalChunks = estimateDatasetMultipartChunks(sizeBytes ?? 0);
+    if (totalChunks > 1) {
+      console.log(`[Download] Multipart dataset detected (uploadId=${multipartUploadId}, chunks=${totalChunks})`);
+      await storageDownloadDatasetMultipartToFile({
+        uploadId: multipartUploadId,
+        totalChunks,
+        destinationPath: destPath,
+        timeoutMsPerPart: 120000,
+      });
+      return;
+    }
+  }
+
   // Try primary URL first
   let resp = await fetch(url);
   
@@ -1214,7 +1235,7 @@ export async function executePythonExperiment(
 
     for (const ds of datasets) {
       const localPath = path.join(dataDir, ds.originalName);
-      await downloadFile(ds.fileUrl, localPath, ds.fileKey);
+      await downloadFile(ds.fileUrl, localPath, ds.fileKey, ds.sizeBytes);
       logs.push(`[INFO] Downloaded: ${ds.originalName}`);
 
       try {
@@ -1547,6 +1568,13 @@ export function isIdOrCodeColumn(col: string, data: Record<string, any>[]): bool
     "都道府県", "コード", "番号", "識別",
   ];
   if (idPatterns.some(p => lowerCol.includes(p))) return true;
+  const measurePatterns = [
+    "score", "rating", "level", "grade", "scale", "age", "year",
+    "income", "salary", "wage", "price", "cost", "count", "rate", "ratio",
+    "percent", "proportion", "frequency", "duration", "time", "hours",
+    "スコア", "得点", "評価", "年齢", "収入", "給与",
+  ];
+  const looksLikeMeasure = measurePatterns.some(p => lowerCol.includes(p));
 
   // Statistical detection: check if values are sequential integers with very high cardinality
   const sampleSize = Math.min(data.length, 200);
@@ -1557,7 +1585,7 @@ export function isIdOrCodeColumn(col: string, data: Record<string, any>[]): bool
 
   // If all values are integers and unique count is very high relative to sample, likely an ID
   const uniqueCount = new Set(values).size;
-  if (uniqueCount / values.length > 0.9 && values.length > 20) return true;
+  if (uniqueCount / values.length > 0.9 && values.length > 20 && !looksLikeMeasure) return true;
 
   // If values are small integers (1-50) with few unique values, likely a code (e.g., prefecture 1-47)
   const min = Math.min(...values);
@@ -1565,11 +1593,7 @@ export function isIdOrCodeColumn(col: string, data: Record<string, any>[]): bool
   if (min >= 0 && max <= 100 && uniqueCount <= 50 && uniqueCount === (max - min + 1)) {
     // Looks like a sequential code (e.g., prefecture 1-47)
     // Only flag if the column name doesn't suggest a meaningful measure
-    const measurePatterns = ["score", "rating", "level", "grade", "scale", "age", "year",
-      "income", "salary", "wage", "price", "cost", "count", "rate", "ratio",
-      "percent", "proportion", "frequency", "duration", "time", "hours",
-      "スコア", "得点", "評価", "年齢", "収入", "給与"];
-    if (!measurePatterns.some(p => lowerCol.includes(p))) return true;
+    if (!looksLikeMeasure) return true;
   }
 
   return false;
@@ -1749,6 +1773,229 @@ function detectTextColumns(ds: ParsedDataset): string[] {
     if (avgLen >= 20 || nameHintsText) textCols.push(col);
   }
   return textCols;
+}
+
+type MethodApplicabilityStatus = "executable_now" | "partially_ready" | "blocked";
+
+interface MethodApplicabilityAssessment {
+  methodId: string;
+  label: string;
+  status: MethodApplicabilityStatus;
+  readinessScore: number;
+  evidence: string;
+  notes: string;
+}
+
+function formatMethodApplicabilityStatus(status: MethodApplicabilityStatus): string {
+  if (status === "executable_now") return "Executable now";
+  if (status === "partially_ready") return "Partially ready";
+  return "Blocked";
+}
+
+function clampReadinessScore(score: number): number {
+  return Math.max(0, Math.min(100, Math.round(score)));
+}
+
+export function buildMethodApplicabilityAssessment(
+  ds: ParsedDataset,
+  numericCols: string[],
+  categoricalCols: string[]
+): MethodApplicabilityAssessment[] {
+  const rowCount = ds.totalRows || ds.data.length;
+  const timeCols = ds.columns.filter(c => /(year|month|date|time|wave|period|quarter)/i.test(c));
+  const textCols = detectTextColumns(ds);
+  const lowerCols = ds.columns.map(c => c.toLowerCase());
+  const hasGraphLike = lowerCols.some(c => /(node|edge|source|target|network|graph)/i.test(c));
+  const hasImageLike = lowerCols.some(c => /(image|img|pixel|vision|frame|video|path)/i.test(c));
+  const hasPanelLike = timeCols.length > 0 && lowerCols.some(c => /(id|code|entity|respondent|household|firm|user|patient)/i.test(c));
+  const hasTreatmentLike = lowerCols.some(c => /(treat|treatment|intervention|policy|program|exposure|group)/i.test(c));
+  const hasOutcomeLike = lowerCols.some(c => /(outcome|target|response|score|rate|risk|income|wage|price|cost)/i.test(c)) || numericCols.length > 0;
+
+  const textDocumentCount = (() => {
+    if (textCols.length === 0) return 0;
+    const col = textCols[0];
+    return ds.data
+      .map(r => (typeof r[col] === "string" ? String(r[col]).trim() : ""))
+      .filter(s => s.length >= 20)
+      .length;
+  })();
+
+  let bestCorrelationPairs = 0;
+  if (numericCols.length >= 2) {
+    const pairLimit = Math.min(6, numericCols.length);
+    for (let i = 0; i < pairLimit; i++) {
+      for (let j = i + 1; j < pairLimit; j++) {
+        bestCorrelationPairs = Math.max(bestCorrelationPairs, parseNumericPairs(ds, numericCols[i], numericCols[j]).length);
+      }
+    }
+  }
+
+  let bestTimePairs = 0;
+  if (timeCols.length > 0 && numericCols.length > 0) {
+    for (const tCol of timeCols.slice(0, 3)) {
+      for (const nCol of numericCols.slice(0, 5)) {
+        let n = 0;
+        for (const row of ds.data) {
+          const t = parseTimeValue(row[tCol]);
+          const y = Number(row[nCol]);
+          if (t !== null && !isNaN(y)) n++;
+        }
+        bestTimePairs = Math.max(bestTimePairs, n);
+      }
+    }
+  }
+
+  let bestGroupCount = 0;
+  let smallestGroupN = 0;
+  let bestGroupPairedRows = 0;
+  if (categoricalCols.length > 0 && numericCols.length > 0) {
+    for (const catCol of categoricalCols.slice(0, 4)) {
+      for (const numCol of numericCols.slice(0, 4)) {
+        const groups = new Map<string, number>();
+        for (const row of ds.data) {
+          const key = String(row[catCol] ?? "").trim();
+          const value = Number(row[numCol]);
+          if (!key || isNaN(value)) continue;
+          groups.set(key, (groups.get(key) || 0) + 1);
+        }
+        const valid = Array.from(groups.values()).filter(v => v >= 3);
+        if (valid.length < 2) continue;
+        const minGroup = Math.min(...valid);
+        const pairedRows = valid.reduce((sum, v) => sum + v, 0);
+        if (pairedRows > bestGroupPairedRows) {
+          bestGroupPairedRows = pairedRows;
+          bestGroupCount = valid.length;
+          smallestGroupN = minGroup;
+        }
+      }
+    }
+  }
+
+  const assessments: MethodApplicabilityAssessment[] = [];
+  const pushAssessment = (
+    methodId: string,
+    label: string,
+    status: MethodApplicabilityStatus,
+    readinessScore: number,
+    evidence: string,
+    notes: string
+  ) => {
+    assessments.push({
+      methodId,
+      label,
+      status,
+      readinessScore: clampReadinessScore(readinessScore),
+      evidence,
+      notes,
+    });
+  };
+
+  const baselineEvidence = `rows=${rowCount}, numeric=${numericCols.length}, categorical=${categoricalCols.length}`;
+  if (rowCount >= 20 && (numericCols.length > 0 || categoricalCols.length > 0)) {
+    pushAssessment("descriptive_statistics", "Descriptive Statistics", "executable_now", 95, baselineEvidence, "Sufficient observations for robust summary statistics and distribution profiling.");
+  } else if (rowCount >= 10) {
+    pushAssessment("descriptive_statistics", "Descriptive Statistics", "partially_ready", 60, baselineEvidence, "Only limited descriptive summaries are reliable with current sample size.");
+  } else {
+    pushAssessment("descriptive_statistics", "Descriptive Statistics", "blocked", 25, baselineEvidence, "Too few observations for stable descriptive inference.");
+  }
+
+  const corrEvidence = `numeric_vars=${numericCols.length}, max_pair_n=${bestCorrelationPairs}`;
+  if (numericCols.length >= 2 && bestCorrelationPairs >= 20) {
+    pushAssessment("correlation", "Correlation Analysis", "executable_now", 85, corrEvidence, "At least one numeric variable pair has adequate overlap for interpretable correlation testing.");
+  } else if (numericCols.length >= 2 && bestCorrelationPairs >= 10) {
+    pushAssessment("correlation", "Correlation Analysis", "partially_ready", 60, corrEvidence, "Numeric pairs exist, but paired sample size is modest for stable inference.");
+  } else {
+    pushAssessment("correlation", "Correlation Analysis", "blocked", 20, corrEvidence, "Need two meaningful numeric variables with sufficient paired observations.");
+  }
+
+  const regressionEvidence = `numeric_vars=${numericCols.length}, max_model_n=${bestCorrelationPairs}`;
+  if (numericCols.length >= 2 && bestCorrelationPairs >= 40) {
+    pushAssessment("linear_regression", "Linear Regression", "executable_now", 80, regressionEvidence, "Data volume supports baseline OLS modelling and residual diagnostics.");
+  } else if (numericCols.length >= 2 && bestCorrelationPairs >= 20) {
+    pushAssessment("linear_regression", "Linear Regression", "partially_ready", 55, regressionEvidence, "Regression is feasible but may be underpowered for nuanced effect estimation.");
+  } else {
+    pushAssessment("linear_regression", "Linear Regression", "blocked", 20, regressionEvidence, "Need larger paired numeric sample and clearer dependent/independent structure.");
+  }
+
+  const groupEvidence = `groups=${bestGroupCount}, min_group_n=${smallestGroupN}, paired_rows=${bestGroupPairedRows}`;
+  if (bestGroupCount >= 2 && smallestGroupN >= 5 && bestGroupPairedRows >= 30) {
+    pushAssessment("group_comparison", "Group Comparison (t-test/ANOVA)", "executable_now", 78, groupEvidence, "Group structure is sufficient for between-group mean comparison with effect-size reporting.");
+  } else if (bestGroupCount >= 2 && smallestGroupN >= 3) {
+    pushAssessment("group_comparison", "Group Comparison (t-test/ANOVA)", "partially_ready", 52, groupEvidence, "Groups exist but small cells limit reliability of inferential comparisons.");
+  } else {
+    pushAssessment("group_comparison", "Group Comparison (t-test/ANOVA)", "blocked", 18, groupEvidence, "Need categorical groups and numeric outcomes with adequate per-group sample size.");
+  }
+
+  const trendEvidence = `time_cols=${timeCols.length}, numeric_vars=${numericCols.length}, max_trend_n=${bestTimePairs}`;
+  if (timeCols.length > 0 && numericCols.length > 0 && bestTimePairs >= 20) {
+    pushAssessment("time_trend", "Time Trend Analysis", "executable_now", 76, trendEvidence, "Temporal fields and numeric outcomes support trend estimation.");
+  } else if (timeCols.length > 0 && numericCols.length > 0 && bestTimePairs >= 10) {
+    pushAssessment("time_trend", "Time Trend Analysis", "partially_ready", 50, trendEvidence, "Temporal analysis is possible but limited by sparse aligned observations.");
+  } else {
+    pushAssessment("time_trend", "Time Trend Analysis", "blocked", 15, trendEvidence, "Need reliable temporal index and sufficient aligned numeric observations.");
+  }
+
+  const textEvidence = `text_cols=${textCols.length}, docs>=20chars=${textDocumentCount}`;
+  if (textCols.length > 0 && textDocumentCount >= 30) {
+    pushAssessment("text_feature_analysis", "Text Feature Analysis", "executable_now", 74, textEvidence, "Text volume supports token-frequency and document-length analytics.");
+  } else if (textCols.length > 0 && textDocumentCount >= 10) {
+    pushAssessment("text_feature_analysis", "Text Feature Analysis", "partially_ready", 48, textEvidence, "Text exists, but coverage is modest for robust lexical signal extraction.");
+  } else {
+    pushAssessment("text_feature_analysis", "Text Feature Analysis", "blocked", 12, textEvidence, "Need richer text fields with sufficient document coverage.");
+  }
+
+  const visualEvidence = `rows=${rowCount}, variables=${ds.columns.length}`;
+  if (rowCount >= 10 && ds.columns.length >= 2) {
+    pushAssessment("data_visualisation", "Academic Data Visualisation", "executable_now", 90, visualEvidence, "Dataset supports publication-style descriptive and inferential graphics.");
+  } else if (rowCount >= 5) {
+    pushAssessment("data_visualisation", "Academic Data Visualisation", "partially_ready", 55, visualEvidence, "Basic charts are feasible but inferential visualisation is limited.");
+  } else {
+    pushAssessment("data_visualisation", "Academic Data Visualisation", "blocked", 15, visualEvidence, "Insufficient data density for meaningful figures.");
+  }
+
+  const advancedTsEvidence = `time_cols=${timeCols.length}, trend_pairs=${bestTimePairs}`;
+  if (timeCols.length > 0 && bestTimePairs >= 120) {
+    pushAssessment("advanced_time_series", "Advanced Time-Series Modelling", "partially_ready", 62, advancedTsEvidence, "Temporal structure exists; advanced models may be feasible with stronger stationarity diagnostics.");
+  } else {
+    pushAssessment("advanced_time_series", "Advanced Time-Series Modelling", "blocked", timeCols.length > 0 ? 30 : 8, advancedTsEvidence, "Needs longer, denser temporal sequences and richer lag structure.");
+  }
+
+  const panelEvidence = `panel_like=${hasPanelLike ? "yes" : "no"}, rows=${rowCount}`;
+  if (hasPanelLike && rowCount >= 150) {
+    pushAssessment("panel_econometrics", "Panel Econometrics", "partially_ready", 64, panelEvidence, "Panel-style identifiers detected; feasibility depends on balanced panels and entity coverage.");
+  } else {
+    pushAssessment("panel_econometrics", "Panel Econometrics", "blocked", hasPanelLike ? 35 : 10, panelEvidence, "Needs explicit entity-time panel structure and broader sample depth.");
+  }
+
+  const causalEvidence = `treatment_like=${hasTreatmentLike ? "yes" : "no"}, time_like=${timeCols.length > 0 ? "yes" : "no"}, outcome_like=${hasOutcomeLike ? "yes" : "no"}, rows=${rowCount}`;
+  if (hasTreatmentLike && hasOutcomeLike && timeCols.length > 0 && rowCount >= 200) {
+    pushAssessment("causal_inference", "Causal Inference", "partially_ready", 55, causalEvidence, "Potential treatment/outcome structure exists, but identification assumptions still need rigorous validation.");
+  } else {
+    pushAssessment("causal_inference", "Causal Inference", "blocked", 12, causalEvidence, "Identification strategy prerequisites are not fully evidenced in the current data.");
+  }
+
+  const advNlpEvidence = `text_cols=${textCols.length}, docs>=20chars=${textDocumentCount}`;
+  if (textCols.length > 0 && textDocumentCount >= 300) {
+    pushAssessment("advanced_nlp", "Advanced NLP / Deep Text Models", "partially_ready", 58, advNlpEvidence, "Text volume may support more advanced NLP with additional model-validation resources.");
+  } else {
+    pushAssessment("advanced_nlp", "Advanced NLP / Deep Text Models", "blocked", textCols.length > 0 ? 26 : 8, advNlpEvidence, "Requires larger text corpora and stronger computational/annotation support.");
+  }
+
+  const graphEvidence = `graph_features=${hasGraphLike ? "detected" : "not_detected"}, rows=${rowCount}`;
+  if (hasGraphLike && rowCount >= 200) {
+    pushAssessment("graph_modelling", "Graph Modelling", "partially_ready", 52, graphEvidence, "Graph-like schema is present; network completeness should be validated before modelling.");
+  } else {
+    pushAssessment("graph_modelling", "Graph Modelling", "blocked", hasGraphLike ? 28 : 8, graphEvidence, "Needs explicit node-edge structure and sufficient graph connectivity.");
+  }
+
+  const visionEvidence = `image_features=${hasImageLike ? "detected" : "not_detected"}, rows=${rowCount}`;
+  if (hasImageLike && rowCount >= 200) {
+    pushAssessment("vision_analysis", "Vision Analysis", "partially_ready", 52, visionEvidence, "Image/path indicators exist; image quality and label structure should be validated.");
+  } else {
+    pushAssessment("vision_analysis", "Vision Analysis", "blocked", hasImageLike ? 28 : 8, visionEvidence, "Requires image tensors/paths and adequate labelled image volume.");
+  }
+
+  return assessments;
 }
 
 function topTerms(texts: string[], topN = 10): Array<[string, number]> {
@@ -2407,6 +2654,61 @@ function generateDefaultCharts(
     }
   }
 
+  // Chart 11: Methodology applicability/readiness overview
+  if (methodAllowed(executableMethods, "data_visualisation")) {
+    const applicability = buildMethodApplicabilityAssessment(ds, numericCols, categoricalCols);
+    if (applicability.length > 0) {
+      const topMethods = applicability
+        .slice()
+        .sort((a, b) => b.readinessScore - a.readinessScore)
+        .slice(0, 10);
+      const labels = topMethods.map(item => item.label.length > 22 ? `${item.label.slice(0, 19)}...` : item.label);
+      const scores = topMethods.map(item => item.readinessScore);
+      const colors = topMethods.map(item => {
+        if (item.status === "executable_now") return "rgba(89, 161, 79, 0.75)";
+        if (item.status === "partially_ready") return "rgba(237, 201, 73, 0.8)";
+        return "rgba(225, 87, 89, 0.75)";
+      });
+
+      charts.push({
+        name: "method_applicability_overview",
+        description: "Readiness profile of major statistical methodologies (0-100 scale)",
+        config: {
+          type: "bar",
+          data: {
+            labels,
+            datasets: [{
+              label: "Method readiness (0-100)",
+              data: scores,
+              backgroundColor: colors,
+              borderColor: "rgba(68, 68, 68, 0.9)",
+              borderWidth: 1,
+            }],
+          },
+          options: {
+            plugins: {
+              title: {
+                display: true,
+                text: "Methodology Applicability Overview",
+                font: { size: 16 },
+              },
+            },
+            scales: {
+              y: {
+                min: 0,
+                max: 100,
+                title: { display: true, text: "Readiness score (0-100)" },
+              },
+              x: {
+                title: { display: true, text: "Methodology" },
+              },
+            },
+          },
+        },
+      });
+    }
+  }
+
   return charts;
 }
 
@@ -2487,6 +2789,7 @@ function generateDefaultTables(
   const { numericCols: rawNumericCols, categoricalCols, idCols: _idCols2 } = classifyColumns(ds.data, ds.columns);
   // Exclude ID/code columns from tables - they are not meaningful for descriptive statistics
   const numericCols = rawNumericCols.filter(c => !_idCols2.includes(c));
+  const methodAssessments = buildMethodApplicabilityAssessment(ds, numericCols, categoricalCols);
 
   // Table 1: Descriptive statistics of numeric variables
   if (numericCols.length > 0 && methodAllowed(executableMethods, "descriptive_statistics")) {
@@ -2790,6 +3093,22 @@ function generateDefaultTables(
     });
   }
 
+  // Table 7: Methodology applicability matrix
+  if (methodAssessments.length > 0) {
+    tables.push({
+      name: "method_applicability_matrix",
+      description: "Applicability matrix for major statistical methodologies on the current dataset",
+      headers: ["Methodology", "Status", "Readiness (0-100)", "Evidence", "Interpretation"],
+      rows: methodAssessments.map(item => ([
+        item.label,
+        formatMethodApplicabilityStatus(item.status),
+        item.readinessScore,
+        item.evidence,
+        item.notes,
+      ])),
+    });
+  }
+
   return tables;
 }
 
@@ -2828,6 +3147,26 @@ function generateDefaultMetrics(
 
   // Descriptive stats for meaningful numeric columns only (exclude ID/code columns)
   const meaningfulNumericCols = numericCols.filter(c => !idCols.includes(c));
+  const methodAssessments = buildMethodApplicabilityAssessment(ds, meaningfulNumericCols, categoricalCols);
+  const executableNowCount = methodAssessments.filter(item => item.status === "executable_now").length;
+  const partiallyReadyCount = methodAssessments.filter(item => item.status === "partially_ready").length;
+  const blockedCount = methodAssessments.filter(item => item.status === "blocked").length;
+  metrics.method_applicability_executable_now = executableNowCount;
+  metrics.method_applicability_partially_ready = partiallyReadyCount;
+  metrics.method_applicability_blocked = blockedCount;
+  for (const item of methodAssessments) {
+    metrics[`method_readiness_${item.methodId}`] = item.readinessScore;
+    metrics[`method_status_${item.methodId}`] = item.status;
+  }
+  const topExecutable = methodAssessments
+    .filter(item => item.status === "executable_now")
+    .sort((a, b) => b.readinessScore - a.readinessScore)
+    .slice(0, 5)
+    .map(item => `${item.methodId}(${item.readinessScore})`)
+    .join(", ");
+  metrics.method_applicability_top_executable = topExecutable || "none";
+  metrics.method_applicability_summary = `executable_now=${executableNowCount}, partially_ready=${partiallyReadyCount}, blocked=${blockedCount}`;
+
   if (methodAllowed(executableMethods, "descriptive_statistics")) {
     for (const col of meaningfulNumericCols.slice(0, 5)) {
       const values = ds.data.map(r => Number(r[col])).filter(v => !isNaN(v));

@@ -56,6 +56,9 @@ interface ResearchEvidenceProfile {
     hasPanelLike: boolean;
     hasGraphLike: boolean;
     hasImageLike: boolean;
+    hasGroupLike: boolean;
+    hasTreatmentLike: boolean;
+    hasOutcomeLike: boolean;
   };
   literatureSummary: {
     paperCount: number;
@@ -332,25 +335,29 @@ function buildResearchEvidenceProfile(topic: string, datasets: DatasetInfo[], pa
   const hasGraphLike = allCols.some(c => /(node|edge|source|target|network|graph)/i.test(c));
   const hasImageLike = allCols.some(c => /(image|img|pixel|vision|frame|video|path)/i.test(c));
   const hasPanelLike = hasTimeLike && allCols.some(c => /(id|code|entity|respondent|household|firm|user|patient)/i.test(c));
+  const hasGroupLike = allCols.some(c => /(group|category|class|type|segment|gender|sex|region|prefecture|country|state|city|occupation|industry|cohort)/i.test(c));
+  const hasTreatmentLike = allCols.some(c => /(treat|treatment|intervention|policy|program|exposure|assignment)/i.test(c));
+  const hasOutcomeLike = allCols.some(c => /(outcome|target|response|score|rate|risk|income|wage|price|cost|value|metric|performance)/i.test(c));
+  const hasContinuousLike = allCols.some(c => /(score|rate|ratio|index|income|wage|price|cost|count|amount|duration|age|height|weight|value|metric|measure)/i.test(c));
   const totalRowsHint = datasets.reduce((sum, ds) => sum + (ds.rowCount || 0), 0);
   const methodSignals = buildLiteratureMethodSignals(papers);
 
   const recommendedExecutableMethods = uniqMethodIds([
-    "descriptive_statistics",
-    "correlation",
-    totalRowsHint >= 30 ? "linear_regression" : "",
+    datasets.length > 0 ? "descriptive_statistics" : "",
+    datasets.length > 0 ? "correlation" : "",
+    totalRowsHint >= 30 && (hasContinuousLike || allCols.length >= 3) ? "linear_regression" : "",
     hasTimeLike ? "time_trend" : "",
     hasTextLike ? "text_feature_analysis" : "",
     datasets.length > 0 ? "data_visualisation" : "",
-    hasPanelLike ? "group_comparison" : "",
+    hasGroupLike ? "group_comparison" : "",
   ].filter(Boolean));
 
   const constrainedMethods = uniqMethodIds([
-    !hasTextLike ? "advanced_nlp" : "",
+    !hasTextLike || totalRowsHint < 300 ? "advanced_nlp" : "",
     !hasGraphLike ? "graph_modelling" : "",
     !hasImageLike ? "vision_analysis" : "",
-    !hasPanelLike ? "panel_econometrics" : "",
-    !hasTimeLike ? "advanced_time_series" : "",
+    !hasPanelLike || totalRowsHint < 120 ? "panel_econometrics" : "",
+    !hasTimeLike || totalRowsHint < 120 ? "advanced_time_series" : "",
     "causal_inference",
   ].filter(Boolean));
 
@@ -363,6 +370,9 @@ function buildResearchEvidenceProfile(topic: string, datasets: DatasetInfo[], pa
       hasPanelLike,
       hasGraphLike,
       hasImageLike,
+      hasGroupLike,
+      hasTreatmentLike,
+      hasOutcomeLike,
     },
     literatureSummary: {
       paperCount: papers.length,
@@ -371,6 +381,26 @@ function buildResearchEvidenceProfile(topic: string, datasets: DatasetInfo[], pa
     recommendedExecutableMethods,
     constrainedMethods,
   };
+}
+
+function buildMethodologyApplicabilityGuide(profile: ResearchEvidenceProfile): string {
+  const d = profile.datasetSummary;
+  const rowsHint = d.totalRowsHint || 0;
+  const methodLines = [
+    `- descriptive_statistics: ${d.datasetCount > 0 ? "executable_now" : "blocked"} | prereq: tabular rows >= 10 | evidence: datasets=${d.datasetCount}, rows~${rowsHint}`,
+    `- correlation: ${d.datasetCount > 0 ? "executable_now" : "blocked"} | prereq: >=2 numeric measures with paired values | evidence: datasets=${d.datasetCount}`,
+    `- linear_regression: ${rowsHint >= 30 ? "executable_now" : "partially_ready"} | prereq: rows >= 30 + meaningful dependent/independent variables | evidence: rows~${rowsHint}`,
+    `- group_comparison: ${d.hasGroupLike ? "executable_now" : "partially_ready"} | prereq: categorical groups + numeric outcome | evidence: group_like=${d.hasGroupLike ? "yes" : "no"}`,
+    `- time_trend: ${d.hasTimeLike ? "executable_now" : "blocked"} | prereq: explicit time index + numeric outcome | evidence: time_like=${d.hasTimeLike ? "yes" : "no"}`,
+    `- text_feature_analysis: ${d.hasTextLike ? "executable_now" : "blocked"} | prereq: text columns + adequate text volume | evidence: text_like=${d.hasTextLike ? "yes" : "no"}`,
+    `- advanced_time_series: ${d.hasTimeLike && rowsHint >= 120 ? "partially_ready" : "blocked"} | prereq: long time horizon + stationarity diagnostics | evidence: time_like=${d.hasTimeLike ? "yes" : "no"}, rows~${rowsHint}`,
+    `- panel_econometrics: ${d.hasPanelLike && rowsHint >= 120 ? "partially_ready" : "blocked"} | prereq: entity id + time panel + sufficient entities | evidence: panel_like=${d.hasPanelLike ? "yes" : "no"}, rows~${rowsHint}`,
+    `- causal_inference: ${d.hasTreatmentLike && d.hasOutcomeLike && d.hasTimeLike ? "partially_ready" : "blocked"} | prereq: identification strategy + treatment/outcome + assumptions | evidence: treatment_like=${d.hasTreatmentLike ? "yes" : "no"}, outcome_like=${d.hasOutcomeLike ? "yes" : "no"}, time_like=${d.hasTimeLike ? "yes" : "no"}`,
+    `- advanced_nlp: ${d.hasTextLike && rowsHint >= 300 ? "partially_ready" : "blocked"} | prereq: large text corpus + validation resources | evidence: text_like=${d.hasTextLike ? "yes" : "no"}, rows~${rowsHint}`,
+    `- graph_modelling: ${d.hasGraphLike ? "partially_ready" : "blocked"} | prereq: explicit node/edge structure | evidence: graph_like=${d.hasGraphLike ? "yes" : "no"}`,
+    `- vision_analysis: ${d.hasImageLike ? "partially_ready" : "blocked"} | prereq: image assets/features + labels | evidence: image_like=${d.hasImageLike ? "yes" : "no"}`,
+  ];
+  return methodLines.join("\n");
 }
 
 function ensureEvidenceProfile(ctx: PipelineContext): ResearchEvidenceProfile {
@@ -437,7 +467,7 @@ function deriveFallbackMethodContract(methodologyText: string, profile: Research
     blockedReasons,
     evidenceNotes: [
       `Datasets: ${profile.datasetSummary.datasetCount}, rows (hint): ${profile.datasetSummary.totalRowsHint || "unknown"}`,
-      `Capabilities — time:${profile.datasetSummary.hasTimeLike ? "yes" : "no"}, text:${profile.datasetSummary.hasTextLike ? "yes" : "no"}, panel:${profile.datasetSummary.hasPanelLike ? "yes" : "no"}, graph:${profile.datasetSummary.hasGraphLike ? "yes" : "no"}, image:${profile.datasetSummary.hasImageLike ? "yes" : "no"}`,
+      `Capabilities — time:${profile.datasetSummary.hasTimeLike ? "yes" : "no"}, text:${profile.datasetSummary.hasTextLike ? "yes" : "no"}, panel:${profile.datasetSummary.hasPanelLike ? "yes" : "no"}, graph:${profile.datasetSummary.hasGraphLike ? "yes" : "no"}, image:${profile.datasetSummary.hasImageLike ? "yes" : "no"}, group:${profile.datasetSummary.hasGroupLike ? "yes" : "no"}, treatment:${profile.datasetSummary.hasTreatmentLike ? "yes" : "no"}, outcome:${profile.datasetSummary.hasOutcomeLike ? "yes" : "no"}`,
       `Literature papers considered: ${profile.literatureSummary.paperCount}`,
     ],
   };
@@ -466,8 +496,12 @@ function parseMethodContract(validationText: string, methodologyText: string, pr
     const safeExecutableNow = executableNow.filter(m =>
       !mergedFuture.includes(m) && !profile.constrainedMethods.includes(m)
     );
+    if (profile.datasetSummary.datasetCount > 0 && !safeExecutableNow.includes("descriptive_statistics")) {
+      safeExecutableNow.push("descriptive_statistics");
+    }
+    const normalizedExecutableNow = uniqMethodIds(safeExecutableNow);
     return {
-      executableNow: safeExecutableNow.length > 0 ? safeExecutableNow : fallback.executableNow,
+      executableNow: normalizedExecutableNow.length > 0 ? normalizedExecutableNow : fallback.executableNow,
       requiresMissingData: requiresMissingData.length > 0 ? requiresMissingData : fallback.requiresMissingData,
       futureWorkOnly: mergedFuture.length > 0 ? mergedFuture : fallback.futureWorkOnly,
       blockedReasons: Object.keys(blockedReasons).length > 0 ? blockedReasons : fallback.blockedReasons,
@@ -641,11 +675,17 @@ function getAnalyticalMetricEntries(experimentOutput: ExperimentOutput | null): 
     "mean_", "std_", "median_", "min_", "max_",
     "strongest_correlation_", "p_value_", "regression_",
     "anova_", "time_trend_", "text_", "top_",
+    "method_readiness_",
   ];
   const analyticalExact = new Set([
     "correlation_sample_size",
     "correlation_interpretation",
     "analysis_methods_executed",
+    "method_applicability_executable_now",
+    "method_applicability_partially_ready",
+    "method_applicability_blocked",
+    "method_applicability_top_executable",
+    "method_applicability_summary",
   ]);
 
   return entries.filter(([k]) => {
@@ -676,6 +716,9 @@ function collectExecutedMethods(experimentOutput: ExperimentOutput | null): stri
   }
   if (metricKeys.some(k => k.startsWith("text_") || k.startsWith("top_"))) {
     methods.add("text feature analysis");
+  }
+  if (metricKeys.some(k => k.startsWith("method_readiness_") || k.startsWith("method_status_") || k.startsWith("method_applicability_"))) {
+    methods.add("method applicability assessment");
   }
   if (experimentOutput.charts.length > 0) {
     methods.add("data visualisation");
@@ -872,7 +915,7 @@ async function stage5_gapIdentification(ctx: PipelineContext): Promise<string> {
 
 async function stage6_hypothesisGeneration(ctx: PipelineContext): Promise<string> {
   const evidence = ensureEvidenceProfile(ctx);
-  const hypothesisConstraint = `\n\nDataset/literature feasibility profile:\n- Dataset count: ${evidence.datasetSummary.datasetCount}\n- Capabilities: time=${evidence.datasetSummary.hasTimeLike ? "yes" : "no"}, text=${evidence.datasetSummary.hasTextLike ? "yes" : "no"}, panel=${evidence.datasetSummary.hasPanelLike ? "yes" : "no"}, graph=${evidence.datasetSummary.hasGraphLike ? "yes" : "no"}, image=${evidence.datasetSummary.hasImageLike ? "yes" : "no"}\n- Executable method hints: ${evidence.recommendedExecutableMethods.join(", ") || "none"}\n- Constrained method hints: ${evidence.constrainedMethods.join(", ") || "none"}`;
+  const hypothesisConstraint = `\n\nDataset/literature feasibility profile:\n- Dataset count: ${evidence.datasetSummary.datasetCount}\n- Capabilities: time=${evidence.datasetSummary.hasTimeLike ? "yes" : "no"}, text=${evidence.datasetSummary.hasTextLike ? "yes" : "no"}, panel=${evidence.datasetSummary.hasPanelLike ? "yes" : "no"}, graph=${evidence.datasetSummary.hasGraphLike ? "yes" : "no"}, image=${evidence.datasetSummary.hasImageLike ? "yes" : "no"}, group=${evidence.datasetSummary.hasGroupLike ? "yes" : "no"}, treatment=${evidence.datasetSummary.hasTreatmentLike ? "yes" : "no"}, outcome=${evidence.datasetSummary.hasOutcomeLike ? "yes" : "no"}\n- Executable method hints: ${evidence.recommendedExecutableMethods.join(", ") || "none"}\n- Constrained method hints: ${evidence.constrainedMethods.join(", ") || "none"}\n\nMethodology applicability guide (derive hypotheses that can be empirically tested now):\n${buildMethodologyApplicabilityGuide(evidence)}`;
   const result = await callLLM(
     "You are a research hypothesis generator. Create testable hypotheses from identified gaps.",
     `Research topic: "${ctx.topic}"${hypothesisConstraint}\n\nBased on identified research gaps, generate:\n1. Primary hypothesis (clear, testable, specific)\n2. Secondary hypotheses (2-3)\n3. Null hypotheses\n4. Expected outcomes\n5. Variables (independent, dependent, control)\n6. Theoretical framework\n7. Operationalisation table (construct -> dataset column(s) -> expected sign/direction)\n8. Falsification criteria and rejection conditions for each core hypothesis\n\nRules:\n- Keep hypotheses executable with available data modalities.\n- If a hypothesis needs unavailable modalities, explicitly mark it as future-work only.`
@@ -894,7 +937,7 @@ async function stage7_methodDesign(ctx: PipelineContext): Promise<string> {
   const capabilityHints = hasDatasets
     ? `\n\nDataset capability profile (derived from metadata; use this to avoid over-claiming):\n${buildDatasetCapabilityHints(ctx.datasetFiles)}`
     : "";
-  const evidenceHints = `\n\nResearch evidence profile:\n- Dataset count: ${evidence.datasetSummary.datasetCount}\n- Dataset rows (hint): ${evidence.datasetSummary.totalRowsHint || "unknown"}\n- Capabilities: time=${evidence.datasetSummary.hasTimeLike ? "yes" : "no"}, text=${evidence.datasetSummary.hasTextLike ? "yes" : "no"}, panel=${evidence.datasetSummary.hasPanelLike ? "yes" : "no"}, graph=${evidence.datasetSummary.hasGraphLike ? "yes" : "no"}, image=${evidence.datasetSummary.hasImageLike ? "yes" : "no"}\n- Literature signals: ${Object.entries(evidence.literatureSummary.topMethodSignals).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([k,v])=>`${k}:${v}`).join(", ")}\n- Recommended executable methods now: ${evidence.recommendedExecutableMethods.join(", ") || "none"}\n- Constrained methods (must not be claimed as executed): ${evidence.constrainedMethods.join(", ") || "none"}`;
+  const evidenceHints = `\n\nResearch evidence profile:\n- Dataset count: ${evidence.datasetSummary.datasetCount}\n- Dataset rows (hint): ${evidence.datasetSummary.totalRowsHint || "unknown"}\n- Capabilities: time=${evidence.datasetSummary.hasTimeLike ? "yes" : "no"}, text=${evidence.datasetSummary.hasTextLike ? "yes" : "no"}, panel=${evidence.datasetSummary.hasPanelLike ? "yes" : "no"}, graph=${evidence.datasetSummary.hasGraphLike ? "yes" : "no"}, image=${evidence.datasetSummary.hasImageLike ? "yes" : "no"}, group=${evidence.datasetSummary.hasGroupLike ? "yes" : "no"}, treatment=${evidence.datasetSummary.hasTreatmentLike ? "yes" : "no"}, outcome=${evidence.datasetSummary.hasOutcomeLike ? "yes" : "no"}\n- Literature signals: ${Object.entries(evidence.literatureSummary.topMethodSignals).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([k,v])=>`${k}:${v}`).join(", ")}\n- Recommended executable methods now: ${evidence.recommendedExecutableMethods.join(", ") || "none"}\n- Constrained methods (must not be claimed as executed): ${evidence.constrainedMethods.join(", ") || "none"}\n\nMethodology applicability guide (must be respected):\n${buildMethodologyApplicabilityGuide(evidence)}`;
 
   const dataConstraint = hasDatasets
     ? `\n\nCRITICAL METHODOLOGY CONSTRAINTS — ABSOLUTE RULES (VIOLATION = INVALID PAPER):
@@ -918,12 +961,15 @@ RULES:
    b. How variables will be operationalised (which columns map to which concepts)
    c. What preprocessing steps are needed (handling missing values, encoding categoricals, normalisation)
    d. What the expected output of each analysis step is
-6. DO NOT promise results you cannot deliver. Every claim in the methodology about "we will show" or "we will demonstrate" must be achievable with the allowed methods and available data.`
+6. DO NOT promise results you cannot deliver. Every claim in the methodology about "we will show" or "we will demonstrate" must be achievable with the allowed methods and available data.
+7. Descriptive statistics are mandatory whenever at least one dataset is available; they must include central tendency, dispersion, and missing-data profiling.
+8. Include a dedicated subsection called "Methodology Applicability Matrix" with one row per major method family (descriptive, correlation, regression, group comparison, time trend, text analysis, causal inference, panel, advanced time-series, advanced NLP, graph, vision), with readiness label (executable_now/partially_ready/blocked), key prerequisite checks, and rationale.
+9. Any method marked partially_ready or blocked MUST include explicit "what is missing" and "how to unlock" notes.`
     : "";
 
   const result = await callLLM(
     `You are a research methodology designer. You must design methods that are REALISTIC and EXECUTABLE with the available data. Do NOT propose methods that sound impressive but cannot actually be implemented with the given dataset.`,
-    `Research topic: "${ctx.topic}"\nHypothesis: ${ctx.hypothesis}${datasetInfo}${capabilityHints}${evidenceHints}${dataConstraint}\n\nDesign a complete experimental methodology:\n1. Research design (experimental/quasi-experimental/observational) — choose based on what the DATA actually supports\n2. Data description and variable operationalisation — map dataset columns to research variables\n3. Data preprocessing steps — handling missing values, encoding, normalisation\n4. Statistical analysis plan — specific tests/models matched to data type and research questions\n5. Evaluation approach — how will you assess the quality of the analysis?\n6. Baseline comparisons — what simple benchmarks will you compare against?\n7. Limitations — what CAN'T be answered with this data?\n8. Potential confounding variables and how to address them\n9. Hypothesis-to-test alignment matrix (hypothesis -> executable test -> decision rule -> expected falsification outcome)\n\nAt the end, add two sections:\n- "Executable Analyses" with concrete analyses runnable now.\n- "Blocked Analyses" with methods that require missing data/modalities and why.\n\nAlso add a final short section named "Empirical Readiness Classification" with one label:\n- empirical (if executable analyses can produce evidence-backed quantitative claims)\n- methodological_protocol (if evidence is mainly design/protocol and quantitative claims are not yet supported).`
+    `Research topic: "${ctx.topic}"\nHypothesis: ${ctx.hypothesis}${datasetInfo}${capabilityHints}${evidenceHints}${dataConstraint}\n\nDesign a complete experimental methodology:\n1. Research design (experimental/quasi-experimental/observational) — choose based on what the DATA actually supports\n2. Data description and variable operationalisation — map dataset columns to research variables\n3. Data preprocessing steps — handling missing values, encoding, normalisation\n4. Statistical analysis plan — specific tests/models matched to data type and research questions\n5. Evaluation approach — how will you assess the quality of the analysis?\n6. Baseline comparisons — what simple benchmarks will you compare against?\n7. Limitations — what CAN'T be answered with this data?\n8. Potential confounding variables and how to address them\n9. Hypothesis-to-test alignment matrix (hypothesis -> executable test -> decision rule -> expected falsification outcome)\n10. Methodology applicability matrix covering the major modern method families and readiness labels\n\nAt the end, add two sections:\n- "Executable Analyses" with concrete analyses runnable now.\n- "Blocked Analyses" with methods that require missing data/modalities and why.\n\nAlso add a final short section named "Empirical Readiness Classification" with one label:\n- empirical (if executable analyses can produce evidence-backed quantitative claims)\n- methodological_protocol (if evidence is mainly design/protocol and quantitative claims are not yet supported).`
   );
   ctx.methodology = result;
   await persistStageAudit(ctx, 7, {
@@ -941,11 +987,11 @@ async function stage8_methodValidation(ctx: PipelineContext): Promise<string> {
   const capabilityHints = ctx.datasetFiles.length > 0
     ? `\n\nDataset capability profile:\n${buildDatasetCapabilityHints(ctx.datasetFiles)}`
     : "";
-  const evidenceHints = `\n\nResearch evidence profile:\n- Recommended executable methods: ${evidence.recommendedExecutableMethods.join(", ") || "none"}\n- Constrained methods: ${evidence.constrainedMethods.join(", ") || "none"}\n- Literature method signals: ${Object.entries(evidence.literatureSummary.topMethodSignals).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([k,v])=>`${k}:${v}`).join(", ")}`;
+  const evidenceHints = `\n\nResearch evidence profile:\n- Recommended executable methods: ${evidence.recommendedExecutableMethods.join(", ") || "none"}\n- Constrained methods: ${evidence.constrainedMethods.join(", ") || "none"}\n- Literature method signals: ${Object.entries(evidence.literatureSummary.topMethodSignals).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([k,v])=>`${k}:${v}`).join(", ")}\n\nMethodology applicability guide (hard constraints):\n${buildMethodologyApplicabilityGuide(evidence)}`;
 
   const result = await callLLM(
     `You are a methodology reviewer and data science expert. You must critically evaluate whether the proposed methodology is ACTUALLY FEASIBLE with the available data. Be harsh and honest. Your job is to REJECT over-ambitious methodologies and force them to match reality.`,
-    `Research topic: "${ctx.topic}"\nMethodology:\n${ctx.methodology}${datasetInfo}${capabilityHints}${evidenceHints}\n\nCritically validate:\n1. DATA-METHOD ALIGNMENT: Does the proposed method match the actual data? For example:\n   - If the data is a simple CSV with 10 columns, can you really train a graph neural network on it? NO.\n   - If the data has no temporal ordering, can you do time-series analysis? NO.\n   - If the data is aggregate statistics, can you do individual-level causal inference? NO.\n   Flag ANY method that cannot be executed with the available data.\n\n2. STATISTICAL VALIDITY: Are the proposed statistical tests appropriate for the data types?\n   - Correlation on categorical ID columns (prefecture codes, year codes) is MEANINGLESS.\n   - t-tests require proper group definitions, not arbitrary splits.\n   - Regression requires meaningful dependent and independent variables.\n\n3. FEASIBILITY: Can this methodology actually be implemented in Python with standard libraries?\n\n4. HONESTY CHECK: Does the methodology over-promise? If so, recommend simpler, honest alternatives.\n\n5. Recommendations: What methodology SHOULD be used given the actual data?\n\n6. Overall feasibility score (1-10) — be strict. A methodology that proposes deep learning on a 4000-row CSV should score 2-3.\n\nCRITICAL VALIDATION RULE:\nIf the proposed methodology contains ANY method not in the recommended executable list (${evidence.recommendedExecutableMethods.join(", ")}) as a PRIMARY analysis method (not future work), your validation MUST:\n- Assign a feasibility score of 3 or below\n- Explicitly list each non-executable method and explain why it cannot be run\n- Provide a REWRITTEN methodology that uses ONLY executable methods\n- Move all non-executable methods to the "future_work_only" list in the contract\n\nAfter the narrative review, output a machine-readable block using EXACTLY this format:\n[METHOD_CONTRACT_JSON]\n{\"executable_now\":[...],\"requires_missing_data\":[...],\"future_work_only\":[...],\"blocked_reasons\":{\"method\":\"reason\"},\"evidence_notes\":[...]}\n[/METHOD_CONTRACT_JSON]\n\nUse concise snake_case method ids (e.g., descriptive_statistics, correlation, linear_regression, group_comparison, time_trend, text_feature_analysis, causal_inference, graph_modelling, vision_analysis, panel_econometrics, advanced_time_series, advanced_nlp).\n\nIMPORTANT: The "executable_now" list MUST be a strict subset of: ${evidence.recommendedExecutableMethods.join(", ")}. Do NOT add methods to "executable_now" that are not in this list.`
+    `Research topic: "${ctx.topic}"\nMethodology:\n${ctx.methodology}${datasetInfo}${capabilityHints}${evidenceHints}\n\nCritically validate:\n1. DATA-METHOD ALIGNMENT: Does the proposed method match the actual data? For example:\n   - If the data is a simple CSV with 10 columns, can you really train a graph neural network on it? NO.\n   - If the data has no temporal ordering, can you do time-series analysis? NO.\n   - If the data is aggregate statistics, can you do individual-level causal inference? NO.\n   Flag ANY method that cannot be executed with the available data.\n\n2. STATISTICAL VALIDITY: Are the proposed statistical tests appropriate for the data types?\n   - Correlation on categorical ID columns (prefecture codes, year codes) is MEANINGLESS.\n   - t-tests require proper group definitions, not arbitrary splits.\n   - Regression requires meaningful dependent and independent variables.\n\n3. FEASIBILITY: Can this methodology actually be implemented in Python with standard libraries?\n\n4. HONESTY CHECK: Does the methodology over-promise? If so, recommend simpler, honest alternatives.\n\n5. Recommendations: What methodology SHOULD be used given the actual data?\n\n6. Overall feasibility score (1-10) — be strict. A methodology that proposes deep learning on a 4000-row CSV should score 2-3.\n\nCRITICAL VALIDATION RULE:\nIf the proposed methodology contains ANY method not in the recommended executable list (${evidence.recommendedExecutableMethods.join(", ")}) as a PRIMARY analysis method (not future work), your validation MUST:\n- Assign a feasibility score of 3 or below\n- Explicitly list each non-executable method and explain why it cannot be run\n- Provide a REWRITTEN methodology that uses ONLY executable methods\n- Move all non-executable methods to the "future_work_only" list in the contract\n\nADDITIONAL MANDATORY RULES:\n- If at least one dataset is available, descriptive_statistics MUST be included in executable_now.\n- The contract must include a method-family-level applicability judgement (executable_now / partially_ready / blocked) for modern methodologies (causal, panel, advanced_time_series, advanced_nlp, graph_modelling, vision_analysis), with concise blocked_reasons/evidence_notes.\n\nAfter the narrative review, output a machine-readable block using EXACTLY this format:\n[METHOD_CONTRACT_JSON]\n{\"executable_now\":[...],\"requires_missing_data\":[...],\"future_work_only\":[...],\"blocked_reasons\":{\"method\":\"reason\"},\"evidence_notes\":[...]}\n[/METHOD_CONTRACT_JSON]\n\nUse concise snake_case method ids (e.g., descriptive_statistics, correlation, linear_regression, group_comparison, time_trend, text_feature_analysis, causal_inference, graph_modelling, vision_analysis, panel_econometrics, advanced_time_series, advanced_nlp).\n\nIMPORTANT: The "executable_now" list MUST be a strict subset of: ${evidence.recommendedExecutableMethods.join(", ")}. Do NOT add methods to "executable_now" that are not in this list.`
   );
   ctx.methodValidation = result;
   const contract = parseMethodContract(result, ctx.methodology, evidence);
@@ -1189,7 +1235,7 @@ async function stage13_statisticalAnalysis(ctx: PipelineContext): Promise<string
 
   const result = await callLLM(
     `You are a statistician. CRITICAL ANTI-HALLUCINATION RULES:\n1. You may ONLY discuss and interpret numerical values that appear in the "Actual computed metrics" or "Actual computed tables" sections.\n2. Do NOT invent p-values, confidence intervals, effect sizes, or any other statistics not explicitly computed.\n3. If no actual metrics are provided, describe WHAT statistical tests SHOULD be performed and WHY, but do NOT report any numerical results.\n4. Clearly distinguish between "computed results" and "recommended analyses".`,
-    `${hasRealMetrics ? "Interpret and discuss" : "Describe the statistical analysis plan for"} these results:\n\n${ctx.experimentResults}${experimentMetrics}${experimentTables}${contractBlock}${executionBlock}\n\n${hasRealMetrics ? `Interpret the actual computed metrics above:\n1. What do these descriptive statistics tell us?\n2. What patterns or trends are visible?\n3. What additional statistical tests would strengthen the analysis?\n4. What are the limitations of the current analysis?\n\nIMPORTANT: Only discuss the numbers provided above. Do NOT generate new statistics.` : `No empirical metrics were computed from the data. Describe:\n1. What statistical tests SHOULD be performed (but do NOT report results)\n2. What descriptive statistics would be informative\n3. Recommended hypothesis tests and their rationale\n4. Required assumptions and how to validate them\n5. Suggested sample size and power analysis approach\n\nIMPORTANT: Do NOT fabricate any numerical results. Only describe the analytical plan.`}`
+    `${hasRealMetrics ? "Interpret and discuss" : "Describe the statistical analysis plan for"} these results:\n\n${ctx.experimentResults}${experimentMetrics}${experimentTables}${contractBlock}${executionBlock}\n\n${hasRealMetrics ? `Interpret the actual computed metrics above:\n1. What do these descriptive statistics tell us?\n2. What patterns or trends are visible?\n3. What additional statistical tests would strengthen the analysis?\n4. What are the limitations of the current analysis?\n5. Explicitly summarise methodology applicability using any method_readiness_* and method_status_* metrics, distinguishing executable_now vs partially_ready vs blocked methods.\n\nIMPORTANT: Only discuss the numbers provided above. Do NOT generate new statistics.` : `No empirical metrics were computed from the data. Describe:\n1. What statistical tests SHOULD be performed (but do NOT report results)\n2. What descriptive statistics would be informative\n3. Recommended hypothesis tests and their rationale\n4. Required assumptions and how to validate them\n5. Suggested sample size and power analysis approach\n6. A methodology applicability matrix (executable_now / partially_ready / blocked) with prerequisite checks\n\nIMPORTANT: Do NOT fabricate any numerical results. Only describe the analytical plan.`}`
   );
   ctx.statisticalAnalysis = result;
   await persistStageAudit(ctx, 13, {
@@ -1210,7 +1256,7 @@ async function stage14_figureGeneration(ctx: PipelineContext): Promise<string> {
 
     const result = await callLLM(
       "You are a scientific visualization expert. Describe the generated figures for inclusion in the paper.",
-      `The following figures were generated from actual data analysis:\n\n${chartList}\n\nBased on these results:\n${ctx.experimentResults?.substring(0, 3000)}\n\nFor each figure, provide:\n1. A detailed caption suitable for a research paper\n2. Description of what the figure shows\n3. Key observations from the visualization\n4. How it supports the research hypothesis\n\nAlso suggest any additional figures that would strengthen the paper.`
+      `The following figures were generated from actual data analysis:\n\n${chartList}\n\nBased on these results:\n${ctx.experimentResults?.substring(0, 3000)}\n\nFor each figure, provide:\n1. A detailed caption suitable for a research paper\n2. Description of what the figure shows\n3. Key observations from the visualization\n4. How it supports the research hypothesis\n5. Academic-quality checklist (axis labels and units, legend clarity, sample size context, and whether confidence/statistical uncertainty information is shown or unavailable)\n\nAlso suggest any additional figures that would strengthen the paper.`
     );
     ctx.figures = [result];
     return result;
@@ -1236,7 +1282,7 @@ async function stage15_tableGeneration(ctx: PipelineContext): Promise<string> {
 
   const result = await callLLM(
     `You are a scientific table designer. Create publication-quality LaTeX tables.\n\nCRITICAL ANTI-HALLUCINATION RULES:\n1. Tables MUST contain ONLY values from the "Actual computed tables" or "Actual computed metrics" sections.\n2. Do NOT invent, estimate, or fabricate any numerical values.\n3. If no actual data is provided, create tables showing the STRUCTURE only (column headers, row labels) with "—" or "N/A" in data cells, and add a note explaining that empirical values are pending.\n4. Every number in every cell must be traceable to the provided data.`,
-    `${hasRealTables || hasRealMetrics ? "Format the following actual data into publication-quality LaTeX tables" : "Describe the table structures that WOULD be included in an empirical version of this paper"}:\n\n${ctx.experimentResults}\n${ctx.statisticalAnalysis?.substring(0, 2000)}${experimentTables}${experimentMetrics}${contractBlock}${executionBlock}\n\n${hasRealTables ? `Convert the actual computed tables above into LaTeX format using booktabs. Preserve ALL original values exactly as computed. Do NOT round, adjust, or add values.` : `No empirical data tables were computed. Do NOT generate LaTeX table environments with empty cells or placeholder dashes.\nInstead, provide a PROSE DESCRIPTION of what tables the empirical study would include:\n1. Describe the structure of the main results table (what columns, what rows, what metrics)\n2. Describe the structure of the descriptive statistics table\n3. Use paragraph form, NOT LaTeX table environments\nThis ensures the paper reads well without empty placeholder tables.`}\n\nTable formatting rules (for real data only):\n- Use \\resizebox{\\textwidth}{!}{...} for tables with 4+ columns\n- Use booktabs (\\toprule, \\midrule, \\bottomrule)\n- Do NOT use sisetup or S column type\n- Keep column headers SHORT (abbreviate if needed)`
+    `${hasRealTables || hasRealMetrics ? "Format the following actual data into publication-quality LaTeX tables" : "Describe the table structures that WOULD be included in an empirical version of this paper"}:\n\n${ctx.experimentResults}\n${ctx.statisticalAnalysis?.substring(0, 2000)}${experimentTables}${experimentMetrics}${contractBlock}${executionBlock}\n\n${hasRealTables ? `Convert the actual computed tables above into LaTeX format using booktabs. Preserve ALL original values exactly as computed. Do NOT round, adjust, or add values.` : `No empirical data tables were computed. Do NOT generate LaTeX table environments with empty cells or placeholder dashes.\nInstead, provide a PROSE DESCRIPTION of what tables the empirical study would include:\n1. Describe the structure of the main results table (what columns, what rows, what metrics)\n2. Describe the structure of the descriptive statistics table\n3. Use paragraph form, NOT LaTeX table environments\nThis ensures the paper reads well without empty placeholder tables.`}\n\nIn all cases, include (using available data only):\n- A descriptive-statistics table (if any descriptive metrics exist)\n- A methodology applicability table that clearly marks executable_now / partially_ready / blocked methods\n- Brief table notes about assumptions, sample coverage, and interpretation boundaries\n\nTable formatting rules (for real data only):\n- Use \\resizebox{\\textwidth}{!}{...} for tables with 4+ columns\n- Use booktabs (\\toprule, \\midrule, \\bottomrule)\n- Do NOT use sisetup or S column type\n- Keep column headers SHORT (abbreviate if needed)`
   );
   ctx.tables = [result];
   await persistStageAudit(ctx, 15, {
@@ -1306,7 +1352,7 @@ async function stage18_bodyWriting(ctx: PipelineContext): Promise<string> {
     const metricsText = getAnalyticalMetricEntries(ctx.experimentOutput)
       .map(([k, v]) => `${k}: ${v}`).join("\n");
 
-    dataAnalysisSection = `\n\n## Data Analysis Results (from actual dataset analysis)\nCharts generated:\n${chartRefs}\n\nTables generated:\n${tableRefs}\n\nAnalytical metrics:\n${metricsText || "None"}\n\nMethod feasibility contract:\n${formatMethodContract(ctx.methodContract)}\n\nExecution diagnostics:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}\n\nMethod integrity note:\n${ctx.methodIntegrityNote || "No integrity note available."}\n\nIMPORTANT: Reference these actual figures and tables in the paper body. Use "Figure 1", "Table 1" etc. to refer to them. The results section should discuss these actual analysis outputs only.`;
+    dataAnalysisSection = `\n\n## Data Analysis Results (from actual dataset analysis)\nCharts generated:\n${chartRefs}\n\nTables generated:\n${tableRefs}\n\nAnalytical metrics:\n${metricsText || "None"}\n\nMethod feasibility contract:\n${formatMethodContract(ctx.methodContract)}\n\nExecution diagnostics:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}\n\nMethod integrity note:\n${ctx.methodIntegrityNote || "No integrity note available."}\n\nIMPORTANT: Reference these actual figures and tables in the paper body. Use "Figure 1", "Table 1" etc. to refer to them. The results section should discuss these actual analysis outputs only.\n\nIf method applicability metrics are present (e.g., method_readiness_* / method_status_* / method_applicability_summary), explicitly discuss what is executable now versus only partially ready versus blocked.`;
   }
 
   const hasRealMetrics = getAnalyticalMetricEntries(ctx.experimentOutput).length > 0;
@@ -1321,7 +1367,7 @@ async function stage18_bodyWriting(ctx: PipelineContext): Promise<string> {
 
   let antiHallucinationRules = "";
   if (hasRealMetrics || hasRealCharts || hasRealTables) {
-    antiHallucinationRules = `\n\nANTI-HALLUCINATION RULES:\n1. In the Results section, you may ONLY report numerical values from the "Data Analysis Results" section above.\n2. When discussing figures and tables, describe what they show based on the provided descriptions.\n3. Do NOT invent additional statistics, p-values, or effect sizes beyond what is provided.\n4. If you need to discuss implications, use hedged language ("suggests", "indicates", "is consistent with").\n5. Any methodology component not confirmed by the method integrity note must be framed as unexecuted/future work.\n\nMETHODOLOGY-RESULTS ALIGNMENT (CRITICAL):\n- Actually executed methods: ${executedMethodsList}\n- Blocked/unexecuted methods: ${blockedMethodsList}\n- The Methodology section MUST describe ONLY the analyses that were actually executed.\n- Methods listed as blocked/unexecuted MUST appear ONLY in a "Limitations and Future Work" subsection, clearly marked as "not yet implemented" or "planned for future work".\n- The paper title MUST NOT reference unexecuted methods as if they are the paper's contribution.\n- Do NOT describe any blocked or unexecuted method as something "we apply" or "we implement" — only as "future work".`;
+    antiHallucinationRules = `\n\nANTI-HALLUCINATION RULES:\n1. In the Results section, you may ONLY report numerical values from the "Data Analysis Results" section above.\n2. When discussing figures and tables, describe what they show based on the provided descriptions.\n3. Do NOT invent additional statistics, p-values, or effect sizes beyond what is provided.\n4. If you need to discuss implications, use hedged language ("suggests", "indicates", "is consistent with").\n5. Any methodology component not confirmed by the method integrity note must be framed as unexecuted/future work.\n6. If method applicability metrics are available, include a dedicated subsection that classifies method families into executable_now, partially_ready, and blocked, and tie this classification to prerequisites/limitations.\n7. Descriptive statistics and academic-quality visualisation discussion must be included whenever such outputs exist.\n\nMETHODOLOGY-RESULTS ALIGNMENT (CRITICAL):\n- Actually executed methods: ${executedMethodsList}\n- Blocked/unexecuted methods: ${blockedMethodsList}\n- The Methodology section MUST describe ONLY the analyses that were actually executed.\n- Methods listed as blocked/unexecuted MUST appear ONLY in a "Limitations and Future Work" subsection, clearly marked as "not yet implemented" or "planned for future work".\n- The paper title MUST NOT reference unexecuted methods as if they are the paper's contribution.\n- Do NOT describe any blocked or unexecuted method as something "we apply" or "we implement" — only as "future work".`;
   } else {
     antiHallucinationRules = `\n\nCRITICAL ANTI-HALLUCINATION RULES (NO DATASET MODE):\n1. No empirical results were computed from the data. The Results and Discussion section MUST be framed as a methodological discussion, NOT as a results presentation.\n2. Do NOT fabricate any numerical results, p-values, correlations, means, standard deviations, or effect sizes.\n3. Instead, describe the analytical FRAMEWORK: what analyses would be performed, what metrics would be computed, and what patterns would be examined.\n4. Use conditional language throughout: "would", "is expected to", "the analysis aims to".\n5. Do NOT include any tables with empty cells, placeholder dashes ("—"), or "N/A" values. Instead, describe what the tables WOULD contain in prose form.\n6. Do NOT include a "DATA ANALYSIS STATUS" line or "Research Classification" section — these are internal metadata.\n7. Do NOT include an "Execution Limitations" section — limitations should be discussed within the Discussion section naturally.\n\nPAPER FRAMING (CRITICAL):\n- This paper should be framed as a METHODOLOGICAL FRAMEWORK or RESEARCH PROTOCOL paper, not an empirical study.\n- The "Results and Discussion" section should discuss the EXPECTED OUTCOMES of the proposed framework, the interpretive logic, and methodological merits.\n- Blocked/unexecuted methods: ${blockedMethodsList}\n- Do NOT use past tense ("we found", "we demonstrated") for unexecuted analyses. Use future/conditional tense only.\n- The paper should be self-contained and valuable as a methodological contribution even without empirical data.`;
   }
@@ -1823,6 +1869,7 @@ export async function executePipeline(
         originalName: f.originalName,
         fileUrl: f.fileUrl,
         fileKey: f.fileKey,
+        sizeBytes: f.sizeBytes ?? undefined,
         fileType: f.fileType,
         columnNames: f.columnNames as string[] | undefined,
         rowCount: f.rowCount ?? undefined,

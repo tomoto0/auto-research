@@ -1393,6 +1393,35 @@ describe("Chunked upload client utility", () => {
   });
 });
 
+describe("Multipart dataset key helpers", () => {
+  it("builds and parses multipart file keys consistently", async () => {
+    const {
+      buildDatasetMultipartPartKey,
+      buildDatasetMultipartPrefix,
+      parseDatasetMultipartUploadId,
+    } = await import("./storage");
+    const uploadId = "rc-test-1234";
+
+    expect(buildDatasetMultipartPrefix(uploadId)).toBe("datasets/rc-test-1234/parts");
+    expect(buildDatasetMultipartPartKey(uploadId, 0)).toBe("datasets/rc-test-1234/parts/0000");
+    expect(buildDatasetMultipartPartKey(uploadId, 12)).toBe("datasets/rc-test-1234/parts/0012");
+
+    expect(parseDatasetMultipartUploadId("datasets/rc-test-1234/parts")).toBe(uploadId);
+    expect(parseDatasetMultipartUploadId("datasets/rc-test-1234/parts/0007")).toBe(uploadId);
+    expect(parseDatasetMultipartUploadId("datasets/rc-test-1234/data.csv")).toBeNull();
+  });
+
+  it("estimates chunk count from file size using 8MB chunking", async () => {
+    const { estimateDatasetMultipartChunks } = await import("./storage");
+    const chunk8mb = 8 * 1024 * 1024;
+
+    expect(estimateDatasetMultipartChunks(0)).toBe(0);
+    expect(estimateDatasetMultipartChunks(chunk8mb)).toBe(1);
+    expect(estimateDatasetMultipartChunks(chunk8mb + 1)).toBe(2);
+    expect(estimateDatasetMultipartChunks(213 * 1024 * 1024)).toBe(27);
+  });
+});
+
 describe("Experiment runner: memory optimization and hallucination prevention", () => {
   it("isIdOrCodeColumn correctly identifies ID columns", async () => {
     const { isIdOrCodeColumn } = await import("./experiment-runner");
@@ -1421,5 +1450,55 @@ describe("Experiment runner: memory optimization and hallucination prevention", 
     expect(result.categoricalCols).toContain("gender");
     // id should be detected as ID column
     expect(result.idCols).toContain("id");
+  });
+});
+
+describe("Methodology applicability assessment (experiment runner)", () => {
+  it("returns executable descriptive/correlation/regression for rich numeric data", async () => {
+    const { buildMethodApplicabilityAssessment } = await import("./experiment-runner");
+    const data = Array.from({ length: 120 }, (_, i) => ({
+      year: 2000 + (i % 20),
+      group: i % 3 === 0 ? "A" : i % 3 === 1 ? "B" : "C",
+      outcome: 50 + i * 0.5 + Math.random(),
+      predictor: 10 + i * 0.2 + Math.random(),
+      noise: Math.random() * 5,
+    }));
+    const assessment = buildMethodApplicabilityAssessment(
+      { name: "test.csv", data, columns: ["year", "group", "outcome", "predictor", "noise"], totalRows: data.length },
+      ["outcome", "predictor", "noise"],
+      ["group"]
+    );
+    const byId = new Map(assessment.map(a => [a.methodId, a]));
+    expect(byId.get("descriptive_statistics")?.status).toBe("executable_now");
+    expect(byId.get("correlation")?.status).toBe("executable_now");
+    expect(byId.get("linear_regression")?.status).toBe("executable_now");
+    expect(byId.get("data_visualisation")?.status).toBe("executable_now");
+  });
+
+  it("blocks advanced methods when modalities are missing", async () => {
+    const { buildMethodApplicabilityAssessment } = await import("./experiment-runner");
+    const data = Array.from({ length: 40 }, (_, i) => ({
+      score: i + Math.random(),
+      value: i * 2 + Math.random(),
+      category: i % 2 === 0 ? "X" : "Y",
+    }));
+    const assessment = buildMethodApplicabilityAssessment(
+      { name: "simple.csv", data, columns: ["score", "value", "category"], totalRows: data.length },
+      ["score", "value"],
+      ["category"]
+    );
+    const byId = new Map(assessment.map(a => [a.methodId, a]));
+    expect(byId.get("advanced_time_series")?.status).toBe("blocked");
+    expect(byId.get("graph_modelling")?.status).toBe("blocked");
+    expect(byId.get("vision_analysis")?.status).toBe("blocked");
+    expect(byId.get("advanced_nlp")?.status).toBe("blocked");
+    expect(byId.get("causal_inference")?.status).toBe("blocked");
+  });
+});
+
+describe("Research evidence profile enhancements", () => {
+  it("pipeline-engine module loads with expanded dataset capability profile", async () => {
+    const mod = await import("./pipeline-engine");
+    expect(typeof mod.executePipeline).toBe("function");
   });
 });

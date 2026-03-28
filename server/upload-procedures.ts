@@ -4,7 +4,16 @@ import * as path from "path";
 import * as os from "os";
 import { TRPCError } from "@trpc/server";
 import { publicProcedure, longRunningProcedure } from "./_core/trpc";
-import { storagePut, storageDownload } from "./storage";
+import {
+  storagePut,
+  storageGet,
+  storageDownload,
+  storageDownloadDatasetMultipartToFile,
+  buildDatasetMultipartPartKey,
+  buildDatasetMultipartPrefix,
+  parseDatasetMultipartUploadId,
+  estimateDatasetMultipartChunks,
+} from "./storage";
 import { insertDatasetFile } from "./db";
 
 // ─── Helper: parse file preview from downloaded buffer ───
@@ -26,18 +35,16 @@ async function parsePreview(
   fileType: FileType,
   fileName: string,
   sizeBytes: number,
+  options?: { multipartUploadId?: string; multipartTotalChunks?: number },
 ): Promise<{ columnNames: string[] | null; rowCount: number | null; preview: string | null }> {
   let columnNames: string[] | null = null;
   let rowCount: number | null = null;
   let preview: string | null = null;
+  const multipartUploadId = options?.multipartUploadId;
+  const multipartTotalChunks = options?.multipartTotalChunks;
+  const isMultipart = Boolean(multipartUploadId && multipartTotalChunks && multipartTotalChunks > 1);
 
-  if (fileType === "csv" || fileType === "tsv") {
-    const resp = await storageDownload(fileKey, {
-      timeoutMs: 30000,
-      rangeHeader: "bytes=0-65535",
-    });
-    const previewBuf = Buffer.from(await resp.arrayBuffer());
-    let text: string;
+  const decodePreviewText = async (previewBuf: Buffer): Promise<string> => {
     try {
       const iconv = await import("iconv-lite");
       const chardet = await import("chardet");
@@ -48,13 +55,126 @@ async function parsePreview(
       };
       const normalised = (detected || "").toLowerCase().replace(/[^a-z0-9]/g, "");
       const iconvEncoding = encodingMap[normalised] || detected || "utf-8";
-      text = iconv.default.decode(previewBuf, iconvEncoding);
+      let text = iconv.default.decode(previewBuf, iconvEncoding);
       if (text.includes("\uFFFD") && iconvEncoding === "utf-8") {
         text = iconv.default.decode(previewBuf, "Shift_JIS");
       }
+      return text;
     } catch {
-      text = previewBuf.toString("utf-8");
+      return previewBuf.toString("utf-8");
     }
+  };
+
+  const readFileHead = (filePath: string, maxBytes = 65536): Buffer => {
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const previewBuf = Buffer.alloc(maxBytes);
+      const bytesRead = fs.readSync(fd, previewBuf, 0, maxBytes, 0);
+      return previewBuf.subarray(0, bytesRead);
+    } finally {
+      fs.closeSync(fd);
+    }
+  };
+
+  if (isMultipart) {
+    const tmpPath = path.join(os.tmpdir(), `preview-multipart-${Date.now()}-${fileName}`);
+    try {
+      await storageDownloadDatasetMultipartToFile({
+        uploadId: multipartUploadId!,
+        totalChunks: multipartTotalChunks!,
+        destinationPath: tmpPath,
+        timeoutMsPerPart: 120000,
+      });
+    } catch (dlErr: any) {
+      console.warn("[Upload] Failed to download multipart file for preview:", dlErr.message);
+      try { fs.unlinkSync(tmpPath); } catch {}
+      return { columnNames, rowCount, preview };
+    }
+
+    try {
+      if (fileType === "csv" || fileType === "tsv") {
+        const previewBuf = readFileHead(tmpPath, 65536);
+        let text = await decodePreviewText(previewBuf);
+        if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+        const sep = fileType === "tsv" ? "\t" : ",";
+        const lines = text.split("\n").filter(l => l.trim());
+        if (lines.length > 0) {
+          columnNames = lines[0].split(sep).map(c => c.trim().replace(/^"|"$/g, ""));
+          const avgLineLen = previewBuf.length / Math.max(lines.length, 1);
+          rowCount = Math.max(0, Math.round(sizeBytes / avgLineLen) - 1);
+          preview = lines.slice(0, 6).join("\n");
+        }
+      } else if (fileType === "json") {
+        const head = readFileHead(tmpPath, 65536).toString("utf-8");
+        try {
+          const parsed = JSON.parse(head);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            columnNames = Object.keys(parsed[0]);
+            rowCount = parsed.length;
+            preview = JSON.stringify(parsed.slice(0, 3), null, 2);
+          }
+        } catch {
+          const match = head.match(/\[\s*\{/);
+          if (match) {
+            const objMatches = head.match(/\{[^{}]+\}/g);
+            if (objMatches && objMatches.length > 0) {
+              try {
+                const firstObj = JSON.parse(objMatches[0]);
+                columnNames = Object.keys(firstObj);
+                preview = objMatches.slice(0, 3).join(",\n");
+              } catch {}
+            }
+          }
+        }
+      } else if (fileType === "dta" || fileType === "excel") {
+        const fileBuffer = fs.readFileSync(tmpPath);
+        if (fileType === "excel") {
+          try {
+            const XLSX = await import("xlsx");
+            const workbook = XLSX.read(fileBuffer, { type: "buffer" });
+            const sheetName = workbook.SheetNames[0];
+            if (sheetName) {
+              const sheet = workbook.Sheets[sheetName];
+              const jsonData = XLSX.utils.sheet_to_json(sheet, { header: 1 }) as any[][];
+              if (jsonData.length > 0) {
+                columnNames = jsonData[0].map((c: any) => String(c ?? "").trim());
+                rowCount = jsonData.length - 1;
+                preview = jsonData.slice(0, 6).map(r => r.join(",")).join("\n");
+              }
+            }
+          } catch (xlsxErr: any) {
+            console.warn("[Upload] Excel parse for preview failed:", xlsxErr.message);
+          }
+        } else {
+          try {
+            const { parseDtaFile } = await import("./dta-parser");
+            const dtaResult = parseDtaFile(fileBuffer, { previewRows: 10 });
+            if (dtaResult && dtaResult.columns) {
+              columnNames = dtaResult.columns;
+              rowCount = dtaResult.totalRows || dtaResult.data?.length || null;
+              if (dtaResult.data && dtaResult.data.length > 0) {
+                const previewRows = dtaResult.data.slice(0, 5);
+                preview = columnNames.join(",") + "\n" + previewRows.map((r: any) => columnNames!.map(c => r[c] ?? "").join(",")).join("\n");
+              }
+            }
+          } catch (dtaErr: any) {
+            console.warn("[Upload] DTA parse for preview failed:", dtaErr.message);
+          }
+        }
+      }
+    } finally {
+      try { fs.unlinkSync(tmpPath); } catch {}
+    }
+    return { columnNames, rowCount, preview };
+  }
+
+  if (fileType === "csv" || fileType === "tsv") {
+    const resp = await storageDownload(fileKey, {
+      timeoutMs: 30000,
+      rangeHeader: "bytes=0-65535",
+    });
+    const previewBuf = Buffer.from(await resp.arrayBuffer());
+    let text = await decodePreviewText(previewBuf);
     if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
     const sep = fileType === "tsv" ? "\t" : ",";
     const lines = text.split("\n").filter(l => l.trim());
@@ -186,63 +306,34 @@ export const assembleChunksProcedure = longRunningProcedure
   }))
   .mutation(async ({ input }) => {
     const { uploadId, fileName, fileMime, totalChunks, totalSize } = input;
-    const tmpDir = path.join(os.tmpdir(), `assemble-${Date.now()}`);
     try {
-      console.log(`[Upload] Assembling ${totalChunks} chunks for ${fileName} (${(totalSize / 1024 / 1024).toFixed(1)}MB)`);
-
-      fs.mkdirSync(tmpDir, { recursive: true });
-      const assembledPath = path.join(tmpDir, "assembled");
-      const writeStream = fs.createWriteStream(assembledPath);
-      const { Readable } = await import("stream");
+      console.log(`[Upload] Validating multipart upload ${uploadId} for ${fileName} (${(totalSize / 1024 / 1024).toFixed(1)}MB)`);
 
       for (let i = 0; i < totalChunks; i++) {
-        const partKey = `datasets/${uploadId}/parts/${String(i).padStart(4, "0")}`;
+        const partKey = buildDatasetMultipartPartKey(uploadId, i);
         try {
-          const resp = await storageDownload(partKey, { timeoutMs: 120000 });
-          if (!resp.body) {
-            writeStream.end();
-            throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: `Empty response body for part ${i}` });
-          }
-          const readable = Readable.fromWeb(resp.body as any);
-          await new Promise<void>((resolve, reject) => {
-            readable.on("data", (chunk: Buffer) => {
-              const canContinue = writeStream.write(chunk);
-              if (!canContinue) {
-                readable.pause();
-                writeStream.once("drain", () => readable.resume());
-              }
-            });
-            readable.on("end", resolve);
-            readable.on("error", reject);
-          });
+          await storageDownload(partKey, { timeoutMs: 120000, rangeHeader: "bytes=0-0" });
         } catch (partErr: any) {
-          writeStream.end();
-          if (partErr instanceof TRPCError) throw partErr;
           console.error(`[Upload] Failed to download part ${i}:`, partErr.message);
           throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: `Failed to download part ${i}: ${partErr.message}` });
         }
-        console.log(`[Upload] Streamed part ${i + 1}/${totalChunks} to disk`);
+        console.log(`[Upload] Verified part ${i + 1}/${totalChunks}`);
       }
 
-      await new Promise<void>((resolve) => writeStream.end(resolve));
-
-      const assembledSize = fs.statSync(assembledPath).size;
-      console.log(`[Upload] Assembled ${assembledSize} bytes on disk for ${fileName}`);
-
-      const finalKey = `datasets/${uploadId}/${fileName}`;
-      const assembledBuffer = fs.readFileSync(assembledPath);
-      const { url: finalUrl } = await storagePut(finalKey, assembledBuffer, fileMime);
-
-      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      const firstPartKey = buildDatasetMultipartPartKey(uploadId, 0);
+      const { url: firstPartUrl } = await storageGet(firstPartKey);
+      const multipartPrefix = buildDatasetMultipartPrefix(uploadId);
 
       return {
         success: true as const,
-        fileUrl: finalUrl,
-        fileKey: finalKey,
-        sizeBytes: assembledSize,
+        multipart: true as const,
+        fileUrl: firstPartUrl,
+        fileKey: multipartPrefix,
+        sizeBytes: totalSize,
+        totalChunks,
+        fileMime,
       };
     } catch (err: any) {
-      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
       if (err instanceof TRPCError) throw err;
       console.error("[Upload] Assemble error:", err);
       throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: err?.message || "Assembly failed" });
@@ -256,19 +347,31 @@ export const registerFileProcedure = longRunningProcedure
     fileKey: z.string().min(1),
     fileUrl: z.string().min(1),
     sizeBytes: z.number().int().min(0).default(0),
+    multipartTotalChunks: z.number().int().min(1).optional(),
   }))
   .mutation(async ({ input, ctx }) => {
-    const { fileName, fileMime, fileKey, fileUrl, sizeBytes } = input;
+    const { fileName, fileMime, fileKey, fileUrl, sizeBytes, multipartTotalChunks } = input;
     const fileType = detectFileType(fileName);
+    const multipartUploadId = parseDatasetMultipartUploadId(fileKey);
+    const inferredChunkCount = estimateDatasetMultipartChunks(sizeBytes);
+    const resolvedMultipartChunks = multipartUploadId
+      ? (multipartTotalChunks ?? inferredChunkCount)
+      : undefined;
 
     console.log(`[Upload] Registering S3 file: ${fileName} (${fileType}, ${(sizeBytes / 1024 / 1024).toFixed(1)}MB)`);
+    if (multipartUploadId) {
+      console.log(`[Upload] Multipart dataset detected: uploadId=${multipartUploadId}, chunks=${resolvedMultipartChunks}`);
+    }
 
     let columnNames: string[] | null = null;
     let rowCount: number | null = null;
     let preview: string | null = null;
 
     try {
-      const parsed = await parsePreview(fileKey, fileType, fileName, sizeBytes);
+      const parsed = await parsePreview(fileKey, fileType, fileName, sizeBytes, {
+        multipartUploadId: multipartUploadId ?? undefined,
+        multipartTotalChunks: resolvedMultipartChunks,
+      });
       columnNames = parsed.columnNames;
       rowCount = parsed.rowCount;
       preview = parsed.preview;

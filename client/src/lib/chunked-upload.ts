@@ -17,6 +17,7 @@ import { trpcVanilla } from "./trpc-client";
 const CHUNK_SIZE = 8 * 1024 * 1024; // 8MB per chunk
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 2000;
+const MULTIPART_KEY_SUFFIX = "/parts";
 
 export interface ChunkedUploadProgress {
   phase: "initiating" | "uploading" | "completing";
@@ -40,6 +41,35 @@ export interface ChunkedUploadResult {
     preview: string | null;
   };
   error?: string;
+}
+
+function extractMessageFromUnknown(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (value instanceof Error) return value.message;
+  if (Array.isArray(value)) {
+    const joined = value.map(v => extractMessageFromUnknown(v)).filter(Boolean).join(" ");
+    return joined || null;
+  }
+  if (typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    return (
+      extractMessageFromUnknown(obj.message) ||
+      extractMessageFromUnknown(obj.data) ||
+      extractMessageFromUnknown(obj.error) ||
+      null
+    );
+  }
+  return null;
+}
+
+function normaliseUploadError(err: unknown, fallback: string): string {
+  const message = extractMessageFromUnknown(err) || fallback;
+  if (message.includes("Unexpected token 'S'") || message.includes('"Service Unavailable" is not valid JSON')) {
+    return "Storage service is temporarily unavailable. Please retry this upload.";
+  }
+  return message;
 }
 
 function generateId(len = 12): string {
@@ -73,17 +103,17 @@ async function mutateWithRetry<T>(
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       return await fn();
-    } catch (err: any) {
+    } catch (err: unknown) {
       // Don't retry on client-side errors (BAD_REQUEST, PAYLOAD_TOO_LARGE, etc.)
-      const code = err?.data?.code;
+      const code = (err as any)?.data?.code;
       if (code === "BAD_REQUEST" || code === "PAYLOAD_TOO_LARGE" || code === "UNPROCESSABLE_CONTENT") {
-        throw err;
+        throw new Error(normaliseUploadError(err, "Upload request failed"));
       }
       if (attempt < retries) {
         await new Promise(r => setTimeout(r, RETRY_DELAY * (attempt + 1)));
         continue;
       }
-      throw err;
+      throw new Error(normaliseUploadError(err, "Upload request failed"));
     }
   }
   throw new Error("Max retries exceeded");
@@ -147,10 +177,10 @@ export async function chunkedUpload(
         trpcVanilla.datasets.uploadChunk.mutate({ fileKey, fileMime, chunkBase64 })
       );
       lastChunkUrl = chunkResult.url;
-    } catch (err: any) {
+    } catch (err: unknown) {
       return {
         success: false,
-        error: err?.message || `Chunk ${i + 1}/${totalChunks} failed`,
+        error: normaliseUploadError(err, `Chunk ${i + 1}/${totalChunks} failed`),
       };
     }
 
@@ -189,8 +219,8 @@ export async function chunkedUpload(
       );
       finalFileUrl = assembleResult.fileUrl;
       finalFileKey = assembleResult.fileKey;
-    } catch (err: any) {
-      return { success: false, error: err?.message || "Assembly failed" };
+    } catch (err: unknown) {
+      return { success: false, error: normaliseUploadError(err, "Assembly failed") };
     }
   }
 
@@ -203,6 +233,7 @@ export async function chunkedUpload(
         fileKey: finalFileKey,
         fileUrl: finalFileUrl,
         sizeBytes: totalBytes,
+        ...(finalFileKey.endsWith(MULTIPART_KEY_SUFFIX) ? { multipartTotalChunks: totalChunks } : {}),
       })
     );
 
@@ -216,7 +247,7 @@ export async function chunkedUpload(
     });
 
     return { success: true, file: result.file };
-  } catch (err: any) {
-    return { success: false, error: err?.message || "Registration failed" };
+  } catch (err: unknown) {
+    return { success: false, error: normaliseUploadError(err, "Registration failed") };
   }
 }
