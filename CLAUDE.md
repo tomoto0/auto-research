@@ -38,6 +38,7 @@ Full-stack TypeScript app: React 19 + Vite frontend, Express + tRPC 11 backend, 
 - Stage definitions and `RunConfig` types in `shared/pipeline.ts`
 - DB persistence via `server/db.ts` using Drizzle tables in `drizzle/schema.ts`
 - Real-time updates via SSE at `/api/pipeline/events/:runId` with in-memory event buffering in `server/routers.ts`
+  - **Note:** Dev環境でパイプライン起動直後にブラウザコンソールに `EventSource's response has a MIME type ("text/html")` エラーが出るのは既知の無害な挙動（Vite SPA fallbackがSSEリクエストをキャッチするため）。分析は正常に進行する
 - Manual approval mode (`autoApprove=false`) pauses after each stage; approval/rejection handled via router mutations and in-memory waiters (`waitForApproval`, `updateContextFromEdit` in pipeline-engine)
 - Run IDs follow format: `rc-${Date.now()}-${nanoid(8)}`
 

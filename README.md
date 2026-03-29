@@ -29,7 +29,7 @@ Auto Research is a full-stack web application that transforms a research topic i
 
 ## Overview
 
-Auto Research addresses a fundamental challenge in academic research: the time-intensive process of moving from an initial idea to a polished paper. By orchestrating LLM-driven analysis, real-time literature search, server-side Python experiment execution, and structured paper generation, the platform automates the entire research workflow while maintaining academic rigor.
+Auto Research addresses a fundamental challenge in academic research: the time-intensive process of moving from an initial idea to a polished paper. By orchestrating LLM-driven analysis, real-time literature search, a deterministic server-side analysis engine, and structured paper generation, the platform automates the entire research workflow while maintaining academic rigor.
 
 The application supports two operational modes. In **fully autonomous mode**, all 23 stages execute sequentially without human intervention. In **manual approval mode**, users can review, edit, and approve the output of each stage before the pipeline advances, enabling fine-grained control over the research process.
 
@@ -42,8 +42,9 @@ The application supports two operational modes. In **fully autonomous mode**, al
 | **23-Stage Research Pipeline** | End-to-end automation from topic analysis to final paper compilation, organized into 6 phases |
 | **Multi-Source Literature Search** | Simultaneous search across arXiv, Semantic Scholar, Springer, PubMed, and CrossRef with automatic deduplication |
 | **Data File Upload** | Drag-and-drop upload of CSV, Excel (.xlsx), Stata (.dta), JSON, and TSV files for custom data analysis |
-| **Server-Side Experiment Execution** | LLM-generated Python analysis code executed in a sandboxed environment with pandas, matplotlib, scipy, and statsmodels |
-| **Automated Chart & Table Generation** | Statistical analysis results, figures, and tables automatically generated and embedded in the paper |
+| **Deterministic Analysis Execution** | Server-side TypeScript analysis engine that runs schema-aware descriptive statistics, regression, panel, causal, and visualisation workflows on real uploaded data |
+| **Econometrics & Causal Inference** | Built-in readiness gating plus robust OLS, panel fixed effects, difference-in-differences, event study, and synthetic control support with paper-ready outputs |
+| **Automated Chart & Table Generation** | Statistical analysis results, econometric figures, and publication tables automatically generated and embedded in the paper |
 | **Conference Template Support** | Paper formatting for NeurIPS, ICML, ICLR, ACL, AAAI, CVPR, EMNLP, and general academic formats |
 | **Real-Time Progress Tracking** | Server-Sent Events (SSE) for live pipeline status updates in the browser |
 | **Manual Approval Mode** | Stage-by-stage review with approve, edit, and reject controls |
@@ -55,7 +56,7 @@ The application supports two operational modes. In **fully autonomous mode**, al
 
 ## Architecture
 
-The application follows a modern full-stack architecture with a React frontend communicating with an Express/tRPC backend through type-safe RPC calls. The pipeline engine operates as a server-side state machine that orchestrates LLM calls, external API requests, and Python code execution.
+The application follows a modern full-stack architecture with a React frontend communicating with an Express/tRPC backend through type-safe RPC calls. The pipeline engine operates as a server-side state machine that orchestrates LLM calls, external API requests, and deterministic server-side analysis execution.
 
 ![Architecture Diagram](https://d2xsxph8kpxj0f.cloudfront.net/310419663027084947/gtQthQFbp8juSZFb2bGpao/architecture_ec3e1be1.png)
 
@@ -67,7 +68,7 @@ The architecture consists of five primary layers:
 
 **Pipeline Engine** — A 23-stage state machine that manages the research workflow. Each stage receives context from previous stages, invokes the LLM for content generation, and persists results to the database. The engine supports auto-approve and manual-approval modes, error recovery with configurable retries, and graceful shutdown.
 
-**Execution Layer** — Server-side Python execution for data analysis. The LLM generates analysis code based on uploaded dataset schemas and the research topic. Code runs in a sandboxed child process with a 5-minute timeout, and generated charts are automatically uploaded to S3.
+**Execution Layer** — A deterministic Node/TypeScript analysis engine for data analysis and chart generation. The LLM proposes analysis plans, but the server executes validated statistics, econometric estimators, and Chart.js rendering directly over uploaded datasets, then uploads the resulting artifacts to S3.
 
 **Storage Layer** — TiDB (MySQL-compatible) for relational data managed through Drizzle ORM, and S3 object storage for binary artifacts including uploaded datasets, generated charts, and compiled PDFs.
 
@@ -103,7 +104,7 @@ Each stage produces structured output that feeds into subsequent stages, creatin
 | **Object Storage** | AWS S3 |
 | **Authentication** | Manus OAuth |
 | **LLM Integration** | Manus Forge API |
-| **Experiment Execution** | Python 3.11 (pandas, numpy, matplotlib, scipy, statsmodels, seaborn) |
+| **Experiment Execution** | Node.js/TypeScript deterministic analysis engine, Chart.js, csv-parse, XLSX |
 | **PDF Generation** | Puppeteer (headless Chromium) |
 | **Real-Time Updates** | Server-Sent Events (SSE) |
 | **Build Tool** | Vite 6, esbuild |
@@ -120,11 +121,13 @@ Auto Research supports uploading structured data files for automated analysis wi
 
 2. **Schema Extraction** — During the experiment code generation stage (Stage 9), the pipeline retrieves all attached dataset files and constructs a detailed schema description including column names, data types, sample values, and basic statistics.
 
-3. **Code Generation** — The LLM receives the dataset schema along with the research topic, hypothesis, and methodology to generate Python analysis code. The generated code uses pandas for data manipulation, matplotlib/seaborn for visualization, and scipy/statsmodels for statistical testing.
+3. **Analysis Planning** — The LLM receives the dataset schema along with the research topic, hypothesis, and methodology to propose executable analyses. The pipeline then constrains that plan to methods supported by the deterministic runner.
 
-4. **Sandboxed Execution** — Generated Python code executes in a server-side sandboxed child process with a 5-minute timeout. The executor captures stdout, stderr, generated image files (PNG), and JSON metrics output.
+4. **Deterministic Execution** — The server runs validated analysis routines directly in TypeScript, including descriptive statistics, correlation, regression, robust OLS, panel fixed effects, difference-in-differences, event study, synthetic control, and specialised chart generation.
 
-5. **Result Integration** — Generated charts are uploaded to S3 as pipeline artifacts. Statistical metrics and table data are passed to the paper writing stages (Stage 18) where they are incorporated into the paper body with proper figure numbering and table formatting.
+5. **Result Integration** — Generated charts are uploaded to S3 as pipeline artifacts. Statistical metrics, econometric diagnostics, and table data are passed to the paper writing stages (Stage 18) where they are incorporated into the paper body with proper figure numbering, equations, and table formatting.
+
+The current specialised figure catalogue includes coefficient interval plots, residual-vs-fitted plots, parallel-trends plots, event-study trajectories, synthetic-control path plots, synthetic-control gap plots, and donor-weight charts in addition to the standard descriptive visualisations.
 
 ---
 
@@ -163,7 +166,7 @@ The literature search module queries five academic databases in parallel and ded
 
 ### Prerequisites
 
-The application requires Node.js 22+, pnpm, and Python 3.11+ with scientific computing packages (pandas, numpy, matplotlib, scipy, statsmodels, seaborn, openpyxl).
+The application requires Node.js 22+ and pnpm. Python is no longer required for the default deterministic dataset-analysis path.
 
 ### Installation
 
@@ -188,7 +191,7 @@ pnpm dev
 pnpm test
 ```
 
-The test suite includes 19 tests covering authentication, pipeline operations, literature search integration, PDF generation, dataset upload, and experiment execution.
+The test suite covers authentication, pipeline operations, literature search integration, PDF generation, dataset upload, and deterministic experiment execution.
 
 ---
 
@@ -211,7 +214,7 @@ auto-research-claw/
 │   ├── routers.ts             # tRPC procedures
 │   ├── db.ts                  # Database query helpers
 │   ├── pipeline-engine.ts     # 23-stage pipeline state machine
-│   ├── experiment-runner.ts   # Python sandbox executor
+│   ├── experiment-runner.ts   # Deterministic statistics/econometrics runner
 │   ├── literature-search.ts   # Multi-source academic search
 │   ├── pdf-generator.ts       # Markdown-to-PDF converter
 │   └── *.test.ts              # Vitest test files

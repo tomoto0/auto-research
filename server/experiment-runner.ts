@@ -20,7 +20,7 @@ import {
   storageDownloadDatasetMultipartToFile,
 } from "./storage";
 import { insertExperimentResult, updateExperimentResult } from "./db";
-import { parse as csvParse } from "csv-parse/sync";
+import { parse as csvParseStream } from "csv-parse";
 import * as XLSX from "xlsx";
 import { parseDtaFile } from "./dta-parser";
 import * as iconv from "iconv-lite";
@@ -29,6 +29,8 @@ import { invokeLLM } from "./_core/llm";
 
 const EXECUTION_TIMEOUT_MS = 90_000; // 90 seconds max
 const MAX_OUTPUT_LENGTH = 50_000;
+const MAX_PARSED_ROWS = 2000;
+const CSV_ENCODING_SAMPLE_BYTES = 128 * 1024;
 
 export interface DatasetInfo {
   originalName: string;
@@ -77,6 +79,9 @@ function normaliseMethodId(raw: string): string {
     correlation_analysis: "correlation",
     regression: "linear_regression",
     ols: "linear_regression",
+    robust_regression: "robust_ols",
+    robust_ols: "robust_ols",
+    heteroskedasticity_robust_ols: "robust_ols",
     anova: "group_comparison",
     t_test: "group_comparison",
     time_series_trend: "time_trend",
@@ -85,6 +90,24 @@ function normaliseMethodId(raw: string): string {
     data_visualization: "data_visualisation",
     visualization: "data_visualisation",
     visualisation: "data_visualisation",
+    fixed_effects: "panel_fixed_effects",
+    twfe: "panel_fixed_effects",
+    panel_fixed_effects: "panel_fixed_effects",
+    difference_in_differences: "diff_in_diff",
+    diff_in_diff: "diff_in_diff",
+    did: "diff_in_diff",
+    event_study: "event_study",
+    synthetic_control: "synthetic_control",
+    synthetic_controls: "synthetic_control",
+    iv: "iv_2sls",
+    instrumental_variable: "iv_2sls",
+    two_stage_least_squares: "iv_2sls",
+    iv_2sls: "iv_2sls",
+    regression_discontinuity: "regression_discontinuity",
+    rdd: "regression_discontinuity",
+    propensity_score: "propensity_score",
+    propensity_score_matching: "propensity_score",
+    quantile_regression: "quantile_regression",
     gnn: "graph_modelling",
     computer_vision: "vision_analysis",
     panel_model: "panel_econometrics",
@@ -249,10 +272,124 @@ async function downloadFile(url: string, destPath: string, fileKey?: string, siz
   }
 }
 
+function hasGarbledColumns(columns: string[]): boolean {
+  return columns.some(col => col.includes("\uFFFD") || /^[\x00-\x1f]+$/.test(col));
+}
+
+function detectDelimitedFileEncoding(filePath: string): string {
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const sample = Buffer.alloc(CSV_ENCODING_SAMPLE_BYTES);
+    const bytesRead = fs.readSync(fd, sample, 0, sample.length, 0);
+    const { encoding } = decodeFileBuffer(sample.subarray(0, bytesRead));
+    if (!encoding) return "utf-8";
+    return encoding === "utf-8-bom" ? "utf-8" : encoding;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+async function parseDelimitedSampleWithEncoding(
+  filePath: string,
+  delimiter: "," | "\t",
+  encoding: string,
+): Promise<{ records: Record<string, any>[]; columns: string[] }> {
+  return new Promise((resolve, reject) => {
+    const records: Record<string, any>[] = [];
+    const readStream = fs.createReadStream(filePath);
+    const decoder = iconv.decodeStream(encoding);
+    const parser = csvParseStream({
+      columns: true,
+      skip_empty_lines: true,
+      delimiter,
+      relax_column_count: true,
+      cast: true,
+      bom: true,
+      to: MAX_PARSED_ROWS,
+    });
+
+    const cleanup = () => {
+      readStream.off("error", onError);
+      decoder.off("error", onError);
+      parser.off("error", onError);
+      parser.off("data", onData);
+      parser.off("end", onEnd);
+    };
+
+    const onError = (err: unknown) => {
+      cleanup();
+      readStream.destroy();
+      reject(err instanceof Error ? err : new Error(String(err)));
+    };
+
+    const onData = (record: unknown) => {
+      records.push(record as Record<string, any>);
+    };
+
+    const onEnd = () => {
+      cleanup();
+      readStream.destroy();
+      const columns = records.length > 0 ? Object.keys(records[0]) : [];
+      resolve({ records, columns });
+    };
+
+    readStream.on("error", onError);
+    decoder.on("error", onError);
+    parser.on("error", onError);
+    parser.on("data", onData);
+    parser.on("end", onEnd);
+
+    readStream.pipe(decoder).pipe(parser);
+  });
+}
+
+async function parseDelimitedFile(
+  filePath: string,
+  fileType: "csv" | "tsv",
+  rowCountHint?: number,
+): Promise<{ data: Record<string, any>[]; columns: string[]; totalRows: number; encoding?: string }> {
+  const delimiter = fileType === "tsv" ? "\t" : ",";
+  const detectedEncoding = detectDelimitedFileEncoding(filePath);
+  const encodingsToTry = Array.from(new Set([
+    detectedEncoding,
+    ...(detectedEncoding.toLowerCase().startsWith("utf") ? ["Shift_JIS", "CP932", "EUC-JP"] : []),
+    "utf-8",
+    "Shift_JIS",
+    "CP932",
+    "EUC-JP",
+    "latin1",
+  ]));
+
+  let firstError: Error | null = null;
+
+  for (const enc of encodingsToTry) {
+    try {
+      const { records, columns } = await parseDelimitedSampleWithEncoding(filePath, delimiter, enc);
+      if (records.length === 0 && columns.length === 0) continue;
+      if (hasGarbledColumns(columns) && enc.toLowerCase().startsWith("utf")) continue;
+      const hintedTotal = rowCountHint && rowCountHint > 0 ? rowCountHint : 0;
+      const totalRows = Math.max(hintedTotal, records.length);
+      return {
+        data: records.slice(0, MAX_PARSED_ROWS),
+        columns,
+        totalRows,
+        encoding: enc === detectedEncoding ? enc : `${enc} (retry)`,
+      };
+    } catch (err: any) {
+      if (!firstError) {
+        firstError = err instanceof Error ? err : new Error(String(err));
+      }
+    }
+  }
+
+  if (firstError) throw firstError;
+  throw new Error(`Failed to parse ${fileType.toUpperCase()} file`);
+}
+
 /**
  * Parse a data file into a JSON-serializable array of objects.
  * Supports CSV, TSV, Excel (.xlsx/.xls), Stata (.dta), and JSON.
- * Returns at most 5000 rows to keep memory manageable.
+ * Returns at most 2,000 rows to keep memory manageable.
  * Automatically detects file encoding for CSV/TSV files.
  */
 function validateParsedData(
@@ -282,102 +419,30 @@ function validateParsedData(
   }
 }
 
-function parseDataFile(
+async function parseDataFile(
   filePath: string,
-  fileType: string
-): { data: Record<string, any>[]; columns: string[]; totalRows: number; encoding?: string } {
-  const MAX_ROWS = 2000;
+  fileType: string,
+  rowCountHint?: number,
+): Promise<{ data: Record<string, any>[]; columns: string[]; totalRows: number; encoding?: string }> {
+  const hintedRows = rowCountHint && rowCountHint > 0 ? rowCountHint : undefined;
 
   if (fileType === "csv" || fileType === "tsv") {
-    const rawBuffer = fs.readFileSync(filePath);
-    const { text: raw, encoding } = decodeFileBuffer(rawBuffer);
-    const delimiter = fileType === "tsv" ? "\t" : ",";
-
-    // Try parsing with auto-detected encoding
-    try {
-      const records: Record<string, any>[] = csvParse(raw, {
-        columns: true,
-        skip_empty_lines: true,
-        delimiter,
-        relax_column_count: true,
-        cast: true,
-        bom: true,
-      });
-      const columns = records.length > 0 ? Object.keys(records[0]) : [];
-
-      // Validate columns: check they're not garbled
-      const hasGarbledColumns = columns.some(col =>
-        col.includes("\uFFFD") || /^[\x00-\x1f]+$/.test(col)
-      );
-
-      if (hasGarbledColumns && encoding === "utf-8") {
-        // Retry with Shift-JIS
-        const sjisText = iconv.decode(rawBuffer, "Shift_JIS");
-        const retryRecords: Record<string, any>[] = csvParse(sjisText, {
-          columns: true,
-          skip_empty_lines: true,
-          delimiter,
-          relax_column_count: true,
-          cast: true,
-          bom: true,
-        });
-        const retryCols = retryRecords.length > 0 ? Object.keys(retryRecords[0]) : [];
-        if (retryCols.length > 0 && !retryCols.some(c => c.includes("\uFFFD"))) {
-          return {
-            data: retryRecords.slice(0, MAX_ROWS),
-            columns: retryCols,
-            totalRows: retryRecords.length,
-            encoding: "Shift_JIS (retry)",
-          };
-        }
-      }
-
-      return {
-        data: records.slice(0, MAX_ROWS),
-        columns,
-        totalRows: records.length,
-        encoding,
-      };
-    } catch (parseError: any) {
-      // If CSV parsing fails, try with different encodings
-      for (const fallbackEnc of ["Shift_JIS", "CP932", "EUC-JP", "latin1"]) {
-        try {
-          const fallbackText = iconv.decode(rawBuffer, fallbackEnc);
-          const records: Record<string, any>[] = csvParse(fallbackText, {
-            columns: true,
-            skip_empty_lines: true,
-            delimiter,
-            relax_column_count: true,
-            cast: true,
-            bom: true,
-          });
-          const columns = records.length > 0 ? Object.keys(records[0]) : [];
-          if (columns.length > 0) {
-            return {
-              data: records.slice(0, MAX_ROWS),
-              columns,
-              totalRows: records.length,
-              encoding: fallbackEnc,
-            };
-          }
-        } catch {
-          continue;
-        }
-      }
-      throw parseError;
-    }
+    return parseDelimitedFile(filePath, fileType, hintedRows);
   }
 
   if (fileType === "dta") {
     let rawBuf: Buffer | null = fs.readFileSync(filePath);
-    const result = parseDtaFile(rawBuf, { previewRows: MAX_ROWS });
+    const result = parseDtaFile(rawBuf, { previewRows: MAX_PARSED_ROWS });
     // Release the large buffer immediately so GC can reclaim it
     rawBuf = null;
     try { global.gc?.(); } catch {}
     return {
-      data: result.data.slice(0, MAX_ROWS),
+      data: result.data.slice(0, MAX_PARSED_ROWS),
       columns: result.columns,
-      totalRows: result.totalRows,
+      totalRows: Math.max(
+        result.totalRows > 0 ? result.totalRows : result.data.length,
+        hintedRows ?? 0
+      ),
     };
   }
 
@@ -388,9 +453,9 @@ function parseDataFile(
     const records: Record<string, any>[] = XLSX.utils.sheet_to_json(sheet);
     const columns = records.length > 0 ? Object.keys(records[0]) : [];
     return {
-      data: records.slice(0, MAX_ROWS),
+      data: records.slice(0, MAX_PARSED_ROWS),
       columns,
-      totalRows: records.length,
+      totalRows: Math.max(hintedRows ?? 0, records.length),
     };
   }
 
@@ -410,9 +475,9 @@ function parseDataFile(
     }
     const columns = parsed.length > 0 ? Object.keys(parsed[0]) : [];
     return {
-      data: parsed.slice(0, MAX_ROWS),
+      data: parsed.slice(0, MAX_PARSED_ROWS),
       columns,
-      totalRows: parsed.length,
+      totalRows: Math.max(hintedRows ?? 0, parsed.length),
     };
   }
 
@@ -420,11 +485,12 @@ function parseDataFile(
 }
 
 /** Wrapper that parses and validates a data file */
-function parseAndValidateDataFile(
+async function parseAndValidateDataFile(
   filePath: string,
-  fileType: string
-): { data: Record<string, any>[]; columns: string[]; totalRows: number; encoding?: string } {
-  const result = parseDataFile(filePath, fileType);
+  fileType: string,
+  rowCountHint?: number,
+): Promise<{ data: Record<string, any>[]; columns: string[]; totalRows: number; encoding?: string }> {
+  const result = await parseDataFile(filePath, fileType, rowCountHint);
   validateParsedData(result, fileType);
   return result;
 }
@@ -1478,7 +1544,7 @@ export async function executePythonExperiment(
       logs.push(`[INFO] Downloaded: ${ds.originalName}`);
 
       try {
-        const parsed = parseAndValidateDataFile(localPath, ds.fileType);
+        const parsed = await parseAndValidateDataFile(localPath, ds.fileType, ds.rowCount);
         // Remove the local file immediately after parsing to free disk space
         // and avoid keeping both on-disk and in-memory copies
         try { fs.unlinkSync(localPath); } catch {}
@@ -2006,6 +2072,1381 @@ function parseTimeValue(raw: any): number | null {
   return null;
 }
 
+function parseBinaryValue(raw: any): number | null {
+  if (raw === null || raw === undefined || raw === "") return null;
+  if (typeof raw === "boolean") return raw ? 1 : 0;
+  if (typeof raw === "number" && isFinite(raw) && (raw === 0 || raw === 1)) return raw;
+  const text = String(raw).trim().toLowerCase();
+  if (!text) return null;
+  if (["1", "true", "yes", "y", "treated", "treatment", "post", "after", "eligible"].includes(text)) return 1;
+  if (["0", "false", "no", "n", "control", "pre", "before", "ineligible"].includes(text)) return 0;
+  return null;
+}
+
+function sampleDistinctValues(ds: ParsedDataset, col: string, limit = 200): string[] {
+  const values: string[] = [];
+  const seen = new Set<string>();
+  for (const row of ds.data) {
+    const raw = row[col];
+    if (raw === null || raw === undefined || raw === "") continue;
+    const key = String(raw).trim();
+    if (!key) continue;
+    if (!seen.has(key)) {
+      seen.add(key);
+      values.push(key);
+      if (values.length >= limit) break;
+    }
+  }
+  return values;
+}
+
+function isBinaryLikeColumn(ds: ParsedDataset, col: string): boolean {
+  const values = sampleDistinctValues(ds, col, 12);
+  if (values.length === 0 || values.length > 2) return false;
+  return values.every(v => parseBinaryValue(v) !== null);
+}
+
+interface EconometricDesignHints {
+  timeCols: string[];
+  entityCols: string[];
+  treatmentCols: string[];
+  outcomeCols: string[];
+  instrumentCols: string[];
+  runningCols: string[];
+  primaryTimeCol?: string;
+  primaryEntityCol?: string;
+  primaryTreatmentCol?: string;
+  primaryOutcomeCol?: string;
+  primaryRegressorCol?: string;
+  primaryInstrumentCol?: string;
+  primaryRunningCol?: string;
+}
+
+interface RobustOlsResult {
+  xCol: string;
+  yCol: string;
+  intercept: number;
+  slope: number;
+  seIntercept: number;
+  seSlope: number;
+  tStat: number;
+  pValue: number;
+  r2: number;
+  adjR2: number;
+  n: number;
+  ciLower: number;
+  ciUpper: number;
+  fittedResiduals: Array<{ fitted: number; residual: number }>;
+}
+
+interface PanelFixedEffectsResult {
+  entityCol: string;
+  timeCol: string;
+  xCol: string;
+  yCol: string;
+  beta: number;
+  se: number;
+  tStat: number;
+  pValue: number;
+  n: number;
+  entities: number;
+  periods: number;
+  r2Within: number;
+  fittedResiduals: Array<{ fitted: number; residual: number }>;
+}
+
+interface DiffInDiffPoint {
+  label: string;
+  timeValue: number;
+  relIndex: number;
+  treatedMean: number;
+  controlMean: number;
+  effect: number;
+}
+
+interface DiffInDiffResult {
+  timeCol: string;
+  entityCol?: string;
+  treatmentCol: string;
+  outcomeCol: string;
+  treatmentStart: number;
+  estimate: number;
+  treatedPre: number;
+  treatedPost: number;
+  controlPre: number;
+  controlPost: number;
+  n: number;
+  preTrendDelta: number;
+  series: DiffInDiffPoint[];
+}
+
+interface SyntheticControlResult {
+  entityCol: string;
+  timeCol: string;
+  outcomeCol: string;
+  treatmentCol: string;
+  treatedUnit: string;
+  treatmentStart: number;
+  donorCount: number;
+  preRmse: number;
+  postRmse: number;
+  attPostMean: number;
+  weights: Array<{ unit: string; weight: number }>;
+  series: Array<{
+    label: string;
+    timeValue: number;
+    relIndex: number;
+    treated: number;
+    synthetic: number;
+    gap: number;
+  }>;
+}
+
+interface SyntheticControlPlaceboResult {
+  treatedUnit: string;
+  treatmentStart: number;
+  actualRatio: number;
+  ratios: Array<{
+    unit: string;
+    ratio: number;
+    preRmse: number;
+    postRmse: number;
+    isActual: boolean;
+  }>;
+  actualRank: number;
+}
+
+interface Iv2SlsResult {
+  zCol: string;
+  xCol: string;
+  yCol: string;
+  beta: number;
+  se: number;
+  tStat: number;
+  pValue: number;
+  ciLower: number;
+  ciUpper: number;
+  n: number;
+  firstStageSlope: number;
+  firstStageSe: number;
+  firstStageF: number;
+  firstStagePValue: number;
+  reducedFormSlope: number;
+  firstStagePoints: Array<{ x: number; y: number }>;
+}
+
+interface RddResult {
+  runningCol: string;
+  treatmentCol: string;
+  outcomeCol: string;
+  cutoff: number;
+  bandwidth: number;
+  estimate: number;
+  se: number;
+  tStat: number;
+  pValue: number;
+  nLocal: number;
+  leftN: number;
+  rightN: number;
+  leftSlope: number;
+  rightSlope: number;
+  bins: Array<{ x: number; y: number; side: "left" | "right"; count: number }>;
+  fitLine: Array<{ x: number; y: number; side: "left" | "right" }>;
+}
+
+interface PropensityBalanceEntry {
+  covariate: string;
+  smdBefore: number;
+  smdAfter: number;
+  meanTreated: number;
+  meanControl: number;
+  weightedTreated: number;
+  weightedControl: number;
+}
+
+interface PropensityScoreResult {
+  treatmentCol: string;
+  outcomeCol: string;
+  covariates: string[];
+  ate: number;
+  se: number;
+  tStat: number;
+  pValue: number;
+  ciLower: number;
+  ciUpper: number;
+  n: number;
+  meanScoreTreated: number;
+  meanScoreControl: number;
+  overlapMin: number;
+  overlapMax: number;
+  balance: PropensityBalanceEntry[];
+  scoreRows: Array<{ score: number; treatment: number }>;
+}
+
+interface QuantileRegressionEstimate {
+  tau: number;
+  intercept: number;
+  slope: number;
+  pseudoR1: number;
+}
+
+interface QuantileRegressionResult {
+  xCol: string;
+  yCol: string;
+  n: number;
+  estimates: QuantileRegressionEstimate[];
+}
+
+function detectTimeColumnsFromDataset(ds: ParsedDataset): string[] {
+  return ds.columns.filter(c => /(year|month|date|time|wave|period|quarter)/i.test(c));
+}
+
+function detectEntityColumns(ds: ParsedDataset, categoricalCols: string[], idCols: string[]): string[] {
+  const scored = new Map<string, number>();
+  for (const col of [...idCols, ...categoricalCols]) {
+    const distinct = sampleDistinctValues(ds, col, 300).length;
+    let score = 0;
+    if (/(id|code|entity|respondent|household|firm|user|patient|school|region|prefecture|country|state|city)/i.test(col)) score += 4;
+    if (distinct >= 5) score += 2;
+    if (distinct >= 20) score += 1;
+    scored.set(col, score);
+  }
+  return Array.from(scored.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([col]) => col);
+}
+
+function detectTreatmentColumns(ds: ParsedDataset, numericCols: string[], categoricalCols: string[]): string[] {
+  const scored = new Map<string, number>();
+  for (const col of [...numericCols, ...categoricalCols, ...ds.columns]) {
+    let score = 0;
+    if (/(treat|treatment|intervention|policy|program|exposure|assignment|eligible)/i.test(col)) score += 5;
+    if (/(post|after)/i.test(col)) score += 1;
+    if (isBinaryLikeColumn(ds, col)) score += 3;
+    if (score > 0) scored.set(col, Math.max(score, scored.get(col) || 0));
+  }
+  return Array.from(scored.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([col]) => col);
+}
+
+function detectOutcomeColumns(ds: ParsedDataset, numericCols: string[]): string[] {
+  const scored = new Map<string, number>();
+  for (const col of numericCols) {
+    let score = 1;
+    if (/(outcome|target|response|score|rate|risk|income|wage|price|cost|value|metric|performance|sales|earnings|mortality)/i.test(col)) score += 5;
+    if (/(id|code|index)$/i.test(col)) score -= 2;
+    scored.set(col, score);
+  }
+  return Array.from(scored.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([col]) => col);
+}
+
+function detectInstrumentColumns(ds: ParsedDataset): string[] {
+  return ds.columns.filter(c => /(instrument|iv|encouragement|eligib|distance|shiftshare|shock|assignment)/i.test(c));
+}
+
+function detectRunningVariableColumns(ds: ParsedDataset, numericCols: string[]): string[] {
+  return numericCols.filter(c => /(running|forcing|cutoff|threshold|score|distance|margin|rank)/i.test(c));
+}
+
+function inferEconometricDesignHints(
+  ds: ParsedDataset,
+  numericCols: string[],
+  categoricalCols: string[],
+  idCols: string[],
+): EconometricDesignHints {
+  const timeCols = detectTimeColumnsFromDataset(ds);
+  const entityCols = detectEntityColumns(ds, categoricalCols, idCols);
+  const treatmentCols = detectTreatmentColumns(ds, numericCols, categoricalCols);
+  const outcomeCols = detectOutcomeColumns(ds, numericCols);
+  const instrumentCols = detectInstrumentColumns(ds);
+  const runningCols = detectRunningVariableColumns(ds, numericCols);
+  const primaryOutcomeCol = outcomeCols[0] || numericCols[0];
+  const primaryInstrumentCol = instrumentCols[0];
+  const primaryTreatmentCol =
+    treatmentCols.find(col => col !== primaryOutcomeCol && col !== primaryInstrumentCol) ||
+    treatmentCols.find(col => col !== primaryOutcomeCol) ||
+    treatmentCols[0];
+  const primaryRegressorCol =
+    (primaryTreatmentCol && primaryTreatmentCol !== primaryOutcomeCol ? primaryTreatmentCol : undefined) ||
+    numericCols.find(col => col !== primaryOutcomeCol);
+
+  return {
+    timeCols,
+    entityCols,
+    treatmentCols,
+    outcomeCols,
+    instrumentCols,
+    runningCols,
+    primaryTimeCol: timeCols[0],
+    primaryEntityCol: entityCols[0],
+    primaryTreatmentCol,
+    primaryOutcomeCol,
+    primaryRegressorCol,
+    primaryInstrumentCol,
+    primaryRunningCol: runningCols[0],
+  };
+}
+
+function invert2x2(a: number, b: number, c: number, d: number): [number, number, number, number] | null {
+  const det = a * d - b * c;
+  if (!isFinite(det) || Math.abs(det) < 1e-10) return null;
+  return [d / det, -b / det, -c / det, a / det];
+}
+
+function mean(values: number[]): number {
+  return values.reduce((sum, value) => sum + value, 0) / Math.max(1, values.length);
+}
+
+function variance(values: number[], sample = true): number {
+  if (values.length <= (sample ? 1 : 0)) return 0;
+  const avg = mean(values);
+  const denom = sample ? Math.max(1, values.length - 1) : values.length;
+  return values.reduce((sum, value) => sum + (value - avg) ** 2, 0) / denom;
+}
+
+function stdDev(values: number[], sample = true): number {
+  return Math.sqrt(Math.max(variance(values, sample), 0));
+}
+
+function weightedMean(values: number[], weights: number[]): number {
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+  if (!isFinite(totalWeight) || totalWeight <= 0) return mean(values);
+  return values.reduce((sum, value, index) => sum + value * weights[index], 0) / totalWeight;
+}
+
+function weightedVariance(values: number[], weights: number[]): number {
+  const avg = weightedMean(values, weights);
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+  if (!isFinite(totalWeight) || totalWeight <= 0) return variance(values, false);
+  return values.reduce((sum, value, index) => sum + weights[index] * (value - avg) ** 2, 0) / totalWeight;
+}
+
+function logisticSigmoid(value: number): number {
+  if (value >= 0) {
+    const expNeg = Math.exp(-value);
+    return 1 / (1 + expNeg);
+  }
+  const expPos = Math.exp(value);
+  return expPos / (1 + expPos);
+}
+
+function standardisedMeanDifference(
+  treatedValues: number[],
+  controlValues: number[],
+  treatedWeights?: number[],
+  controlWeights?: number[],
+): number {
+  if (treatedValues.length < 2 || controlValues.length < 2) return 0;
+  const meanT = treatedWeights ? weightedMean(treatedValues, treatedWeights) : mean(treatedValues);
+  const meanC = controlWeights ? weightedMean(controlValues, controlWeights) : mean(controlValues);
+  const varT = treatedWeights ? weightedVariance(treatedValues, treatedWeights) : variance(treatedValues, false);
+  const varC = controlWeights ? weightedVariance(controlValues, controlWeights) : variance(controlValues, false);
+  const pooled = Math.sqrt(Math.max((varT + varC) / 2, 1e-12));
+  return (meanT - meanC) / pooled;
+}
+
+function fitSimpleWeightedLine(
+  rows: Array<{ x: number; y: number; weight: number }>
+): {
+  intercept: number;
+  slope: number;
+  interceptSe: number;
+  slopeSe: number;
+  fitted: Array<{ x: number; y: number; predicted: number; weight: number }>;
+} | null {
+  if (rows.length < 10) return null;
+  let sw = 0;
+  let swx = 0;
+  let swxx = 0;
+  let swy = 0;
+  let swxy = 0;
+  for (const row of rows) {
+    const w = Math.max(row.weight, 1e-6);
+    sw += w;
+    swx += w * row.x;
+    swxx += w * row.x * row.x;
+    swy += w * row.y;
+    swxy += w * row.x * row.y;
+  }
+  const inv = invert2x2(sw, swx, swx, swxx);
+  if (!inv) return null;
+  const [inv00, inv01, inv10, inv11] = inv;
+  const intercept = inv00 * swy + inv01 * swxy;
+  const slope = inv10 * swy + inv11 * swxy;
+
+  let weightedResidualSum = 0;
+  const fitted: Array<{ x: number; y: number; predicted: number; weight: number }> = [];
+  for (const row of rows) {
+    const predicted = intercept + slope * row.x;
+    weightedResidualSum += row.weight * (row.y - predicted) ** 2;
+    fitted.push({ x: row.x, y: row.y, predicted, weight: row.weight });
+  }
+  const sigma2 = weightedResidualSum / Math.max(1, rows.length - 2);
+  const interceptSe = Math.sqrt(Math.max(sigma2 * inv00, 0));
+  const slopeSe = Math.sqrt(Math.max(sigma2 * inv11, 0));
+
+  return { intercept, slope, interceptSe, slopeSe, fitted };
+}
+
+function fitLogisticPropensityModel(
+  rows: Array<{ treatment: number; covariates: number[] }>
+): { coefficients: number[]; scores: number[] } | null {
+  if (rows.length < 40 || rows[0]?.covariates.length === 0) return null;
+  const k = rows[0].covariates.length;
+  const means = Array(k).fill(0);
+  const stds = Array(k).fill(1);
+  for (let j = 0; j < k; j++) {
+    const values = rows.map(row => row.covariates[j]);
+    means[j] = mean(values);
+    stds[j] = stdDev(values, false) || 1;
+  }
+  const standardized = rows.map(row => ({
+    treatment: row.treatment,
+    x: row.covariates.map((value, index) => (value - means[index]) / stds[index]),
+  }));
+
+  const coefficients = Array(k + 1).fill(0);
+  const learningRate = 0.12;
+  const penalty = 1e-3;
+  for (let iter = 0; iter < 2500; iter++) {
+    const gradient = Array(k + 1).fill(0);
+    for (const row of standardized) {
+      const linearPredictor = coefficients[0] + row.x.reduce((sum, value, index) => sum + value * coefficients[index + 1], 0);
+      const score = logisticSigmoid(Math.max(-12, Math.min(12, linearPredictor)));
+      const error = row.treatment - score;
+      gradient[0] += error;
+      for (let j = 0; j < k; j++) {
+        gradient[j + 1] += error * row.x[j];
+      }
+    }
+    coefficients[0] += learningRate * gradient[0] / standardized.length;
+    for (let j = 0; j < k; j++) {
+      coefficients[j + 1] += learningRate * (gradient[j + 1] / standardized.length - penalty * coefficients[j + 1]);
+    }
+  }
+
+  const scores = standardized.map(row => {
+    const linearPredictor = coefficients[0] + row.x.reduce((sum, value, index) => sum + value * coefficients[index + 1], 0);
+    return Math.min(0.98, Math.max(0.02, logisticSigmoid(Math.max(-12, Math.min(12, linearPredictor)))));
+  });
+  const uniqueRoundedScores = new Set(scores.map(score => score.toFixed(3)));
+  if (uniqueRoundedScores.size < 5) return null;
+  return { coefficients, scores };
+}
+
+function computeEmpiricalQuantile(values: number[], tau: number): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const position = Math.max(0, Math.min(sorted.length - 1, Math.round((sorted.length - 1) * tau)));
+  return sorted[position];
+}
+
+function fitQuantileRegression1D(
+  observations: Array<{ x: number; y: number }>,
+  tau: number,
+): { intercept: number; slope: number; pseudoR1: number } | null {
+  if (observations.length < 40) return null;
+  const xMean = mean(observations.map(obs => obs.x));
+  const xStd = stdDev(observations.map(obs => obs.x), false) || 1;
+  const yMean = mean(observations.map(obs => obs.y));
+  const yStd = stdDev(observations.map(obs => obs.y), false) || 1;
+  const standardized = observations.map(obs => ({
+    x: (obs.x - xMean) / xStd,
+    y: (obs.y - yMean) / yStd,
+  }));
+
+  let intercept = computeEmpiricalQuantile(standardized.map(obs => obs.y), tau);
+  let slope = 0;
+  let step = 0.08;
+  for (let iter = 0; iter < 1800; iter++) {
+    let gradIntercept = 0;
+    let gradSlope = 0;
+    for (const obs of standardized) {
+      const residual = obs.y - (intercept + slope * obs.x);
+      const indicator = residual < 0 ? 1 : 0;
+      const subGrad = tau - indicator;
+      gradIntercept -= subGrad;
+      gradSlope -= subGrad * obs.x;
+    }
+    intercept -= (step / standardized.length) * gradIntercept;
+    slope -= (step / standardized.length) * gradSlope;
+    step *= 0.999;
+  }
+
+  const interceptOriginal = yMean + yStd * intercept - (yStd * slope * xMean) / xStd;
+  const slopeOriginal = (yStd * slope) / xStd;
+
+  const rho = (residual: number) => residual >= 0 ? tau * residual : (tau - 1) * residual;
+  const objective = observations.reduce((sum, obs) => sum + rho(obs.y - (interceptOriginal + slopeOriginal * obs.x)), 0);
+  const unconditionalQuantile = computeEmpiricalQuantile(observations.map(obs => obs.y), tau);
+  const nullObjective = observations.reduce((sum, obs) => sum + rho(obs.y - unconditionalQuantile), 0);
+  const pseudoR1 = nullObjective > 0 ? Math.max(0, 1 - objective / nullObjective) : 0;
+
+  if (!isFinite(interceptOriginal) || !isFinite(slopeOriginal)) return null;
+  return { intercept: interceptOriginal, slope: slopeOriginal, pseudoR1 };
+}
+
+function inferRddCutoff(
+  rows: Array<{ running: number; treatment: number }>
+): { cutoff: number; direction: "right" | "left"; misclassificationRate: number } | null {
+  if (rows.length < 40) return null;
+  const sorted = [...rows].sort((a, b) => a.running - b.running);
+  const candidates: number[] = [];
+  for (let i = 1; i < sorted.length; i++) {
+    const left = sorted[i - 1].running;
+    const right = sorted[i].running;
+    if (!isFinite(left) || !isFinite(right) || left === right) continue;
+    candidates.push((left + right) / 2);
+  }
+  if (candidates.length === 0) return null;
+
+  let best: { cutoff: number; direction: "right" | "left"; errors: number } | null = null;
+  for (const cutoff of candidates.slice(0, 400)) {
+    for (const direction of ["right", "left"] as const) {
+      let errors = 0;
+      for (const row of rows) {
+        const predicted = direction === "right" ? (row.running >= cutoff ? 1 : 0) : (row.running <= cutoff ? 1 : 0);
+        if (predicted !== row.treatment) errors++;
+      }
+      if (!best || errors < best.errors) {
+        best = { cutoff, direction, errors };
+      }
+    }
+  }
+  if (!best) return null;
+  return {
+    cutoff: best.cutoff,
+    direction: best.direction,
+    misclassificationRate: best.errors / rows.length,
+  };
+}
+
+function computeRobustOls(ds: ParsedDataset, xCol: string, yCol: string): RobustOlsResult | null {
+  const observations = ds.data
+    .map(row => ({ x: Number(row[xCol]), y: Number(row[yCol]) }))
+    .filter(obs => !isNaN(obs.x) && !isNaN(obs.y) && isFinite(obs.x) && isFinite(obs.y));
+  if (observations.length < 20) return null;
+
+  const pairs: [number, number][] = observations.map(obs => [obs.x, obs.y]);
+  const reg = regressionStatsFromPairs(pairs);
+  if (!reg) return null;
+
+  const n = observations.length;
+  const sumX = observations.reduce((sum, obs) => sum + obs.x, 0);
+  const sumXX = observations.reduce((sum, obs) => sum + obs.x * obs.x, 0);
+  const inv = invert2x2(n, sumX, sumX, sumXX);
+  if (!inv) return null;
+  const [inv00, inv01, inv10, inv11] = inv;
+
+  let meat00 = 0;
+  let meat01 = 0;
+  let meat11 = 0;
+  let ssRes = 0;
+  const meanY = observations.reduce((sum, obs) => sum + obs.y, 0) / n;
+  const ssTot = observations.reduce((sum, obs) => sum + (obs.y - meanY) ** 2, 0);
+  const fittedResiduals: Array<{ fitted: number; residual: number }> = [];
+  for (const obs of observations) {
+    const fitted = reg.intercept + reg.slope * obs.x;
+    const residual = obs.y - fitted;
+    const u2 = residual * residual;
+    meat00 += u2;
+    meat01 += u2 * obs.x;
+    meat11 += u2 * obs.x * obs.x;
+    ssRes += residual * residual;
+    if (fittedResiduals.length < 400) {
+      fittedResiduals.push({ fitted, residual });
+    }
+  }
+
+  const tmp00 = inv00 * meat00 + inv01 * meat01;
+  const tmp01 = inv00 * meat01 + inv01 * meat11;
+  const tmp10 = inv10 * meat00 + inv11 * meat01;
+  const tmp11 = inv10 * meat01 + inv11 * meat11;
+  const hc1 = n / Math.max(1, n - 2);
+  const var00 = (tmp00 * inv00 + tmp01 * inv10) * hc1;
+  const var11 = (tmp10 * inv01 + tmp11 * inv11) * hc1;
+  const seIntercept = Math.sqrt(Math.max(var00, 0));
+  const seSlope = Math.sqrt(Math.max(var11, 0));
+  if (!isFinite(seSlope) || seSlope <= 0) return null;
+
+  const tStat = reg.slope / seSlope;
+  const pValue = approxTwoTailPValue(tStat, n - 2);
+  const ciLower = reg.slope - 1.96 * seSlope;
+  const ciUpper = reg.slope + 1.96 * seSlope;
+  const adjR2 = 1 - (1 - reg.r2) * (n - 1) / Math.max(1, n - 2);
+
+  return {
+    xCol,
+    yCol,
+    intercept: reg.intercept,
+    slope: reg.slope,
+    seIntercept,
+    seSlope,
+    tStat,
+    pValue,
+    r2: reg.r2,
+    adjR2,
+    n,
+    ciLower,
+    ciUpper,
+    fittedResiduals,
+  };
+}
+
+function computePanelFixedEffects(ds: ParsedDataset, hints: EconometricDesignHints): PanelFixedEffectsResult | null {
+  const entityCol = hints.primaryEntityCol;
+  const timeCol = hints.primaryTimeCol;
+  const yCol = hints.primaryOutcomeCol;
+  const xCol =
+    (hints.primaryTreatmentCol && hints.primaryTreatmentCol !== hints.primaryOutcomeCol ? hints.primaryTreatmentCol : undefined) ||
+    hints.primaryRegressorCol;
+  if (!entityCol || !timeCol || !yCol || !xCol || xCol === yCol) return null;
+
+  const rows = ds.data
+    .map(row => ({
+      entity: String(row[entityCol] ?? "").trim(),
+      time: parseTimeValue(row[timeCol]),
+      x: Number(row[xCol]),
+      y: Number(row[yCol]),
+    }))
+    .filter(row => row.entity && row.time !== null && !isNaN(row.x) && !isNaN(row.y));
+  if (rows.length < 40) return null;
+
+  const entityX = new Map<string, { sum: number; count: number }>();
+  const entityY = new Map<string, { sum: number; count: number }>();
+  const timeX = new Map<number, { sum: number; count: number }>();
+  const timeY = new Map<number, { sum: number; count: number }>();
+  for (const row of rows) {
+    const ex = entityX.get(row.entity) || { sum: 0, count: 0 };
+    ex.sum += row.x;
+    ex.count++;
+    entityX.set(row.entity, ex);
+    const ey = entityY.get(row.entity) || { sum: 0, count: 0 };
+    ey.sum += row.y;
+    ey.count++;
+    entityY.set(row.entity, ey);
+    const tx = timeX.get(row.time!) || { sum: 0, count: 0 };
+    tx.sum += row.x;
+    tx.count++;
+    timeX.set(row.time!, tx);
+    const ty = timeY.get(row.time!) || { sum: 0, count: 0 };
+    ty.sum += row.y;
+    ty.count++;
+    timeY.set(row.time!, ty);
+  }
+
+  const entityCount = entityX.size;
+  const periodCount = timeX.size;
+  if (entityCount < 2 || periodCount < 3) return null;
+
+  const grandX = rows.reduce((sum, row) => sum + row.x, 0) / rows.length;
+  const grandY = rows.reduce((sum, row) => sum + row.y, 0) / rows.length;
+  let num = 0;
+  let den = 0;
+  let ssTot = 0;
+  const transformed: Array<{ xdd: number; ydd: number }> = [];
+  for (const row of rows) {
+    const meanEntityX = entityX.get(row.entity)!.sum / entityX.get(row.entity)!.count;
+    const meanEntityY = entityY.get(row.entity)!.sum / entityY.get(row.entity)!.count;
+    const meanTimeX = timeX.get(row.time!)!.sum / timeX.get(row.time!)!.count;
+    const meanTimeY = timeY.get(row.time!)!.sum / timeY.get(row.time!)!.count;
+    const xdd = row.x - meanEntityX - meanTimeX + grandX;
+    const ydd = row.y - meanEntityY - meanTimeY + grandY;
+    if (!isFinite(xdd) || !isFinite(ydd)) continue;
+    transformed.push({ xdd, ydd });
+    num += xdd * ydd;
+    den += xdd * xdd;
+    ssTot += ydd * ydd;
+  }
+  if (transformed.length < 30 || den <= 1e-10) return null;
+
+  const beta = num / den;
+  let ssRes = 0;
+  let robustNumerator = 0;
+  const fittedResiduals: Array<{ fitted: number; residual: number }> = [];
+  for (const row of transformed) {
+    const fitted = beta * row.xdd;
+    const residual = row.ydd - fitted;
+    ssRes += residual * residual;
+    robustNumerator += row.xdd * row.xdd * residual * residual;
+    if (fittedResiduals.length < 400) {
+      fittedResiduals.push({ fitted, residual });
+    }
+  }
+
+  const n = transformed.length;
+  const hc1 = n / Math.max(1, n - 1);
+  const se = Math.sqrt(Math.max((robustNumerator / (den * den)) * hc1, 0));
+  if (!isFinite(se) || se <= 0) return null;
+  const tStat = beta / se;
+  const pValue = approxTwoTailPValue(tStat, n - 1);
+  const r2Within = ssTot > 0 ? Math.max(0, 1 - ssRes / ssTot) : 0;
+
+  return {
+    entityCol,
+    timeCol,
+    xCol,
+    yCol,
+    beta,
+    se,
+    tStat,
+    pValue,
+    n,
+    entities: entityCount,
+    periods: periodCount,
+    r2Within,
+    fittedResiduals,
+  };
+}
+
+function computeDiffInDiff(ds: ParsedDataset, hints: EconometricDesignHints): DiffInDiffResult | null {
+  const timeCol = hints.primaryTimeCol;
+  const treatmentCol = hints.primaryTreatmentCol;
+  const outcomeCol = hints.primaryOutcomeCol;
+  if (!timeCol || !treatmentCol || !outcomeCol) return null;
+
+  const rows = ds.data
+    .map(row => ({
+      entity: hints.primaryEntityCol ? String(row[hints.primaryEntityCol] ?? "").trim() : "",
+      timeValue: parseTimeValue(row[timeCol]),
+      timeLabel: String(row[timeCol] ?? ""),
+      treatment: parseBinaryValue(row[treatmentCol]),
+      outcome: Number(row[outcomeCol]),
+    }))
+    .filter(row => row.timeValue !== null && row.treatment !== null && !isNaN(row.outcome));
+  if (rows.length < 40) return null;
+
+  let treatmentStart = Infinity;
+  let treatedEntities = new Set<string>();
+  let controlEntities = new Set<string>();
+
+  if (hints.primaryEntityCol) {
+    const everTreated = new Map<string, boolean>();
+    for (const row of rows) {
+      if (!row.entity) continue;
+      if (row.treatment === 1) {
+        everTreated.set(row.entity, true);
+        treatmentStart = Math.min(treatmentStart, row.timeValue!);
+      } else if (!everTreated.has(row.entity)) {
+        everTreated.set(row.entity, false);
+      }
+    }
+    treatedEntities = new Set(Array.from(everTreated.entries()).filter(([, treated]) => treated).map(([entity]) => entity));
+    controlEntities = new Set(Array.from(everTreated.entries()).filter(([, treated]) => !treated).map(([entity]) => entity));
+  } else {
+    for (const row of rows) {
+      if (row.treatment === 1) treatmentStart = Math.min(treatmentStart, row.timeValue!);
+    }
+  }
+  if (!isFinite(treatmentStart)) return null;
+
+  const treatedPre: number[] = [];
+  const treatedPost: number[] = [];
+  const controlPre: number[] = [];
+  const controlPost: number[] = [];
+  const treatedByTime = new Map<number, { sum: number; count: number; label: string }>();
+  const controlByTime = new Map<number, { sum: number; count: number; label: string }>();
+
+  for (const row of rows) {
+    const isTreatedGroup = hints.primaryEntityCol
+      ? treatedEntities.has(row.entity)
+      : row.treatment === 1;
+    const isControlGroup = hints.primaryEntityCol
+      ? controlEntities.has(row.entity)
+      : row.treatment === 0;
+    if (!isTreatedGroup && !isControlGroup) continue;
+    const isPost = row.timeValue! >= treatmentStart;
+
+    if (isTreatedGroup) {
+      (isPost ? treatedPost : treatedPre).push(row.outcome);
+      const current = treatedByTime.get(row.timeValue!) || { sum: 0, count: 0, label: row.timeLabel };
+      current.sum += row.outcome;
+      current.count++;
+      treatedByTime.set(row.timeValue!, current);
+    } else if (isControlGroup) {
+      (isPost ? controlPost : controlPre).push(row.outcome);
+      const current = controlByTime.get(row.timeValue!) || { sum: 0, count: 0, label: row.timeLabel };
+      current.sum += row.outcome;
+      current.count++;
+      controlByTime.set(row.timeValue!, current);
+    }
+  }
+
+  if (treatedPre.length < 5 || treatedPost.length < 5 || controlPre.length < 5 || controlPost.length < 5) return null;
+
+  const mean = (values: number[]) => values.reduce((sum, value) => sum + value, 0) / values.length;
+  const treatedPreMean = mean(treatedPre);
+  const treatedPostMean = mean(treatedPost);
+  const controlPreMean = mean(controlPre);
+  const controlPostMean = mean(controlPost);
+  const estimate = (treatedPostMean - treatedPreMean) - (controlPostMean - controlPreMean);
+
+  const commonTimes = Array.from(treatedByTime.keys())
+    .filter(time => controlByTime.has(time))
+    .sort((a, b) => a - b);
+  if (commonTimes.length < 4) return null;
+
+  const startIndex = commonTimes.findIndex(time => time >= treatmentStart);
+  const baselineIndex = Math.max(0, startIndex - 1);
+  const baselineTime = commonTimes[baselineIndex];
+  const baselineDiff =
+    treatedByTime.get(baselineTime)!.sum / treatedByTime.get(baselineTime)!.count -
+    controlByTime.get(baselineTime)!.sum / controlByTime.get(baselineTime)!.count;
+  const firstPreTime = commonTimes[0];
+  const firstPreDiff =
+    treatedByTime.get(firstPreTime)!.sum / treatedByTime.get(firstPreTime)!.count -
+    controlByTime.get(firstPreTime)!.sum / controlByTime.get(firstPreTime)!.count;
+
+  const series = commonTimes.map((time, index) => {
+    const treatedMean = treatedByTime.get(time)!.sum / treatedByTime.get(time)!.count;
+    const controlMean = controlByTime.get(time)!.sum / controlByTime.get(time)!.count;
+    return {
+      label: treatedByTime.get(time)?.label || controlByTime.get(time)?.label || String(time),
+      timeValue: time,
+      relIndex: index - startIndex,
+      treatedMean,
+      controlMean,
+      effect: (treatedMean - controlMean) - baselineDiff,
+    };
+  });
+
+  return {
+    timeCol,
+    entityCol: hints.primaryEntityCol,
+    treatmentCol,
+    outcomeCol,
+    treatmentStart,
+    estimate,
+    treatedPre: treatedPreMean,
+    treatedPost: treatedPostMean,
+    controlPre: controlPreMean,
+    controlPost: controlPostMean,
+    n: treatedPre.length + treatedPost.length + controlPre.length + controlPost.length,
+    preTrendDelta: baselineDiff - firstPreDiff,
+    series,
+  };
+}
+
+function projectOntoSimplex(values: number[]): number[] {
+  const sorted = [...values].sort((a, b) => b - a);
+  let cumulative = 0;
+  let rho = 0;
+  for (let i = 0; i < sorted.length; i++) {
+    cumulative += sorted[i];
+    const theta = (cumulative - 1) / (i + 1);
+    if (sorted[i] - theta > 0) {
+      rho = i + 1;
+    }
+  }
+  const theta = (sorted.slice(0, rho).reduce((sum, value) => sum + value, 0) - 1) / Math.max(1, rho);
+  return values.map(value => Math.max(value - theta, 0));
+}
+
+function fitSyntheticControlWeights(donorSeries: number[][], treatedSeries: number[]): number[] {
+  const donorCount = donorSeries.length;
+  if (donorCount === 0) return [];
+  let weights = Array(donorCount).fill(1 / donorCount);
+  const maxNorm = Math.max(
+    1,
+    ...donorSeries.map(series => series.reduce((sum, value) => sum + value * value, 0))
+  );
+  const learningRate = 0.2 / maxNorm;
+
+  for (let iter = 0; iter < 800; iter++) {
+    const prediction = treatedSeries.map((_, timeIndex) =>
+      donorSeries.reduce((sum, series, donorIndex) => sum + weights[donorIndex] * series[timeIndex], 0)
+    );
+    const gradient = donorSeries.map(series =>
+      2 * series.reduce((sum, value, timeIndex) => sum + value * (prediction[timeIndex] - treatedSeries[timeIndex]), 0)
+    );
+    const next = projectOntoSimplex(weights.map((weight, index) => weight - learningRate * gradient[index]));
+    const maxDelta = Math.max(...next.map((value, index) => Math.abs(value - weights[index])));
+    weights = next;
+    if (maxDelta < 1e-8) break;
+  }
+
+  return weights;
+}
+
+function buildSyntheticControlPanelData(ds: ParsedDataset, hints: EconometricDesignHints): {
+  entityCol: string;
+  timeCol: string;
+  treatmentCol: string;
+  outcomeCol: string;
+  treatedCandidates: Array<[string, number]>;
+  donorUnits: string[];
+  outcomeByEntityTime: Map<string, Map<number, { sum: number; count: number; label: string }>>;
+} | null {
+  const entityCol = hints.primaryEntityCol;
+  const timeCol = hints.primaryTimeCol;
+  const treatmentCol = hints.primaryTreatmentCol;
+  const outcomeCol = hints.primaryOutcomeCol;
+  if (!entityCol || !timeCol || !treatmentCol || !outcomeCol) return null;
+
+  const rows = ds.data
+    .map(row => ({
+      entity: String(row[entityCol] ?? "").trim(),
+      timeValue: parseTimeValue(row[timeCol]),
+      timeLabel: String(row[timeCol] ?? ""),
+      treatment: parseBinaryValue(row[treatmentCol]),
+      outcome: Number(row[outcomeCol]),
+    }))
+    .filter(row => row.entity && row.timeValue !== null && row.treatment !== null && !isNaN(row.outcome));
+  if (rows.length < 60) return null;
+
+  const firstTreatmentByEntity = new Map<string, number>();
+  const outcomeByEntityTime = new Map<string, Map<number, { sum: number; count: number; label: string }>>();
+  for (const row of rows) {
+    if (row.treatment === 1) {
+      firstTreatmentByEntity.set(
+        row.entity,
+        Math.min(firstTreatmentByEntity.get(row.entity) ?? Infinity, row.timeValue!)
+      );
+    }
+    const entityMap = outcomeByEntityTime.get(row.entity) || new Map<number, { sum: number; count: number; label: string }>();
+    const current = entityMap.get(row.timeValue!) || { sum: 0, count: 0, label: row.timeLabel };
+    current.sum += row.outcome;
+    current.count++;
+    entityMap.set(row.timeValue!, current);
+    outcomeByEntityTime.set(row.entity, entityMap);
+  }
+
+  const treatedCandidates = Array.from(firstTreatmentByEntity.entries()).sort((a, b) => a[1] - b[1]);
+  const donorUnits = Array.from(outcomeByEntityTime.keys()).filter(entity => !firstTreatmentByEntity.has(entity));
+  if (treatedCandidates.length === 0 || donorUnits.length < 2) return null;
+
+  return {
+    entityCol,
+    timeCol,
+    treatmentCol,
+    outcomeCol,
+    treatedCandidates,
+    donorUnits,
+    outcomeByEntityTime,
+  };
+}
+
+function computeSyntheticControlForUnit(
+  panel: NonNullable<ReturnType<typeof buildSyntheticControlPanelData>>,
+  treatedUnit: string,
+  treatmentStart: number,
+  donorPool: string[],
+): SyntheticControlResult | null {
+  const treatedMap = panel.outcomeByEntityTime.get(treatedUnit);
+  if (!treatedMap || donorPool.length < 2) return null;
+  const preTimes = Array.from(treatedMap.keys()).filter(time => time < treatmentStart).sort((a, b) => a - b);
+  if (preTimes.length < 4) return null;
+
+  const donorDistances = donorPool
+    .map(entity => {
+      const donorMap = panel.outcomeByEntityTime.get(entity);
+      if (!donorMap) return null;
+      const overlappingPreTimes = preTimes.filter(time => donorMap.has(time));
+      if (overlappingPreTimes.length < 4) return null;
+      const distance = overlappingPreTimes.reduce((sum, time) => {
+        const treatedMean = treatedMap.get(time)!.sum / treatedMap.get(time)!.count;
+        const donorMean = donorMap.get(time)!.sum / donorMap.get(time)!.count;
+        return sum + (treatedMean - donorMean) ** 2;
+      }, 0) / overlappingPreTimes.length;
+      return { entity, distance };
+    })
+    .filter((item): item is { entity: string; distance: number } => item !== null)
+    .sort((a, b) => a.distance - b.distance)
+    .slice(0, 8);
+  if (donorDistances.length < 2) return null;
+
+  const selectedDonors = donorDistances.map(item => item.entity);
+  const commonPreTimes = preTimes.filter(time =>
+    selectedDonors.every(entity => panel.outcomeByEntityTime.get(entity)?.has(time))
+  );
+  if (commonPreTimes.length < 4) return null;
+
+  const donorSeries = selectedDonors.map(entity =>
+    commonPreTimes.map(time => {
+      const point = panel.outcomeByEntityTime.get(entity)!.get(time)!;
+      return point.sum / point.count;
+    })
+  );
+  const treatedSeries = commonPreTimes.map(time => {
+    const point = treatedMap.get(time)!;
+    return point.sum / point.count;
+  });
+  const weights = fitSyntheticControlWeights(donorSeries, treatedSeries);
+  if (weights.length !== selectedDonors.length) return null;
+
+  const usableTimes = Array.from(treatedMap.keys())
+    .filter(time => selectedDonors.every(entity => panel.outcomeByEntityTime.get(entity)?.has(time)))
+    .sort((a, b) => a - b);
+  if (usableTimes.length < 6) return null;
+
+  const startIndex = usableTimes.findIndex(value => value >= treatmentStart);
+  if (startIndex < 0) return null;
+  const series = usableTimes.map((time, index) => {
+    const treated = treatedMap.get(time)!.sum / treatedMap.get(time)!.count;
+    const synthetic = selectedDonors.reduce((sum, entity, donorIndex) => {
+      const point = panel.outcomeByEntityTime.get(entity)!.get(time)!;
+      return sum + weights[donorIndex] * (point.sum / point.count);
+    }, 0);
+    const label = treatedMap.get(time)?.label || String(time);
+    return {
+      label,
+      timeValue: time,
+      relIndex: index - startIndex,
+      treated,
+      synthetic,
+      gap: treated - synthetic,
+    };
+  });
+
+  const preSeries = series.filter(point => point.timeValue < treatmentStart);
+  const postSeries = series.filter(point => point.timeValue >= treatmentStart);
+  if (preSeries.length < 4 || postSeries.length < 2) return null;
+
+  const rmse = (items: Array<{ gap: number }>) => Math.sqrt(items.reduce((sum, item) => sum + item.gap ** 2, 0) / items.length);
+  const preRmse = rmse(preSeries);
+  const postRmse = rmse(postSeries);
+  const attPostMean = postSeries.reduce((sum, item) => sum + item.gap, 0) / postSeries.length;
+
+  return {
+    entityCol: panel.entityCol,
+    timeCol: panel.timeCol,
+    outcomeCol: panel.outcomeCol,
+    treatmentCol: panel.treatmentCol,
+    treatedUnit,
+    treatmentStart,
+    donorCount: selectedDonors.length,
+    preRmse,
+    postRmse,
+    attPostMean,
+    weights: selectedDonors.map((unit, index) => ({ unit, weight: weights[index] }))
+      .sort((a, b) => b.weight - a.weight),
+    series,
+  };
+}
+
+function computeSyntheticControl(ds: ParsedDataset, hints: EconometricDesignHints): SyntheticControlResult | null {
+  const panel = buildSyntheticControlPanelData(ds, hints);
+  if (!panel) return null;
+  const [treatedUnit, treatmentStart] = panel.treatedCandidates[0];
+  return computeSyntheticControlForUnit(panel, treatedUnit, treatmentStart, panel.donorUnits);
+}
+
+function computeSyntheticControlPlacebos(
+  ds: ParsedDataset,
+  hints: EconometricDesignHints,
+  actualResult?: SyntheticControlResult | null,
+): SyntheticControlPlaceboResult | null {
+  const panel = buildSyntheticControlPanelData(ds, hints);
+  const actual = actualResult || computeSyntheticControl(ds, hints);
+  if (!panel || !actual || actual.preRmse <= 1e-9) return null;
+
+  const ratios: SyntheticControlPlaceboResult["ratios"] = [{
+    unit: actual.treatedUnit,
+    ratio: actual.postRmse / actual.preRmse,
+    preRmse: actual.preRmse,
+    postRmse: actual.postRmse,
+    isActual: true,
+  }];
+
+  for (const donorUnit of panel.donorUnits.slice(0, 8)) {
+    const donorPool = panel.donorUnits.filter(unit => unit !== donorUnit);
+    const placebo = computeSyntheticControlForUnit(panel, donorUnit, actual.treatmentStart, donorPool);
+    if (!placebo || placebo.preRmse <= 1e-9) continue;
+    ratios.push({
+      unit: donorUnit,
+      ratio: placebo.postRmse / placebo.preRmse,
+      preRmse: placebo.preRmse,
+      postRmse: placebo.postRmse,
+      isActual: false,
+    });
+  }
+
+  if (ratios.length < 3) return null;
+  const sorted = [...ratios].sort((a, b) => b.ratio - a.ratio);
+  const actualRank = sorted.findIndex(item => item.isActual) + 1;
+  return {
+    treatedUnit: actual.treatedUnit,
+    treatmentStart: actual.treatmentStart,
+    actualRatio: actual.postRmse / actual.preRmse,
+    ratios: sorted,
+    actualRank,
+  };
+}
+
+function computeIv2Sls(ds: ParsedDataset, hints: EconometricDesignHints): Iv2SlsResult | null {
+  const zCol = hints.primaryInstrumentCol;
+  const xCol = hints.primaryTreatmentCol || hints.primaryRegressorCol;
+  const yCol = hints.primaryOutcomeCol;
+  if (!zCol || !xCol || !yCol || zCol === xCol || zCol === yCol || xCol === yCol) return null;
+
+  const observations = ds.data
+    .map(row => ({
+      z: Number(row[zCol]),
+      x: Number(row[xCol]),
+      y: Number(row[yCol]),
+    }))
+    .filter(obs => !isNaN(obs.z) && !isNaN(obs.x) && !isNaN(obs.y) && isFinite(obs.z) && isFinite(obs.x) && isFinite(obs.y));
+  if (observations.length < 60) return null;
+
+  const firstStagePairs: [number, number][] = observations.map(obs => [obs.z, obs.x]);
+  const reducedFormPairs: [number, number][] = observations.map(obs => [obs.z, obs.y]);
+  const firstStage = regressionStatsFromPairs(firstStagePairs);
+  const reducedForm = regressionStatsFromPairs(reducedFormPairs);
+  if (!firstStage || !reducedForm) return null;
+
+  const zValues = observations.map(obs => obs.z);
+  const meanZ = mean(zValues);
+  const ssZ = zValues.reduce((sum, value) => sum + (value - meanZ) ** 2, 0);
+  if (ssZ <= 1e-10) return null;
+
+  const firstStageResiduals = observations.map(obs => obs.x - (firstStage.intercept + firstStage.slope * obs.z));
+  const firstStageMse = firstStageResiduals.reduce((sum, residual) => sum + residual ** 2, 0) / Math.max(1, observations.length - 2);
+  const firstStageSe = Math.sqrt(firstStageMse / ssZ);
+  if (!isFinite(firstStageSe) || firstStageSe <= 0) return null;
+  const firstStageT = firstStage.slope / firstStageSe;
+  const firstStagePValue = approxTwoTailPValue(firstStageT, observations.length - 2);
+  const firstStageF = firstStageT ** 2;
+
+  const fittedTreatment = observations.map(obs => firstStage.intercept + firstStage.slope * obs.z);
+  const secondStagePairs: [number, number][] = observations.map((obs, index) => [fittedTreatment[index], obs.y]);
+  const secondStage = regressionStatsFromPairs(secondStagePairs);
+  if (!secondStage) return null;
+  const meanDHat = mean(fittedTreatment);
+  const ssDhat = fittedTreatment.reduce((sum, value) => sum + (value - meanDHat) ** 2, 0);
+  if (ssDhat <= 1e-10) return null;
+  const secondStageResiduals = observations.map((obs, index) => obs.y - (secondStage.intercept + secondStage.slope * fittedTreatment[index]));
+  const secondStageMse = secondStageResiduals.reduce((sum, residual) => sum + residual ** 2, 0) / Math.max(1, observations.length - 2);
+  const secondStageSe = Math.sqrt(secondStageMse / ssDhat);
+  if (!isFinite(secondStageSe) || secondStageSe <= 0) return null;
+
+  const tStat = secondStage.slope / secondStageSe;
+  const pValue = approxTwoTailPValue(tStat, observations.length - 2);
+  return {
+    zCol,
+    xCol,
+    yCol,
+    beta: secondStage.slope,
+    se: secondStageSe,
+    tStat,
+    pValue,
+    ciLower: secondStage.slope - 1.96 * secondStageSe,
+    ciUpper: secondStage.slope + 1.96 * secondStageSe,
+    n: observations.length,
+    firstStageSlope: firstStage.slope,
+    firstStageSe,
+    firstStageF,
+    firstStagePValue,
+    reducedFormSlope: reducedForm.slope,
+    firstStagePoints: observations.slice(0, 300).map(obs => ({ x: obs.z, y: obs.x })),
+  };
+}
+
+function computeRegressionDiscontinuity(ds: ParsedDataset, hints: EconometricDesignHints): RddResult | null {
+  const runningCol = hints.primaryRunningCol;
+  const treatmentCol = hints.primaryTreatmentCol;
+  const outcomeCol = hints.primaryOutcomeCol;
+  if (!runningCol || !treatmentCol || !outcomeCol) return null;
+
+  const rows = ds.data
+    .map(row => ({
+      running: Number(row[runningCol]),
+      treatment: parseBinaryValue(row[treatmentCol]),
+      outcome: Number(row[outcomeCol]),
+    }))
+    .filter(row => !isNaN(row.running) && row.treatment !== null && !isNaN(row.outcome));
+  if (rows.length < 80) return null;
+
+  const cutoffInfo = inferRddCutoff(rows.map(row => ({ running: row.running, treatment: row.treatment! })));
+  if (!cutoffInfo || cutoffInfo.misclassificationRate > 0.35) return null;
+
+  const centeredRows = rows.map(row => ({
+    x: row.running - cutoffInfo.cutoff,
+    running: row.running,
+    treatment: row.treatment!,
+    outcome: row.outcome,
+  }));
+  const absDistances = centeredRows.map(row => Math.abs(row.x)).sort((a, b) => a - b);
+  const bandwidth = absDistances[Math.min(absDistances.length - 1, Math.max(40, Math.floor(absDistances.length * 0.35)))] || absDistances[absDistances.length - 1];
+  if (!isFinite(bandwidth) || bandwidth <= 0) return null;
+
+  const local = centeredRows.filter(row => Math.abs(row.x) <= bandwidth);
+  const leftRows = local
+    .filter(row => row.x < 0)
+    .map(row => ({ x: row.x, y: row.outcome, weight: Math.max(0.05, 1 - Math.abs(row.x) / bandwidth), running: row.running }));
+  const rightRows = local
+    .filter(row => row.x >= 0)
+    .map(row => ({ x: row.x, y: row.outcome, weight: Math.max(0.05, 1 - Math.abs(row.x) / bandwidth), running: row.running }));
+  if (leftRows.length < 20 || rightRows.length < 20) return null;
+
+  const leftFit = fitSimpleWeightedLine(leftRows);
+  const rightFit = fitSimpleWeightedLine(rightRows);
+  if (!leftFit || !rightFit) return null;
+
+  const estimate = cutoffInfo.direction === "right"
+    ? rightFit.intercept - leftFit.intercept
+    : leftFit.intercept - rightFit.intercept;
+  const se = Math.sqrt(leftFit.interceptSe ** 2 + rightFit.interceptSe ** 2);
+  if (!isFinite(se) || se <= 0) return null;
+  const tStat = estimate / se;
+  const pValue = approxTwoTailPValue(tStat, leftRows.length + rightRows.length - 4);
+
+  const makeBins = (subset: typeof local, side: "left" | "right") => {
+    const ordered = [...subset].sort((a, b) => a.running - b.running);
+    const binSize = Math.max(6, Math.ceil(ordered.length / 6));
+    const bins: RddResult["bins"] = [];
+    for (let start = 0; start < ordered.length; start += binSize) {
+      const chunk = ordered.slice(start, start + binSize);
+      if (chunk.length === 0) continue;
+      bins.push({
+        x: mean(chunk.map(row => row.running)),
+        y: mean(chunk.map(row => row.outcome)),
+        side,
+        count: chunk.length,
+      });
+    }
+    return bins;
+  };
+
+  const leftMin = Math.min(...leftRows.map(row => row.x));
+  const rightMax = Math.max(...rightRows.map(row => row.x));
+  return {
+    runningCol,
+    treatmentCol,
+    outcomeCol,
+    cutoff: cutoffInfo.cutoff,
+    bandwidth,
+    estimate,
+    se,
+    tStat,
+    pValue,
+    nLocal: local.length,
+    leftN: leftRows.length,
+    rightN: rightRows.length,
+    leftSlope: leftFit.slope,
+    rightSlope: rightFit.slope,
+    bins: [
+      ...makeBins(local.filter(row => row.x < 0), "left"),
+      ...makeBins(local.filter(row => row.x >= 0), "right"),
+    ],
+    fitLine: [
+      { x: cutoffInfo.cutoff + leftMin, y: leftFit.intercept + leftFit.slope * leftMin, side: "left" },
+      { x: cutoffInfo.cutoff, y: leftFit.intercept, side: "left" },
+      { x: cutoffInfo.cutoff, y: rightFit.intercept, side: "right" },
+      { x: cutoffInfo.cutoff + rightMax, y: rightFit.intercept + rightFit.slope * rightMax, side: "right" },
+    ],
+  };
+}
+
+function computePropensityScore(ds: ParsedDataset, hints: EconometricDesignHints): PropensityScoreResult | null {
+  const treatmentCol = hints.primaryTreatmentCol;
+  const outcomeCol = hints.primaryOutcomeCol;
+  if (!treatmentCol || !outcomeCol) return null;
+
+  const { numericCols, idCols } = classifyColumns(ds.data, ds.columns);
+  const covariates = numericCols
+    .filter(col => !idCols.includes(col))
+    .filter(col => col !== treatmentCol && col !== outcomeCol && col !== hints.primaryInstrumentCol && col !== hints.primaryRunningCol)
+    .slice(0, 5);
+  if (covariates.length < 2) return null;
+
+  const rows = ds.data
+    .map(row => ({
+      treatment: parseBinaryValue(row[treatmentCol]),
+      outcome: Number(row[outcomeCol]),
+      covariates: covariates.map(col => Number(row[col])),
+    }))
+    .filter(row => row.treatment !== null && !isNaN(row.outcome) && row.covariates.every(value => !isNaN(value) && isFinite(value)));
+  if (rows.length < 80) return null;
+
+  const model = fitLogisticPropensityModel(rows.map(row => ({ treatment: row.treatment!, covariates: row.covariates })));
+  if (!model) return null;
+
+  const scoreRows = rows.map((row, index) => ({
+    score: model.scores[index],
+    treatment: row.treatment!,
+    outcome: row.outcome,
+    covariates: row.covariates,
+  }));
+  const treated = scoreRows.filter(row => row.treatment === 1);
+  const control = scoreRows.filter(row => row.treatment === 0);
+  if (treated.length < 15 || control.length < 15) return null;
+
+  const contributions = scoreRows.map(row =>
+    row.treatment === 1 ? row.outcome / row.score : -row.outcome / (1 - row.score)
+  );
+  const ate = mean(contributions);
+  const se = stdDev(contributions) / Math.sqrt(scoreRows.length);
+  if (!isFinite(se) || se <= 0) return null;
+  const tStat = ate / se;
+  const pValue = approxTwoTailPValue(tStat, scoreRows.length - 1);
+
+  const treatedWeights = treated.map(row => 1 / row.score);
+  const controlWeights = control.map(row => 1 / (1 - row.score));
+  const balance = covariates.map((covariate, index) => {
+    const treatedValues = treated.map(row => row.covariates[index]);
+    const controlValues = control.map(row => row.covariates[index]);
+    return {
+      covariate,
+      smdBefore: standardisedMeanDifference(treatedValues, controlValues),
+      smdAfter: standardisedMeanDifference(treatedValues, controlValues, treatedWeights, controlWeights),
+      meanTreated: mean(treatedValues),
+      meanControl: mean(controlValues),
+      weightedTreated: weightedMean(treatedValues, treatedWeights),
+      weightedControl: weightedMean(controlValues, controlWeights),
+    };
+  });
+
+  const treatedScores = treated.map(row => row.score);
+  const controlScores = control.map(row => row.score);
+  return {
+    treatmentCol,
+    outcomeCol,
+    covariates,
+    ate,
+    se,
+    tStat,
+    pValue,
+    ciLower: ate - 1.96 * se,
+    ciUpper: ate + 1.96 * se,
+    n: scoreRows.length,
+    meanScoreTreated: mean(treatedScores),
+    meanScoreControl: mean(controlScores),
+    overlapMin: Math.max(Math.min(...treatedScores), Math.min(...controlScores)),
+    overlapMax: Math.min(Math.max(...treatedScores), Math.max(...controlScores)),
+    balance,
+    scoreRows: scoreRows.map(row => ({ score: row.score, treatment: row.treatment })),
+  };
+}
+
+function computeQuantileRegression(ds: ParsedDataset, hints: EconometricDesignHints): QuantileRegressionResult | null {
+  const yCol = hints.primaryOutcomeCol;
+  const xCol = hints.primaryRegressorCol;
+  if (!xCol || !yCol || xCol === yCol) return null;
+
+  const observations = ds.data
+    .map(row => ({ x: Number(row[xCol]), y: Number(row[yCol]) }))
+    .filter(obs => !isNaN(obs.x) && !isNaN(obs.y) && isFinite(obs.x) && isFinite(obs.y));
+  if (observations.length < 80) return null;
+
+  const estimates = [0.25, 0.5, 0.75]
+    .map(tau => {
+      const fit = fitQuantileRegression1D(observations, tau);
+      return fit ? { tau, intercept: fit.intercept, slope: fit.slope, pseudoR1: fit.pseudoR1 } : null;
+    })
+    .filter((item): item is QuantileRegressionEstimate => item !== null);
+  if (estimates.length < 3) return null;
+
+  return {
+    xCol,
+    yCol,
+    n: observations.length,
+    estimates,
+  };
+}
+
 function detectTextColumns(ds: ParsedDataset): string[] {
   const textCols: string[] = [];
   for (const col of ds.columns) {
@@ -2047,6 +3488,7 @@ export function buildMethodApplicabilityAssessment(
   categoricalCols: string[]
 ): MethodApplicabilityAssessment[] {
   const rowCount = ds.totalRows || ds.data.length;
+  const { idCols } = classifyColumns(ds.data, ds.columns);
   const timeCols = ds.columns.filter(c => /(year|month|date|time|wave|period|quarter)/i.test(c));
   const textCols = detectTextColumns(ds);
   const lowerCols = ds.columns.map(c => c.toLowerCase());
@@ -2055,6 +3497,7 @@ export function buildMethodApplicabilityAssessment(
   const hasPanelLike = timeCols.length > 0 && lowerCols.some(c => /(id|code|entity|respondent|household|firm|user|patient)/i.test(c));
   const hasTreatmentLike = lowerCols.some(c => /(treat|treatment|intervention|policy|program|exposure|group)/i.test(c));
   const hasOutcomeLike = lowerCols.some(c => /(outcome|target|response|score|rate|risk|income|wage|price|cost)/i.test(c)) || numericCols.length > 0;
+  const designHints = inferEconometricDesignHints(ds, numericCols, categoricalCols, idCols);
 
   const textDocumentCount = (() => {
     if (textCols.length === 0) return 0;
@@ -2198,6 +3641,51 @@ export function buildMethodApplicabilityAssessment(
     pushAssessment("data_visualisation", "Academic Data Visualisation", "blocked", 15, visualEvidence, "Insufficient data density for meaningful figures.");
   }
 
+  const robustEvidence = `numeric_vars=${numericCols.length}, max_model_n=${bestCorrelationPairs}`;
+  if (numericCols.length >= 2 && bestCorrelationPairs >= 40) {
+    pushAssessment("robust_ols", "Robust OLS Inference", "executable_now", 82, robustEvidence, "The data supports OLS with heteroskedasticity-robust standard errors and coefficient intervals.");
+  } else if (numericCols.length >= 2 && bestCorrelationPairs >= 20) {
+    pushAssessment("robust_ols", "Robust OLS Inference", "partially_ready", 56, robustEvidence, "Regression is feasible, but robust inference remains sample-limited.");
+  } else {
+    pushAssessment("robust_ols", "Robust OLS Inference", "blocked", 18, robustEvidence, "Need a stronger paired numeric design for defensible robust inference.");
+  }
+
+  const panelFeEvidence = `entity=${designHints.primaryEntityCol || "none"}, time=${designHints.primaryTimeCol || "none"}, regressor=${designHints.primaryRegressorCol || "none"}, outcome=${designHints.primaryOutcomeCol || "none"}, rows=${rowCount}`;
+  if (designHints.primaryEntityCol && designHints.primaryTimeCol && designHints.primaryOutcomeCol && designHints.primaryRegressorCol && rowCount >= 120) {
+    pushAssessment("panel_fixed_effects", "Panel Fixed Effects", "executable_now", 78, panelFeEvidence, "Entity-time structure and a within-unit regressor/outcome pairing support fixed-effects estimation.");
+  } else if (designHints.primaryEntityCol && designHints.primaryTimeCol && rowCount >= 60) {
+    pushAssessment("panel_fixed_effects", "Panel Fixed Effects", "partially_ready", 52, panelFeEvidence, "Panel structure exists, but stronger within-unit variation or more depth is needed.");
+  } else {
+    pushAssessment("panel_fixed_effects", "Panel Fixed Effects", "blocked", 16, panelFeEvidence, "Need a clearer entity-time panel with repeated observations and a varying regressor.");
+  }
+
+  const didEvidence = `time=${designHints.primaryTimeCol || "none"}, treatment=${designHints.primaryTreatmentCol || "none"}, outcome=${designHints.primaryOutcomeCol || "none"}, rows=${rowCount}`;
+  if (designHints.primaryTimeCol && designHints.primaryTreatmentCol && designHints.primaryOutcomeCol && rowCount >= 80) {
+    pushAssessment("diff_in_diff", "Difference-in-Differences", "executable_now", 74, didEvidence, "A time, treatment, and outcome structure is available for a baseline treated-versus-control DiD design.");
+  } else if (designHints.primaryTimeCol && designHints.primaryTreatmentCol && rowCount >= 50) {
+    pushAssessment("diff_in_diff", "Difference-in-Differences", "partially_ready", 48, didEvidence, "Some DiD ingredients exist, but outcome support or pre/post coverage is still limited.");
+  } else {
+    pushAssessment("diff_in_diff", "Difference-in-Differences", "blocked", 14, didEvidence, "Need explicit treatment assignment, a time axis, and an interpretable outcome.");
+  }
+
+  const eventStudyEvidence = `time=${designHints.primaryTimeCol || "none"}, treatment=${designHints.primaryTreatmentCol || "none"}, entity=${designHints.primaryEntityCol || "none"}, rows=${rowCount}`;
+  if (designHints.primaryTimeCol && designHints.primaryTreatmentCol && designHints.primaryEntityCol && designHints.primaryOutcomeCol && rowCount >= 120) {
+    pushAssessment("event_study", "Event Study", "executable_now", 72, eventStudyEvidence, "Panel timing structure can support dynamic treatment-effect profiling around the intervention date.");
+  } else if (designHints.primaryTimeCol && designHints.primaryTreatmentCol && rowCount >= 80) {
+    pushAssessment("event_study", "Event Study", "partially_ready", 44, eventStudyEvidence, "Event-study diagnostics may be possible, but richer panel timing support is still needed.");
+  } else {
+    pushAssessment("event_study", "Event Study", "blocked", 12, eventStudyEvidence, "Need panel timing structure and enough pre/post observations for dynamic effect estimation.");
+  }
+
+  const scmEvidence = `entity=${designHints.primaryEntityCol || "none"}, time=${designHints.primaryTimeCol || "none"}, treatment=${designHints.primaryTreatmentCol || "none"}, rows=${rowCount}`;
+  if (designHints.primaryEntityCol && designHints.primaryTimeCol && designHints.primaryTreatmentCol && designHints.primaryOutcomeCol && rowCount >= 120) {
+    pushAssessment("synthetic_control", "Synthetic Control", "executable_now", 68, scmEvidence, "A treated unit, donor pool, and panel outcome history are plausibly available for synthetic-control estimation.");
+  } else if (designHints.primaryEntityCol && designHints.primaryTimeCol && rowCount >= 80) {
+    pushAssessment("synthetic_control", "Synthetic Control", "partially_ready", 42, scmEvidence, "Some synthetic-control ingredients exist, but donor coverage or treatment structure remains thin.");
+  } else {
+    pushAssessment("synthetic_control", "Synthetic Control", "blocked", 10, scmEvidence, "Need an identifiable treated unit, a donor pool, and pre-treatment panel history.");
+  }
+
   const advancedTsEvidence = `time_cols=${timeCols.length}, trend_pairs=${bestTimePairs}`;
   if (timeCols.length > 0 && bestTimePairs >= 120) {
     pushAssessment("advanced_time_series", "Advanced Time-Series Modelling", "partially_ready", 62, advancedTsEvidence, "Temporal structure exists; advanced models may be feasible with stronger stationarity diagnostics.");
@@ -2217,6 +3705,42 @@ export function buildMethodApplicabilityAssessment(
     pushAssessment("causal_inference", "Causal Inference", "partially_ready", 55, causalEvidence, "Potential treatment/outcome structure exists, but identification assumptions still need rigorous validation.");
   } else {
     pushAssessment("causal_inference", "Causal Inference", "blocked", 12, causalEvidence, "Identification strategy prerequisites are not fully evidenced in the current data.");
+  }
+
+  const ivEvidence = `instrument=${designHints.primaryInstrumentCol || "none"}, treatment=${designHints.primaryTreatmentCol || "none"}, outcome=${designHints.primaryOutcomeCol || "none"}, rows=${rowCount}`;
+  if (designHints.primaryInstrumentCol && designHints.primaryTreatmentCol && designHints.primaryOutcomeCol && rowCount >= 120) {
+    pushAssessment("iv_2sls", "Instrumental Variables / 2SLS", "executable_now", 70, ivEvidence, "An instrument-like field, treatment, and outcome are available for a baseline just-identified 2SLS specification.");
+  } else if (designHints.primaryInstrumentCol && designHints.primaryTreatmentCol && rowCount >= 80) {
+    pushAssessment("iv_2sls", "Instrumental Variables / 2SLS", "partially_ready", 48, ivEvidence, "Instrument-like structure is present, but more support is needed for defensible first-stage strength and exclusion claims.");
+  } else {
+    pushAssessment("iv_2sls", "Instrumental Variables / 2SLS", "blocked", designHints.primaryInstrumentCol ? 26 : 8, ivEvidence, "Need a credible instrument plus treatment and outcome support.");
+  }
+
+  const rddEvidence = `running=${designHints.primaryRunningCol || "none"}, treatment=${designHints.primaryTreatmentCol || "none"}, outcome=${designHints.primaryOutcomeCol || "none"}, rows=${rowCount}`;
+  if (designHints.primaryRunningCol && designHints.primaryTreatmentCol && designHints.primaryOutcomeCol && rowCount >= 140) {
+    pushAssessment("regression_discontinuity", "Regression Discontinuity", "executable_now", 68, rddEvidence, "Running variable, treatment assignment, and outcome support a baseline local-linear RDD with bandwidth diagnostics.");
+  } else if (designHints.primaryRunningCol && designHints.primaryTreatmentCol && rowCount >= 90) {
+    pushAssessment("regression_discontinuity", "Regression Discontinuity", "partially_ready", 44, rddEvidence, "A running variable exists, but local support around the cutoff may still be thin.");
+  } else {
+    pushAssessment("regression_discontinuity", "Regression Discontinuity", "blocked", designHints.primaryRunningCol ? 24 : 8, rddEvidence, "Need an explicit running variable, cutoff logic, and sufficient local sample support.");
+  }
+
+  const psmEvidence = `treatment=${designHints.primaryTreatmentCol || "none"}, outcome=${designHints.primaryOutcomeCol || "none"}, covariates=${Math.max(0, numericCols.length - 1)}, rows=${rowCount}`;
+  if (designHints.primaryTreatmentCol && designHints.primaryOutcomeCol && numericCols.length >= 4 && rowCount >= 120) {
+    pushAssessment("propensity_score", "Propensity Score Methods", "executable_now", 66, psmEvidence, "Treatment and multiple covariates support a baseline propensity-score weighting design with overlap and balance diagnostics.");
+  } else if (designHints.primaryTreatmentCol && designHints.primaryOutcomeCol && numericCols.length >= 3 && rowCount >= 80) {
+    pushAssessment("propensity_score", "Propensity Score Methods", "partially_ready", 46, psmEvidence, "Treatment and covariates exist, but balance and overlap support may still be limited.");
+  } else {
+    pushAssessment("propensity_score", "Propensity Score Methods", "blocked", 12, psmEvidence, "Need richer treatment/covariate structure for matching or weighting designs.");
+  }
+
+  const quantileEvidence = `numeric_vars=${numericCols.length}, rows=${rowCount}`;
+  if (numericCols.length >= 2 && rowCount >= 120) {
+    pushAssessment("quantile_regression", "Quantile Regression", "executable_now", 72, quantileEvidence, "The sample supports baseline quantile-regression profiling across conditional outcome quantiles.");
+  } else if (numericCols.length >= 2 && rowCount >= 80) {
+    pushAssessment("quantile_regression", "Quantile Regression", "partially_ready", 50, quantileEvidence, "Quantile profiling is plausible, but tail support remains limited.");
+  } else {
+    pushAssessment("quantile_regression", "Quantile Regression", "blocked", 16, quantileEvidence, "Need larger continuous-outcome samples for stable tail estimation.");
   }
 
   const advNlpEvidence = `text_cols=${textCols.length}, docs>=20chars=${textDocumentCount}`;
@@ -2273,7 +3797,7 @@ function getPrimaryDataset(allData: ParsedDataset[]): ParsedDataset | null {
   return best || allData[0];
 }
 
-function generateDefaultCharts(
+export function generateDefaultCharts(
   allData: { name: string; data: Record<string, any>[]; columns: string[]; totalRows: number }[],
   executableMethods: Set<string> | null
 ): { name: string; description: string; config: any }[] {
@@ -2284,6 +3808,19 @@ function generateDefaultCharts(
   const { numericCols: rawNumericCols, categoricalCols, idCols } = classifyColumns(ds.data, ds.columns);
   // Exclude ID/code columns from analysis - they are not meaningful for statistics
   const numericCols = rawNumericCols.filter(c => !idCols.includes(c));
+  const designHints = inferEconometricDesignHints(ds, numericCols, categoricalCols, idCols);
+  const robustOls =
+    designHints.primaryOutcomeCol && designHints.primaryRegressorCol && designHints.primaryOutcomeCol !== designHints.primaryRegressorCol
+      ? computeRobustOls(ds, designHints.primaryRegressorCol, designHints.primaryOutcomeCol)
+      : null;
+  const panelFixedEffects = computePanelFixedEffects(ds, designHints);
+  const diffInDiff = computeDiffInDiff(ds, designHints);
+  const syntheticControl = computeSyntheticControl(ds, designHints);
+  const syntheticControlPlacebos = syntheticControl ? computeSyntheticControlPlacebos(ds, designHints, syntheticControl) : null;
+  const iv2Sls = computeIv2Sls(ds, designHints);
+  const rdd = computeRegressionDiscontinuity(ds, designHints);
+  const propensityScore = computePropensityScore(ds, designHints);
+  const quantileRegression = computeQuantileRegression(ds, designHints);
 
   // Chart 1: Distribution of first numeric column (histogram-like bar chart)
   if (numericCols.length > 0 && methodAllowed(executableMethods, "descriptive_statistics")) {
@@ -3009,6 +4546,545 @@ function generateDefaultCharts(
     }
   }
 
+  if (methodAllowed(executableMethods, "data_visualisation")) {
+    const coefficientRows: Array<{ label: string; low: number; high: number }> = [];
+    if (robustOls && methodAllowed(executableMethods, "robust_ols")) {
+      coefficientRows.push({
+        label: `Robust OLS: ${robustOls.yCol.length > 12 ? `${robustOls.yCol.slice(0, 10)}..` : robustOls.yCol}`,
+        low: Math.round(robustOls.ciLower * 1000) / 1000,
+        high: Math.round(robustOls.ciUpper * 1000) / 1000,
+      });
+    }
+    if (panelFixedEffects && methodAllowed(executableMethods, "panel_fixed_effects")) {
+      coefficientRows.push({
+        label: `Panel FE: ${panelFixedEffects.yCol.length > 12 ? `${panelFixedEffects.yCol.slice(0, 10)}..` : panelFixedEffects.yCol}`,
+        low: Math.round((panelFixedEffects.beta - 1.96 * panelFixedEffects.se) * 1000) / 1000,
+        high: Math.round((panelFixedEffects.beta + 1.96 * panelFixedEffects.se) * 1000) / 1000,
+      });
+    }
+    if (iv2Sls && methodAllowed(executableMethods, "iv_2sls")) {
+      coefficientRows.push({
+        label: `IV 2SLS: ${iv2Sls.yCol.length > 12 ? `${iv2Sls.yCol.slice(0, 10)}..` : iv2Sls.yCol}`,
+        low: Math.round(iv2Sls.ciLower * 1000) / 1000,
+        high: Math.round(iv2Sls.ciUpper * 1000) / 1000,
+      });
+    }
+    if (rdd && methodAllowed(executableMethods, "regression_discontinuity")) {
+      coefficientRows.push({
+        label: `RDD jump: ${rdd.outcomeCol.length > 12 ? `${rdd.outcomeCol.slice(0, 10)}..` : rdd.outcomeCol}`,
+        low: Math.round((rdd.estimate - 1.96 * rdd.se) * 1000) / 1000,
+        high: Math.round((rdd.estimate + 1.96 * rdd.se) * 1000) / 1000,
+      });
+    }
+    if (propensityScore && methodAllowed(executableMethods, "propensity_score")) {
+      coefficientRows.push({
+        label: `IPW ATE: ${propensityScore.outcomeCol.length > 12 ? `${propensityScore.outcomeCol.slice(0, 10)}..` : propensityScore.outcomeCol}`,
+        low: Math.round(propensityScore.ciLower * 1000) / 1000,
+        high: Math.round(propensityScore.ciUpper * 1000) / 1000,
+      });
+    }
+    if (coefficientRows.length > 0) {
+      charts.push({
+        name: "coefficient_interval_plot",
+        description: "Coefficient interval plot for econometric estimators with 95% confidence intervals",
+        config: {
+          type: "bar",
+          data: {
+            labels: coefficientRows.map(row => row.label),
+            datasets: [{
+              label: "95% confidence interval",
+              data: coefficientRows.map(row => [row.low, row.high]),
+              backgroundColor: "rgba(78, 121, 167, 0.45)",
+              borderColor: "rgba(78, 121, 167, 1)",
+              borderWidth: 1,
+            }],
+          },
+          options: {
+            indexAxis: "y" as const,
+            plugins: { title: { display: true, text: "Econometric Coefficient Intervals", font: { size: 16 } } },
+            scales: {
+              x: { title: { display: true, text: "Coefficient range" } },
+              y: { title: { display: true, text: "Estimator" } },
+            },
+          },
+        },
+      });
+    }
+  }
+
+  if (robustOls && methodAllowed(executableMethods, "robust_ols")) {
+    const residualPoints = robustOls.fittedResiduals.slice(0, 200).map(point => ({
+      x: Math.round(point.fitted * 1000) / 1000,
+      y: Math.round(point.residual * 1000) / 1000,
+    }));
+    if (residualPoints.length >= 12) {
+      const fittedValues = residualPoints.map(point => point.x);
+      charts.push({
+        name: "residual_fitted_plot",
+        description: `Residual-versus-fitted diagnostic for robust OLS (${robustOls.yCol} on ${robustOls.xCol})`,
+        config: {
+          type: "scatter",
+          data: {
+            datasets: [
+              {
+                label: "Residuals",
+                data: residualPoints,
+                backgroundColor: "rgba(225, 87, 89, 0.55)",
+                borderColor: "rgba(225, 87, 89, 1)",
+                pointRadius: 3,
+              },
+              {
+                label: "Zero line",
+                data: [
+                  { x: Math.min(...fittedValues), y: 0 },
+                  { x: Math.max(...fittedValues), y: 0 },
+                ],
+                showLine: true,
+                pointRadius: 0,
+                borderColor: "rgba(68, 68, 68, 0.9)",
+                borderWidth: 1.5,
+                borderDash: [5, 3],
+              },
+            ],
+          },
+          options: {
+            plugins: { title: { display: true, text: "Residual vs Fitted Diagnostic", font: { size: 16 } } },
+            scales: {
+              x: { title: { display: true, text: "Fitted value" } },
+              y: { title: { display: true, text: "Residual" } },
+            },
+          },
+        },
+      });
+    }
+  }
+
+  if (diffInDiff && methodAllowed(executableMethods, "diff_in_diff")) {
+    charts.push({
+      name: "parallel_trends_plot",
+      description: `Parallel-trends style group means for ${diffInDiff.outcomeCol} around the treatment window`,
+      config: {
+        type: "line",
+        data: {
+          labels: diffInDiff.series.map(point => point.label),
+          datasets: [
+            {
+              label: "Treated mean",
+              data: diffInDiff.series.map(point => Math.round(point.treatedMean * 1000) / 1000),
+              borderColor: "rgba(78, 121, 167, 1)",
+              backgroundColor: "rgba(78, 121, 167, 0.12)",
+              tension: 0.15,
+            },
+            {
+              label: "Control mean",
+              data: diffInDiff.series.map(point => Math.round(point.controlMean * 1000) / 1000),
+              borderColor: "rgba(242, 142, 43, 1)",
+              backgroundColor: "rgba(242, 142, 43, 0.12)",
+              tension: 0.15,
+            },
+          ],
+        },
+        options: {
+          plugins: { title: { display: true, text: "Parallel Trends Diagnostic", font: { size: 16 } } },
+          scales: {
+            x: { title: { display: true, text: diffInDiff.timeCol } },
+            y: { title: { display: true, text: diffInDiff.outcomeCol } },
+          },
+        },
+      },
+    });
+  }
+
+  if (diffInDiff && methodAllowed(executableMethods, "event_study")) {
+    charts.push({
+      name: "event_study_plot",
+      description: `Event-study profile for ${diffInDiff.outcomeCol} relative to the pre-treatment baseline`,
+      config: {
+        type: "line",
+        data: {
+          labels: diffInDiff.series.map(point => String(point.relIndex)),
+          datasets: [
+            {
+              label: "Relative effect",
+              data: diffInDiff.series.map(point => Math.round(point.effect * 1000) / 1000),
+              borderColor: "rgba(89, 161, 79, 1)",
+              backgroundColor: "rgba(89, 161, 79, 0.14)",
+              tension: 0.12,
+            },
+            {
+              label: "Zero line",
+              data: diffInDiff.series.map(() => 0),
+              borderColor: "rgba(68, 68, 68, 0.9)",
+              borderWidth: 1.2,
+              borderDash: [5, 3],
+              pointRadius: 0,
+            },
+          ],
+        },
+        options: {
+          plugins: { title: { display: true, text: "Event Study Profile", font: { size: 16 } } },
+          scales: {
+            x: { title: { display: true, text: "Relative period" } },
+            y: { title: { display: true, text: "Effect vs baseline" } },
+          },
+        },
+      },
+    });
+  }
+
+  if (syntheticControl && methodAllowed(executableMethods, "synthetic_control")) {
+    charts.push({
+      name: "synthetic_control_path",
+      description: `Observed versus synthetic trajectory for ${syntheticControl.treatedUnit}`,
+      config: {
+        type: "line",
+        data: {
+          labels: syntheticControl.series.map(point => point.label),
+          datasets: [
+            {
+              label: `Observed: ${syntheticControl.treatedUnit}`,
+              data: syntheticControl.series.map(point => Math.round(point.treated * 1000) / 1000),
+              borderColor: "rgba(78, 121, 167, 1)",
+              backgroundColor: "rgba(78, 121, 167, 0.1)",
+              tension: 0.12,
+            },
+            {
+              label: "Synthetic control",
+              data: syntheticControl.series.map(point => Math.round(point.synthetic * 1000) / 1000),
+              borderColor: "rgba(225, 87, 89, 1)",
+              backgroundColor: "rgba(225, 87, 89, 0.08)",
+              tension: 0.12,
+            },
+          ],
+        },
+        options: {
+          plugins: { title: { display: true, text: "Synthetic Control Trajectory", font: { size: 16 } } },
+          scales: {
+            x: { title: { display: true, text: syntheticControl.timeCol } },
+            y: { title: { display: true, text: syntheticControl.outcomeCol } },
+          },
+        },
+      },
+    });
+
+    charts.push({
+      name: "synthetic_control_gap",
+      description: `Gap plot for ${syntheticControl.treatedUnit} minus its synthetic control`,
+      config: {
+        type: "line",
+        data: {
+          labels: syntheticControl.series.map(point => point.label),
+          datasets: [
+            {
+              label: "Gap",
+              data: syntheticControl.series.map(point => Math.round(point.gap * 1000) / 1000),
+              borderColor: "rgba(118, 183, 178, 1)",
+              backgroundColor: "rgba(118, 183, 178, 0.14)",
+              tension: 0.12,
+            },
+            {
+              label: "Zero line",
+              data: syntheticControl.series.map(() => 0),
+              borderColor: "rgba(68, 68, 68, 0.9)",
+              borderWidth: 1.2,
+              borderDash: [5, 3],
+              pointRadius: 0,
+            },
+          ],
+        },
+        options: {
+          plugins: { title: { display: true, text: "Synthetic Control Gap Plot", font: { size: 16 } } },
+          scales: {
+            x: { title: { display: true, text: syntheticControl.timeCol } },
+            y: { title: { display: true, text: "Observed - synthetic" } },
+          },
+        },
+      },
+    });
+
+    const topWeights = syntheticControl.weights.slice(0, 8);
+    if (topWeights.length > 0) {
+      charts.push({
+        name: "synthetic_control_weights",
+        description: `Donor weights for the synthetic control of ${syntheticControl.treatedUnit}`,
+        config: {
+          type: "bar",
+          data: {
+            labels: topWeights.map(item => item.unit.length > 16 ? `${item.unit.slice(0, 13)}...` : item.unit),
+            datasets: [{
+              label: "Weight",
+              data: topWeights.map(item => Math.round(item.weight * 1000) / 1000),
+              backgroundColor: "rgba(237, 201, 73, 0.75)",
+              borderColor: "rgba(237, 201, 73, 1)",
+              borderWidth: 1,
+            }],
+          },
+          options: {
+            indexAxis: "y" as const,
+            plugins: { title: { display: true, text: "Synthetic Control Donor Weights", font: { size: 16 } } },
+            scales: {
+              x: { title: { display: true, text: "Weight" } },
+              y: { title: { display: true, text: "Donor unit" } },
+            },
+          },
+        },
+      });
+    }
+  }
+
+  if (syntheticControlPlacebos && methodAllowed(executableMethods, "synthetic_control")) {
+    const placeboBars = syntheticControlPlacebos.ratios.slice(0, 10);
+    charts.push({
+      name: "synthetic_control_placebo_rmspe",
+      description: `Placebo RMSPE ratios for synthetic control around ${syntheticControlPlacebos.treatedUnit}`,
+      config: {
+        type: "bar",
+        data: {
+          labels: placeboBars.map(item => item.unit.length > 16 ? `${item.unit.slice(0, 13)}...` : item.unit),
+          datasets: [{
+            label: "Post / pre RMSPE",
+            data: placeboBars.map(item => Math.round(item.ratio * 1000) / 1000),
+            backgroundColor: placeboBars.map(item => item.isActual ? "rgba(225, 87, 89, 0.8)" : "rgba(78, 121, 167, 0.65)"),
+            borderColor: placeboBars.map(item => item.isActual ? "rgba(225, 87, 89, 1)" : "rgba(78, 121, 167, 1)"),
+            borderWidth: 1,
+          }],
+        },
+        options: {
+          plugins: { title: { display: true, text: "Synthetic Control Placebo RMSPE Ratios", font: { size: 16 } } },
+          scales: {
+            x: { title: { display: true, text: "Pseudo-treated unit" } },
+            y: { title: { display: true, text: "Post / pre RMSPE" } },
+          },
+        },
+      },
+    });
+  }
+
+  if (iv2Sls && methodAllowed(executableMethods, "iv_2sls")) {
+    const firstStageLine = regressionStatsFromPairs(iv2Sls.firstStagePoints.map(point => [point.x, point.y] as [number, number]));
+    if (firstStageLine) {
+      const xMin = Math.min(...iv2Sls.firstStagePoints.map(point => point.x));
+      const xMax = Math.max(...iv2Sls.firstStagePoints.map(point => point.x));
+      charts.push({
+        name: "iv_first_stage_plot",
+        description: `First-stage relevance plot for instrument ${iv2Sls.zCol} and treatment ${iv2Sls.xCol}`,
+        config: {
+          type: "scatter",
+          data: {
+            datasets: [
+              {
+                label: "Observed first stage",
+                data: iv2Sls.firstStagePoints.slice(0, 200),
+                backgroundColor: "rgba(78, 121, 167, 0.55)",
+                borderColor: "rgba(78, 121, 167, 1)",
+                pointRadius: 3,
+              },
+              {
+                label: "First-stage fit",
+                data: [
+                  { x: xMin, y: firstStageLine.intercept + firstStageLine.slope * xMin },
+                  { x: xMax, y: firstStageLine.intercept + firstStageLine.slope * xMax },
+                ],
+                showLine: true,
+                pointRadius: 0,
+                borderColor: "rgba(225, 87, 89, 1)",
+                borderWidth: 2,
+              },
+            ],
+          },
+          options: {
+            plugins: { title: { display: true, text: "IV First-Stage Relevance", font: { size: 16 } } },
+            scales: {
+              x: { title: { display: true, text: iv2Sls.zCol } },
+              y: { title: { display: true, text: iv2Sls.xCol } },
+            },
+          },
+        },
+      });
+    }
+  }
+
+  if (rdd && methodAllowed(executableMethods, "regression_discontinuity")) {
+    const leftBins = rdd.bins.filter(point => point.side === "left").map(point => ({ x: point.x, y: point.y }));
+    const rightBins = rdd.bins.filter(point => point.side === "right").map(point => ({ x: point.x, y: point.y }));
+    const fitLeft = rdd.fitLine.filter(point => point.side === "left").map(point => ({ x: point.x, y: point.y }));
+    const fitRight = rdd.fitLine.filter(point => point.side === "right").map(point => ({ x: point.x, y: point.y }));
+    const yValues = rdd.bins.map(point => point.y);
+    charts.push({
+      name: "rdd_plot",
+      description: `RDD local-linear plot for ${rdd.outcomeCol} around cutoff ${Math.round(rdd.cutoff * 1000) / 1000}`,
+      config: {
+        type: "scatter",
+        data: {
+          datasets: [
+            {
+              label: "Left-of-cutoff bins",
+              data: leftBins,
+              backgroundColor: "rgba(78, 121, 167, 0.7)",
+              borderColor: "rgba(78, 121, 167, 1)",
+              pointRadius: 4,
+            },
+            {
+              label: "Right-of-cutoff bins",
+              data: rightBins,
+              backgroundColor: "rgba(225, 87, 89, 0.7)",
+              borderColor: "rgba(225, 87, 89, 1)",
+              pointRadius: 4,
+            },
+            {
+              label: "Left fit",
+              data: fitLeft,
+              showLine: true,
+              pointRadius: 0,
+              borderColor: "rgba(78, 121, 167, 1)",
+              borderWidth: 2,
+            },
+            {
+              label: "Right fit",
+              data: fitRight,
+              showLine: true,
+              pointRadius: 0,
+              borderColor: "rgba(225, 87, 89, 1)",
+              borderWidth: 2,
+            },
+            {
+              label: "Cutoff",
+              data: [
+                { x: rdd.cutoff, y: Math.min(...yValues) },
+                { x: rdd.cutoff, y: Math.max(...yValues) },
+              ],
+              showLine: true,
+              pointRadius: 0,
+              borderColor: "rgba(68, 68, 68, 0.9)",
+              borderWidth: 1.2,
+              borderDash: [5, 3],
+            },
+          ],
+        },
+        options: {
+          plugins: { title: { display: true, text: "Regression Discontinuity Plot", font: { size: 16 } } },
+          scales: {
+            x: { title: { display: true, text: rdd.runningCol } },
+            y: { title: { display: true, text: rdd.outcomeCol } },
+          },
+        },
+      },
+    });
+  }
+
+  if (propensityScore && methodAllowed(executableMethods, "propensity_score")) {
+    const binCount = 10;
+    const treatedBins = Array(binCount).fill(0);
+    const controlBins = Array(binCount).fill(0);
+    for (const row of propensityScore.scoreRows) {
+      const index = Math.min(binCount - 1, Math.max(0, Math.floor(row.score * binCount)));
+      if (row.treatment === 1) treatedBins[index]++;
+      else controlBins[index]++;
+    }
+    const labels = Array.from({ length: binCount }, (_, index) => `${(index / binCount).toFixed(1)}-${((index + 1) / binCount).toFixed(1)}`);
+    charts.push({
+      name: "propensity_overlap_plot",
+      description: `Propensity-score overlap diagnostic for ${propensityScore.treatmentCol}`,
+      config: {
+        type: "bar",
+        data: {
+          labels,
+          datasets: [
+            {
+              label: "Treated",
+              data: treatedBins,
+              backgroundColor: "rgba(78, 121, 167, 0.65)",
+              borderColor: "rgba(78, 121, 167, 1)",
+              borderWidth: 1,
+            },
+            {
+              label: "Control",
+              data: controlBins,
+              backgroundColor: "rgba(242, 142, 43, 0.65)",
+              borderColor: "rgba(242, 142, 43, 1)",
+              borderWidth: 1,
+            },
+          ],
+        },
+        options: {
+          plugins: { title: { display: true, text: "Propensity Score Overlap", font: { size: 16 } } },
+          scales: {
+            x: { title: { display: true, text: "Propensity-score bin" } },
+            y: { title: { display: true, text: "Count" } },
+          },
+        },
+      },
+    });
+
+    const topBalance = propensityScore.balance
+      .slice()
+      .sort((a, b) => Math.abs(b.smdBefore) - Math.abs(a.smdBefore))
+      .slice(0, 8);
+    charts.push({
+      name: "love_plot",
+      description: `Love plot of absolute standardised mean differences before and after weighting`,
+      config: {
+        type: "line",
+        data: {
+          labels: topBalance.map(item => item.covariate.length > 18 ? `${item.covariate.slice(0, 15)}...` : item.covariate),
+          datasets: [
+            {
+              label: "Before weighting",
+              data: topBalance.map(item => Math.round(Math.abs(item.smdBefore) * 1000) / 1000),
+              borderColor: "rgba(225, 87, 89, 1)",
+              backgroundColor: "rgba(225, 87, 89, 0.15)",
+              pointRadius: 4,
+              tension: 0,
+            },
+            {
+              label: "After weighting",
+              data: topBalance.map(item => Math.round(Math.abs(item.smdAfter) * 1000) / 1000),
+              borderColor: "rgba(89, 161, 79, 1)",
+              backgroundColor: "rgba(89, 161, 79, 0.15)",
+              pointRadius: 4,
+              tension: 0,
+            },
+          ],
+        },
+        options: {
+          plugins: { title: { display: true, text: "Covariate Balance Love Plot", font: { size: 16 } } },
+          scales: {
+            x: { title: { display: true, text: "Covariate" } },
+            y: { title: { display: true, text: "|Standardised mean difference|" } },
+          },
+        },
+      },
+    });
+  }
+
+  if (quantileRegression && methodAllowed(executableMethods, "quantile_regression")) {
+    charts.push({
+      name: "quantile_regression_profile",
+      description: `Slope profile across conditional quantiles for ${quantileRegression.yCol}`,
+      config: {
+        type: "line",
+        data: {
+          labels: quantileRegression.estimates.map(estimate => estimate.tau.toFixed(2)),
+          datasets: [{
+            label: `Slope of ${quantileRegression.yCol} on ${quantileRegression.xCol}`,
+            data: quantileRegression.estimates.map(estimate => Math.round(estimate.slope * 1000) / 1000),
+            borderColor: "rgba(118, 183, 178, 1)",
+            backgroundColor: "rgba(118, 183, 178, 0.15)",
+            pointRadius: 4,
+            tension: 0,
+          }],
+        },
+        options: {
+          plugins: { title: { display: true, text: "Quantile Regression Coefficient Profile", font: { size: 16 } } },
+          scales: {
+            x: { title: { display: true, text: "Quantile (tau)" } },
+            y: { title: { display: true, text: "Slope" } },
+          },
+        },
+      },
+    });
+  }
+
   return charts;
 }
 
@@ -3031,9 +5107,18 @@ function buildRoutingDiagnostics(
   if (metricKeys.some(k => k.startsWith("mean_") || k.startsWith("std_") || k.startsWith("median_"))) executedMethods.push("descriptive_statistics");
   if (metricKeys.some(k => k.startsWith("strongest_correlation_"))) executedMethods.push("correlation");
   if (metricKeys.some(k => k.startsWith("regression_"))) executedMethods.push("linear_regression");
+  if (metricKeys.some(k => k.startsWith("robust_ols_"))) executedMethods.push("robust_ols");
   if (metricKeys.some(k => k.startsWith("anova_"))) executedMethods.push("group_comparison");
   if (metricKeys.some(k => k.startsWith("time_trend_"))) executedMethods.push("time_trend");
   if (metricKeys.some(k => k.startsWith("text_") || k.startsWith("top_term_"))) executedMethods.push("text_feature_analysis");
+  if (metricKeys.some(k => k.startsWith("panel_fe_"))) executedMethods.push("panel_fixed_effects");
+  if (metricKeys.some(k => k.startsWith("did_"))) executedMethods.push("diff_in_diff");
+  if (metricKeys.some(k => k.startsWith("event_study_"))) executedMethods.push("event_study");
+  if (metricKeys.some(k => k.startsWith("synthetic_control_"))) executedMethods.push("synthetic_control");
+  if (metricKeys.some(k => k.startsWith("iv_2sls_"))) executedMethods.push("iv_2sls");
+  if (metricKeys.some(k => k.startsWith("rdd_"))) executedMethods.push("regression_discontinuity");
+  if (metricKeys.some(k => k.startsWith("propensity_score_"))) executedMethods.push("propensity_score");
+  if (metricKeys.some(k => k.startsWith("quantile_regression_"))) executedMethods.push("quantile_regression");
   if (charts.length > 0) executedMethods.push("data_visualisation");
 
   const executedSet = new Set(executedMethods.map(normaliseMethodId));
@@ -3055,9 +5140,16 @@ function buildRoutingDiagnostics(
   if (blockedMethods.includes("advanced_nlp") && !hasTextLike) unresolvedPrerequisites.push("advanced_nlp: text columns not detected");
   if (blockedMethods.includes("advanced_time_series") && !hasTimeLike) unresolvedPrerequisites.push("advanced_time_series: time index not detected");
   if (blockedMethods.includes("panel_econometrics") && !hasPanelLike) unresolvedPrerequisites.push("panel_econometrics: panel identifiers/time pairing not detected");
+  if (blockedMethods.includes("panel_fixed_effects") && !hasPanelLike) unresolvedPrerequisites.push("panel_fixed_effects: panel identifiers/time pairing not detected");
   if (blockedMethods.includes("graph_modelling") && !hasGraphLike) unresolvedPrerequisites.push("graph_modelling: graph edge/node structure not detected");
   if (blockedMethods.includes("vision_analysis") && !hasImageLike) unresolvedPrerequisites.push("vision_analysis: image/path features not detected");
   if (blockedMethods.includes("causal_inference")) unresolvedPrerequisites.push("causal_inference: identification assumptions not met");
+  if (blockedMethods.includes("diff_in_diff")) unresolvedPrerequisites.push("diff_in_diff: treatment/outcome/time structure not detected");
+  if (blockedMethods.includes("event_study")) unresolvedPrerequisites.push("event_study: dynamic treatment timing support not detected");
+  if (blockedMethods.includes("synthetic_control")) unresolvedPrerequisites.push("synthetic_control: treated unit or donor pool not detected");
+  if (blockedMethods.includes("iv_2sls")) unresolvedPrerequisites.push("iv_2sls: instrument field not detected");
+  if (blockedMethods.includes("regression_discontinuity")) unresolvedPrerequisites.push("regression_discontinuity: running variable/cutoff not detected");
+  if (blockedMethods.includes("propensity_score")) unresolvedPrerequisites.push("propensity_score: treatment/covariate overlap structure not detected");
 
   const requested = executableMethods ? Array.from(executableMethods) : [];
   const skippedExecutableMethods = requested.filter(m => !executedSet.has(normaliseMethodId(m)));
@@ -3090,6 +5182,18 @@ function generateDefaultTables(
   // Exclude ID/code columns from tables - they are not meaningful for descriptive statistics
   const numericCols = rawNumericCols.filter(c => !_idCols2.includes(c));
   const methodAssessments = buildMethodApplicabilityAssessment(ds, numericCols, categoricalCols);
+  const designHints = inferEconometricDesignHints(ds, numericCols, categoricalCols, _idCols2);
+  const robustOls =
+    designHints.primaryOutcomeCol && designHints.primaryRegressorCol && designHints.primaryOutcomeCol !== designHints.primaryRegressorCol
+      ? computeRobustOls(ds, designHints.primaryRegressorCol, designHints.primaryOutcomeCol)
+      : null;
+  const panelFixedEffects = computePanelFixedEffects(ds, designHints);
+  const diffInDiff = computeDiffInDiff(ds, designHints);
+  const syntheticControl = computeSyntheticControl(ds, designHints);
+  const iv2Sls = computeIv2Sls(ds, designHints);
+  const rdd = computeRegressionDiscontinuity(ds, designHints);
+  const propensityScore = computePropensityScore(ds, designHints);
+  const quantileRegression = computeQuantileRegression(ds, designHints);
 
   // Table 1: Descriptive statistics of numeric variables
   if (numericCols.length > 0 && methodAllowed(executableMethods, "descriptive_statistics")) {
@@ -3409,10 +5513,159 @@ function generateDefaultTables(
     });
   }
 
+  if (robustOls && methodAllowed(executableMethods, "robust_ols")) {
+    tables.push({
+      name: "robust_ols_results",
+      description: `Heteroskedasticity-robust OLS results for ${robustOls.yCol} on ${robustOls.xCol}`,
+      headers: ["Outcome", "Regressor", "Coeff", "Robust SE", "t-stat", "p-value", "95% CI", "R2", "Adj R2", "N"],
+      rows: [[
+        robustOls.yCol.length > 18 ? `${robustOls.yCol.slice(0, 15)}...` : robustOls.yCol,
+        robustOls.xCol.length > 18 ? `${robustOls.xCol.slice(0, 15)}...` : robustOls.xCol,
+        Math.round(robustOls.slope * 10000) / 10000,
+        Math.round(robustOls.seSlope * 10000) / 10000,
+        Math.round(robustOls.tStat * 1000) / 1000,
+        robustOls.pValue < 0.001 ? "<0.001" : robustOls.pValue.toFixed(4),
+        `[${(Math.round(robustOls.ciLower * 1000) / 1000).toFixed(3)}, ${(Math.round(robustOls.ciUpper * 1000) / 1000).toFixed(3)}]`,
+        Math.round(robustOls.r2 * 1000) / 1000,
+        Math.round(robustOls.adjR2 * 1000) / 1000,
+        robustOls.n,
+      ]],
+    });
+  }
+
+  if (panelFixedEffects && methodAllowed(executableMethods, "panel_fixed_effects")) {
+    tables.push({
+      name: "panel_fixed_effects_results",
+      description: `Two-way de-meaned fixed-effects regression for ${panelFixedEffects.yCol} on ${panelFixedEffects.xCol}`,
+      headers: ["Outcome", "Regressor", "Beta", "Robust SE", "t-stat", "p-value", "Within R2", "Entities", "Periods", "N"],
+      rows: [[
+        panelFixedEffects.yCol.length > 18 ? `${panelFixedEffects.yCol.slice(0, 15)}...` : panelFixedEffects.yCol,
+        panelFixedEffects.xCol.length > 18 ? `${panelFixedEffects.xCol.slice(0, 15)}...` : panelFixedEffects.xCol,
+        Math.round(panelFixedEffects.beta * 10000) / 10000,
+        Math.round(panelFixedEffects.se * 10000) / 10000,
+        Math.round(panelFixedEffects.tStat * 1000) / 1000,
+        panelFixedEffects.pValue < 0.001 ? "<0.001" : panelFixedEffects.pValue.toFixed(4),
+        Math.round(panelFixedEffects.r2Within * 1000) / 1000,
+        panelFixedEffects.entities,
+        panelFixedEffects.periods,
+        panelFixedEffects.n,
+      ]],
+    });
+  }
+
+  if (diffInDiff && methodAllowed(executableMethods, "diff_in_diff")) {
+    tables.push({
+      name: "difference_in_differences",
+      description: `Difference-in-differences summary for ${diffInDiff.outcomeCol}`,
+      headers: ["Outcome", "Treatment", "Pre T", "Post T", "Pre C", "Post C", "DiD", "Pre-trend delta", "N"],
+      rows: [[
+        diffInDiff.outcomeCol.length > 18 ? `${diffInDiff.outcomeCol.slice(0, 15)}...` : diffInDiff.outcomeCol,
+        diffInDiff.treatmentCol.length > 18 ? `${diffInDiff.treatmentCol.slice(0, 15)}...` : diffInDiff.treatmentCol,
+        Math.round(diffInDiff.treatedPre * 1000) / 1000,
+        Math.round(diffInDiff.treatedPost * 1000) / 1000,
+        Math.round(diffInDiff.controlPre * 1000) / 1000,
+        Math.round(diffInDiff.controlPost * 1000) / 1000,
+        Math.round(diffInDiff.estimate * 1000) / 1000,
+        Math.round(diffInDiff.preTrendDelta * 1000) / 1000,
+        diffInDiff.n,
+      ]],
+    });
+  }
+
+  if (syntheticControl && methodAllowed(executableMethods, "synthetic_control")) {
+    tables.push({
+      name: "synthetic_control_weights",
+      description: `Synthetic-control donor weights for ${syntheticControl.treatedUnit}`,
+      headers: ["Treated Unit", "Donor Unit", "Weight", "Pre RMSE", "Post RMSE", "Mean Gap Post"],
+      rows: syntheticControl.weights.slice(0, 10).map(item => ([
+        syntheticControl.treatedUnit.length > 18 ? `${syntheticControl.treatedUnit.slice(0, 15)}...` : syntheticControl.treatedUnit,
+        item.unit.length > 18 ? `${item.unit.slice(0, 15)}...` : item.unit,
+        Math.round(item.weight * 1000) / 1000,
+        Math.round(syntheticControl.preRmse * 1000) / 1000,
+        Math.round(syntheticControl.postRmse * 1000) / 1000,
+        Math.round(syntheticControl.attPostMean * 1000) / 1000,
+      ])),
+    });
+  }
+
+  if (iv2Sls && methodAllowed(executableMethods, "iv_2sls")) {
+    tables.push({
+      name: "iv_2sls_results",
+      description: `Baseline just-identified 2SLS results for ${iv2Sls.yCol} on ${iv2Sls.xCol} using ${iv2Sls.zCol}`,
+      headers: ["Outcome", "Endogenous Var", "Instrument", "2SLS Beta", "SE", "t-stat", "p-value", "95% CI", "1st-stage F", "N"],
+      rows: [[
+        iv2Sls.yCol.length > 18 ? `${iv2Sls.yCol.slice(0, 15)}...` : iv2Sls.yCol,
+        iv2Sls.xCol.length > 18 ? `${iv2Sls.xCol.slice(0, 15)}...` : iv2Sls.xCol,
+        iv2Sls.zCol.length > 18 ? `${iv2Sls.zCol.slice(0, 15)}...` : iv2Sls.zCol,
+        Math.round(iv2Sls.beta * 10000) / 10000,
+        Math.round(iv2Sls.se * 10000) / 10000,
+        Math.round(iv2Sls.tStat * 1000) / 1000,
+        iv2Sls.pValue < 0.001 ? "<0.001" : iv2Sls.pValue.toFixed(4),
+        `[${(Math.round(iv2Sls.ciLower * 1000) / 1000).toFixed(3)}, ${(Math.round(iv2Sls.ciUpper * 1000) / 1000).toFixed(3)}]`,
+        Math.round(iv2Sls.firstStageF * 1000) / 1000,
+        iv2Sls.n,
+      ]],
+    });
+  }
+
+  if (rdd && methodAllowed(executableMethods, "regression_discontinuity")) {
+    tables.push({
+      name: "regression_discontinuity_results",
+      description: `Local-linear regression discontinuity summary for ${rdd.outcomeCol}`,
+      headers: ["Outcome", "Running Var", "Treatment Var", "Cutoff", "Bandwidth", "Jump", "SE", "p-value", "N local", "Left/Right N"],
+      rows: [[
+        rdd.outcomeCol.length > 18 ? `${rdd.outcomeCol.slice(0, 15)}...` : rdd.outcomeCol,
+        rdd.runningCol.length > 18 ? `${rdd.runningCol.slice(0, 15)}...` : rdd.runningCol,
+        rdd.treatmentCol.length > 18 ? `${rdd.treatmentCol.slice(0, 15)}...` : rdd.treatmentCol,
+        Math.round(rdd.cutoff * 1000) / 1000,
+        Math.round(rdd.bandwidth * 1000) / 1000,
+        Math.round(rdd.estimate * 1000) / 1000,
+        Math.round(rdd.se * 1000) / 1000,
+        rdd.pValue < 0.001 ? "<0.001" : rdd.pValue.toFixed(4),
+        rdd.nLocal,
+        `${rdd.leftN}/${rdd.rightN}`,
+      ]],
+    });
+  }
+
+  if (propensityScore && methodAllowed(executableMethods, "propensity_score")) {
+    tables.push({
+      name: "propensity_score_balance",
+      description: `Propensity-score balance diagnostics for ${propensityScore.treatmentCol}`,
+      headers: ["Covariate", "Mean T", "Mean C", "Weighted T", "Weighted C", "SMD Before", "SMD After"],
+      rows: propensityScore.balance.map(item => ([
+        item.covariate.length > 18 ? `${item.covariate.slice(0, 15)}...` : item.covariate,
+        Math.round(item.meanTreated * 1000) / 1000,
+        Math.round(item.meanControl * 1000) / 1000,
+        Math.round(item.weightedTreated * 1000) / 1000,
+        Math.round(item.weightedControl * 1000) / 1000,
+        Math.round(item.smdBefore * 1000) / 1000,
+        Math.round(item.smdAfter * 1000) / 1000,
+      ])),
+    });
+  }
+
+  if (quantileRegression && methodAllowed(executableMethods, "quantile_regression")) {
+    tables.push({
+      name: "quantile_regression_results",
+      description: `Quantile-regression slope profile for ${quantileRegression.yCol} on ${quantileRegression.xCol}`,
+      headers: ["Outcome", "Regressor", "Tau", "Intercept", "Slope", "Pseudo R1", "N"],
+      rows: quantileRegression.estimates.map(estimate => ([
+        quantileRegression.yCol.length > 18 ? `${quantileRegression.yCol.slice(0, 15)}...` : quantileRegression.yCol,
+        quantileRegression.xCol.length > 18 ? `${quantileRegression.xCol.slice(0, 15)}...` : quantileRegression.xCol,
+        estimate.tau,
+        Math.round(estimate.intercept * 1000) / 1000,
+        Math.round(estimate.slope * 1000) / 1000,
+        Math.round(estimate.pseudoR1 * 1000) / 1000,
+        quantileRegression.n,
+      ])),
+    });
+  }
+
   return tables;
 }
 
-function generateDefaultMetrics(
+export function generateDefaultMetrics(
   allData: { name: string; data: Record<string, any>[]; columns: string[]; totalRows: number }[],
   executableMethods: Set<string> | null
 ): Record<string, number | string> {
@@ -3448,6 +5701,19 @@ function generateDefaultMetrics(
   // Descriptive stats for meaningful numeric columns only (exclude ID/code columns)
   const meaningfulNumericCols = numericCols.filter(c => !idCols.includes(c));
   const methodAssessments = buildMethodApplicabilityAssessment(ds, meaningfulNumericCols, categoricalCols);
+  const designHints = inferEconometricDesignHints(ds, meaningfulNumericCols, categoricalCols, idCols);
+  const robustOls =
+    designHints.primaryOutcomeCol && designHints.primaryRegressorCol && designHints.primaryOutcomeCol !== designHints.primaryRegressorCol
+      ? computeRobustOls(ds, designHints.primaryRegressorCol, designHints.primaryOutcomeCol)
+      : null;
+  const panelFixedEffects = computePanelFixedEffects(ds, designHints);
+  const diffInDiff = computeDiffInDiff(ds, designHints);
+  const syntheticControl = computeSyntheticControl(ds, designHints);
+  const syntheticControlPlacebos = syntheticControl ? computeSyntheticControlPlacebos(ds, designHints, syntheticControl) : null;
+  const iv2Sls = computeIv2Sls(ds, designHints);
+  const rdd = computeRegressionDiscontinuity(ds, designHints);
+  const propensityScore = computePropensityScore(ds, designHints);
+  const quantileRegression = computeQuantileRegression(ds, designHints);
   const executableNowCount = methodAssessments.filter(item => item.status === "executable_now").length;
   const partiallyReadyCount = methodAssessments.filter(item => item.status === "partially_ready").length;
   const blockedCount = methodAssessments.filter(item => item.status === "blocked").length;
@@ -3590,6 +5856,126 @@ function generateDefaultMetrics(
       metrics[`regression_p_value_${yKey}_on_${xKey}`] = regrPValue < 0.001 ? "<0.001" : (Math.round(regrPValue * 10000) / 10000).toString();
       metrics[`regression_sample_size_${yKey}_on_${xKey}`] = bestModel.n;
     }
+  }
+
+  if (robustOls && methodAllowed(executableMethods, "robust_ols")) {
+    const xKey = metricKeyPart(robustOls.xCol, 16);
+    const yKey = metricKeyPart(robustOls.yCol, 16);
+    metrics[`robust_ols_beta_${yKey}_on_${xKey}`] = Math.round(robustOls.slope * 1000) / 1000;
+    metrics[`robust_ols_se_${yKey}_on_${xKey}`] = Math.round(robustOls.seSlope * 1000) / 1000;
+    metrics[`robust_ols_t_stat_${yKey}_on_${xKey}`] = Math.round(robustOls.tStat * 1000) / 1000;
+    metrics[`robust_ols_p_value_${yKey}_on_${xKey}`] = robustOls.pValue < 0.001 ? "<0.001" : (Math.round(robustOls.pValue * 10000) / 10000).toString();
+    metrics[`robust_ols_ci_low_${yKey}_on_${xKey}`] = Math.round(robustOls.ciLower * 1000) / 1000;
+    metrics[`robust_ols_ci_high_${yKey}_on_${xKey}`] = Math.round(robustOls.ciUpper * 1000) / 1000;
+    metrics[`robust_ols_r2_${yKey}_on_${xKey}`] = Math.round(robustOls.r2 * 1000) / 1000;
+    metrics[`robust_ols_sample_size_${yKey}_on_${xKey}`] = robustOls.n;
+  }
+
+  if (panelFixedEffects && methodAllowed(executableMethods, "panel_fixed_effects")) {
+    const xKey = metricKeyPart(panelFixedEffects.xCol, 16);
+    const yKey = metricKeyPart(panelFixedEffects.yCol, 16);
+    metrics[`panel_fe_beta_${yKey}_on_${xKey}`] = Math.round(panelFixedEffects.beta * 1000) / 1000;
+    metrics[`panel_fe_se_${yKey}_on_${xKey}`] = Math.round(panelFixedEffects.se * 1000) / 1000;
+    metrics[`panel_fe_t_stat_${yKey}_on_${xKey}`] = Math.round(panelFixedEffects.tStat * 1000) / 1000;
+    metrics[`panel_fe_p_value_${yKey}_on_${xKey}`] = panelFixedEffects.pValue < 0.001 ? "<0.001" : (Math.round(panelFixedEffects.pValue * 10000) / 10000).toString();
+    metrics[`panel_fe_within_r2_${yKey}_on_${xKey}`] = Math.round(panelFixedEffects.r2Within * 1000) / 1000;
+    metrics[`panel_fe_entities_${yKey}_on_${xKey}`] = panelFixedEffects.entities;
+    metrics[`panel_fe_periods_${yKey}_on_${xKey}`] = panelFixedEffects.periods;
+    metrics[`panel_fe_sample_size_${yKey}_on_${xKey}`] = panelFixedEffects.n;
+  }
+
+  if (diffInDiff && methodAllowed(executableMethods, "diff_in_diff")) {
+    const outcomeKey = metricKeyPart(diffInDiff.outcomeCol, 16);
+    const treatKey = metricKeyPart(diffInDiff.treatmentCol, 16);
+    metrics[`did_estimate_${outcomeKey}_by_${treatKey}`] = Math.round(diffInDiff.estimate * 1000) / 1000;
+    metrics[`did_treated_pre_${outcomeKey}_by_${treatKey}`] = Math.round(diffInDiff.treatedPre * 1000) / 1000;
+    metrics[`did_treated_post_${outcomeKey}_by_${treatKey}`] = Math.round(diffInDiff.treatedPost * 1000) / 1000;
+    metrics[`did_control_pre_${outcomeKey}_by_${treatKey}`] = Math.round(diffInDiff.controlPre * 1000) / 1000;
+    metrics[`did_control_post_${outcomeKey}_by_${treatKey}`] = Math.round(diffInDiff.controlPost * 1000) / 1000;
+    metrics[`did_pretrend_delta_${outcomeKey}_by_${treatKey}`] = Math.round(diffInDiff.preTrendDelta * 1000) / 1000;
+    metrics[`did_sample_size_${outcomeKey}_by_${treatKey}`] = diffInDiff.n;
+
+    if (methodAllowed(executableMethods, "event_study")) {
+      for (const point of diffInDiff.series.filter(point => point.relIndex >= -3 && point.relIndex <= 4)) {
+        const key = point.relIndex < 0 ? `lead_${Math.abs(point.relIndex)}` : point.relIndex === 0 ? "event_0" : `lag_${point.relIndex}`;
+        metrics[`event_study_${key}_${outcomeKey}_by_${treatKey}`] = Math.round(point.effect * 1000) / 1000;
+      }
+    }
+  }
+
+  if (syntheticControl && methodAllowed(executableMethods, "synthetic_control")) {
+    const outcomeKey = metricKeyPart(syntheticControl.outcomeCol, 16);
+    metrics[`synthetic_control_pre_rmse_${outcomeKey}`] = Math.round(syntheticControl.preRmse * 1000) / 1000;
+    metrics[`synthetic_control_post_rmse_${outcomeKey}`] = Math.round(syntheticControl.postRmse * 1000) / 1000;
+    metrics[`synthetic_control_att_post_${outcomeKey}`] = Math.round(syntheticControl.attPostMean * 1000) / 1000;
+    metrics[`synthetic_control_donor_count_${outcomeKey}`] = syntheticControl.donorCount;
+    metrics[`synthetic_control_treated_unit_${outcomeKey}`] = syntheticControl.treatedUnit;
+    const topWeight = syntheticControl.weights[0];
+    if (topWeight) {
+      metrics[`synthetic_control_top_donor_${outcomeKey}`] = `${topWeight.unit} (${topWeight.weight.toFixed(3)})`;
+    }
+  }
+
+  if (syntheticControlPlacebos && methodAllowed(executableMethods, "synthetic_control")) {
+    const outcomeKey = metricKeyPart(syntheticControl?.outcomeCol || "outcome", 16);
+    metrics[`synthetic_control_placebo_ratio_${outcomeKey}`] = Math.round(syntheticControlPlacebos.actualRatio * 1000) / 1000;
+    metrics[`synthetic_control_placebo_rank_${outcomeKey}`] = syntheticControlPlacebos.actualRank;
+    metrics[`synthetic_control_placebo_count_${outcomeKey}`] = syntheticControlPlacebos.ratios.length;
+  }
+
+  if (iv2Sls && methodAllowed(executableMethods, "iv_2sls")) {
+    const yKey = metricKeyPart(iv2Sls.yCol, 16);
+    const xKey = metricKeyPart(iv2Sls.xCol, 16);
+    const zKey = metricKeyPart(iv2Sls.zCol, 16);
+    metrics[`iv_2sls_beta_${yKey}_on_${xKey}`] = Math.round(iv2Sls.beta * 1000) / 1000;
+    metrics[`iv_2sls_se_${yKey}_on_${xKey}`] = Math.round(iv2Sls.se * 1000) / 1000;
+    metrics[`iv_2sls_t_stat_${yKey}_on_${xKey}`] = Math.round(iv2Sls.tStat * 1000) / 1000;
+    metrics[`iv_2sls_p_value_${yKey}_on_${xKey}`] = iv2Sls.pValue < 0.001 ? "<0.001" : (Math.round(iv2Sls.pValue * 10000) / 10000).toString();
+    metrics[`iv_2sls_ci_low_${yKey}_on_${xKey}`] = Math.round(iv2Sls.ciLower * 1000) / 1000;
+    metrics[`iv_2sls_ci_high_${yKey}_on_${xKey}`] = Math.round(iv2Sls.ciUpper * 1000) / 1000;
+    metrics[`iv_2sls_first_stage_f_${xKey}_by_${zKey}`] = Math.round(iv2Sls.firstStageF * 1000) / 1000;
+    metrics[`iv_2sls_first_stage_p_${xKey}_by_${zKey}`] = iv2Sls.firstStagePValue < 0.001 ? "<0.001" : (Math.round(iv2Sls.firstStagePValue * 10000) / 10000).toString();
+    metrics[`iv_2sls_sample_size_${yKey}_on_${xKey}`] = iv2Sls.n;
+  }
+
+  if (rdd && methodAllowed(executableMethods, "regression_discontinuity")) {
+    const outcomeKey = metricKeyPart(rdd.outcomeCol, 16);
+    const runningKey = metricKeyPart(rdd.runningCol, 16);
+    metrics[`rdd_estimate_${outcomeKey}_at_${runningKey}`] = Math.round(rdd.estimate * 1000) / 1000;
+    metrics[`rdd_se_${outcomeKey}_at_${runningKey}`] = Math.round(rdd.se * 1000) / 1000;
+    metrics[`rdd_t_stat_${outcomeKey}_at_${runningKey}`] = Math.round(rdd.tStat * 1000) / 1000;
+    metrics[`rdd_p_value_${outcomeKey}_at_${runningKey}`] = rdd.pValue < 0.001 ? "<0.001" : (Math.round(rdd.pValue * 10000) / 10000).toString();
+    metrics[`rdd_cutoff_${runningKey}`] = Math.round(rdd.cutoff * 1000) / 1000;
+    metrics[`rdd_bandwidth_${runningKey}`] = Math.round(rdd.bandwidth * 1000) / 1000;
+    metrics[`rdd_local_n_${runningKey}`] = rdd.nLocal;
+  }
+
+  if (propensityScore && methodAllowed(executableMethods, "propensity_score")) {
+    const outcomeKey = metricKeyPart(propensityScore.outcomeCol, 16);
+    const treatKey = metricKeyPart(propensityScore.treatmentCol, 16);
+    metrics[`propensity_score_ate_${outcomeKey}_by_${treatKey}`] = Math.round(propensityScore.ate * 1000) / 1000;
+    metrics[`propensity_score_se_${outcomeKey}_by_${treatKey}`] = Math.round(propensityScore.se * 1000) / 1000;
+    metrics[`propensity_score_t_stat_${outcomeKey}_by_${treatKey}`] = Math.round(propensityScore.tStat * 1000) / 1000;
+    metrics[`propensity_score_p_value_${outcomeKey}_by_${treatKey}`] = propensityScore.pValue < 0.001 ? "<0.001" : (Math.round(propensityScore.pValue * 10000) / 10000).toString();
+    metrics[`propensity_score_ci_low_${outcomeKey}_by_${treatKey}`] = Math.round(propensityScore.ciLower * 1000) / 1000;
+    metrics[`propensity_score_ci_high_${outcomeKey}_by_${treatKey}`] = Math.round(propensityScore.ciUpper * 1000) / 1000;
+    metrics[`propensity_score_overlap_min_${treatKey}`] = Math.round(propensityScore.overlapMin * 1000) / 1000;
+    metrics[`propensity_score_overlap_max_${treatKey}`] = Math.round(propensityScore.overlapMax * 1000) / 1000;
+    metrics[`propensity_score_max_abs_smd_before_${treatKey}`] = Math.round(Math.max(...propensityScore.balance.map(item => Math.abs(item.smdBefore))) * 1000) / 1000;
+    metrics[`propensity_score_max_abs_smd_after_${treatKey}`] = Math.round(Math.max(...propensityScore.balance.map(item => Math.abs(item.smdAfter))) * 1000) / 1000;
+    metrics[`propensity_score_sample_size_${outcomeKey}_by_${treatKey}`] = propensityScore.n;
+  }
+
+  if (quantileRegression && methodAllowed(executableMethods, "quantile_regression")) {
+    const outcomeKey = metricKeyPart(quantileRegression.yCol, 16);
+    const regressorKey = metricKeyPart(quantileRegression.xCol, 16);
+    for (const estimate of quantileRegression.estimates) {
+      const tauKey = `q${Math.round(estimate.tau * 100)}`;
+      metrics[`quantile_regression_slope_${tauKey}_${outcomeKey}_on_${regressorKey}`] = Math.round(estimate.slope * 1000) / 1000;
+      metrics[`quantile_regression_intercept_${tauKey}_${outcomeKey}_on_${regressorKey}`] = Math.round(estimate.intercept * 1000) / 1000;
+      metrics[`quantile_regression_pseudo_r1_${tauKey}_${outcomeKey}_on_${regressorKey}`] = Math.round(estimate.pseudoR1 * 1000) / 1000;
+    }
+    metrics[`quantile_regression_sample_size_${outcomeKey}_on_${regressorKey}`] = quantileRegression.n;
   }
 
   // Group comparison (ANOVA-like between/within decomposition)

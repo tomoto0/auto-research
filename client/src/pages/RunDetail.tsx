@@ -137,7 +137,11 @@ export default function RunDetail({ runId }: { runId: string }) {
         }
       } catch {}
     };
-    evtSource.onerror = () => { evtSource.close(); };
+    evtSource.onerror = () => {
+      // Keep the EventSource instance open: browsers auto-reconnect on transient failures.
+      // Closing here can permanently stop live updates during long-running stages.
+      scheduleRefetch();
+    };
     return () => {
       evtSource.close();
       if (refetchTimer) clearTimeout(refetchTimer);

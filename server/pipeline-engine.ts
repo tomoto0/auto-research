@@ -59,6 +59,9 @@ interface ResearchEvidenceProfile {
     hasGroupLike: boolean;
     hasTreatmentLike: boolean;
     hasOutcomeLike: boolean;
+    hasInstrumentLike: boolean;
+    hasRunningLike: boolean;
+    hasContinuousLike: boolean;
   };
   literatureSummary: {
     paperCount: number;
@@ -270,6 +273,34 @@ function normaliseMethodId(raw: string): string {
     visualization: "data_visualisation",
     visualisation: "data_visualisation",
     causal_inference: "causal_inference",
+    robust_regression: "robust_ols",
+    robust_ols: "robust_ols",
+    heteroskedasticity_robust_ols: "robust_ols",
+    hc_robust_ols: "robust_ols",
+    fixed_effects: "panel_fixed_effects",
+    fixed_effect: "panel_fixed_effects",
+    two_way_fixed_effects: "panel_fixed_effects",
+    twfe: "panel_fixed_effects",
+    panel_fixed_effects: "panel_fixed_effects",
+    difference_in_differences: "diff_in_diff",
+    diff_in_diff: "diff_in_diff",
+    did: "diff_in_diff",
+    event_study: "event_study",
+    synthetic_control_method: "synthetic_control",
+    synthetic_control: "synthetic_control",
+    synthetic_controls: "synthetic_control",
+    iv: "iv_2sls",
+    instrumental_variables: "iv_2sls",
+    instrumental_variable: "iv_2sls",
+    two_stage_least_squares: "iv_2sls",
+    iv_2sls: "iv_2sls",
+    regression_discontinuity_design: "regression_discontinuity",
+    regression_discontinuity: "regression_discontinuity",
+    rdd: "regression_discontinuity",
+    propensity_score_matching: "propensity_score",
+    propensity_score_weighting: "propensity_score",
+    propensity_score: "propensity_score",
+    quantile_regression: "quantile_regression",
     graph_neural_network: "graph_modelling",
     gnn: "graph_modelling",
     graph_modelling: "graph_modelling",
@@ -300,14 +331,22 @@ function buildLiteratureMethodSignals(papers: LiteratureResult[]): Record<string
     descriptive_statistics: 0,
     correlation: 0,
     linear_regression: 0,
+    robust_ols: 0,
     group_comparison: 0,
     time_trend: 0,
     text_feature_analysis: 0,
     causal_inference: 0,
+    diff_in_diff: 0,
+    event_study: 0,
+    synthetic_control: 0,
+    iv_2sls: 0,
+    regression_discontinuity: 0,
     graph_modelling: 0,
     vision_analysis: 0,
     panel_econometrics: 0,
+    panel_fixed_effects: 0,
     advanced_time_series: 0,
+    quantile_regression: 0,
     advanced_nlp: 0,
   };
   for (const p of papers) {
@@ -315,14 +354,22 @@ function buildLiteratureMethodSignals(papers: LiteratureResult[]): Record<string
     if (/(descriptive|summary statistics|distribution)/i.test(text)) signals.descriptive_statistics++;
     if (/(correlation|association|pearson|spearman)/i.test(text)) signals.correlation++;
     if (/(regression|ols|glm|logit|probit)/i.test(text)) signals.linear_regression++;
+    if (/(heteroskedasticity[- ]robust|robust standard errors|sandwich estimator|hc1|hc3)/i.test(text)) signals.robust_ols++;
     if (/(anova|t-test|between-group|group comparison|treatment group)/i.test(text)) signals.group_comparison++;
     if (/(time trend|temporal trend|panel year|longitudinal trend)/i.test(text)) signals.time_trend++;
     if (/(text mining|nlp|sentiment|topic model|keyword extraction)/i.test(text)) signals.text_feature_analysis++;
     if (/(causal|difference-in-differences|instrumental variable|propensity score|rdd|synthetic control)/i.test(text)) signals.causal_inference++;
+    if (/(difference-in-differences|did\b|two-way fixed effects)/i.test(text)) signals.diff_in_diff++;
+    if (/(event study|dynamic treatment effect|relative time)/i.test(text)) signals.event_study++;
+    if (/(synthetic control|synthetic controls|donor pool)/i.test(text)) signals.synthetic_control++;
+    if (/(instrumental variable|2sls|two-stage least squares|local average treatment effect)/i.test(text)) signals.iv_2sls++;
+    if (/(regression discontinuity|rdd\b|running variable|forcing variable)/i.test(text)) signals.regression_discontinuity++;
     if (/(graph neural|gnn|network model|graph convolution|edge|node)/i.test(text)) signals.graph_modelling++;
     if (/(computer vision|image classification|visual recognition|cnn)/i.test(text)) signals.vision_analysis++;
     if (/(panel model|fixed effects|random effects|sem|structural equation|gmm)/i.test(text)) signals.panel_econometrics++;
+    if (/(fixed effects|within estimator|panel fixed effects|two-way fixed effects)/i.test(text)) signals.panel_fixed_effects++;
     if (/(arima|var\b|state space model|lstm|forecasting)/i.test(text)) signals.advanced_time_series++;
+    if (/(quantile regression|conditional quantile)/i.test(text)) signals.quantile_regression++;
     if (/(transformer|bert|deep learning|neural network|embedding model|large language model)/i.test(text)) signals.advanced_nlp++;
   }
   return signals;
@@ -338,6 +385,8 @@ function buildResearchEvidenceProfile(topic: string, datasets: DatasetInfo[], pa
   const hasGroupLike = allCols.some(c => /(group|category|class|type|segment|gender|sex|region|prefecture|country|state|city|occupation|industry|cohort)/i.test(c));
   const hasTreatmentLike = allCols.some(c => /(treat|treatment|intervention|policy|program|exposure|assignment)/i.test(c));
   const hasOutcomeLike = allCols.some(c => /(outcome|target|response|score|rate|risk|income|wage|price|cost|value|metric|performance)/i.test(c));
+  const hasInstrumentLike = allCols.some(c => /(instrument|iv|encouragement|eligib|distance|shiftshare|shock|assignment)/i.test(c));
+  const hasRunningLike = allCols.some(c => /(running|forcing|cutoff|threshold|score|distance|margin|rank)/i.test(c));
   const hasContinuousLike = allCols.some(c => /(score|rate|ratio|index|income|wage|price|cost|count|amount|duration|age|height|weight|value|metric|measure)/i.test(c));
   const totalRowsHint = datasets.reduce((sum, ds) => sum + (ds.rowCount || 0), 0);
   const methodSignals = buildLiteratureMethodSignals(papers);
@@ -346,10 +395,19 @@ function buildResearchEvidenceProfile(topic: string, datasets: DatasetInfo[], pa
     datasets.length > 0 ? "descriptive_statistics" : "",
     datasets.length > 0 ? "correlation" : "",
     totalRowsHint >= 30 && (hasContinuousLike || allCols.length >= 3) ? "linear_regression" : "",
+    totalRowsHint >= 40 && (hasContinuousLike || allCols.length >= 4) ? "robust_ols" : "",
     hasTimeLike ? "time_trend" : "",
     hasTextLike ? "text_feature_analysis" : "",
     datasets.length > 0 ? "data_visualisation" : "",
     hasGroupLike ? "group_comparison" : "",
+    hasPanelLike && totalRowsHint >= 120 ? "panel_fixed_effects" : "",
+    hasTreatmentLike && hasOutcomeLike && hasTimeLike && totalRowsHint >= 80 ? "diff_in_diff" : "",
+    hasTreatmentLike && hasOutcomeLike && hasTimeLike && hasPanelLike && totalRowsHint >= 120 ? "event_study" : "",
+    hasTreatmentLike && hasOutcomeLike && hasTimeLike && hasPanelLike && totalRowsHint >= 120 ? "synthetic_control" : "",
+    hasInstrumentLike && hasTreatmentLike && (hasOutcomeLike || hasContinuousLike) && totalRowsHint >= 120 ? "iv_2sls" : "",
+    hasRunningLike && hasTreatmentLike && (hasOutcomeLike || hasContinuousLike) && totalRowsHint >= 140 ? "regression_discontinuity" : "",
+    hasTreatmentLike && (hasOutcomeLike || hasContinuousLike) && hasContinuousLike && totalRowsHint >= 120 ? "propensity_score" : "",
+    hasContinuousLike && totalRowsHint >= 120 ? "quantile_regression" : "",
   ].filter(Boolean));
 
   const constrainedMethods = uniqMethodIds([
@@ -358,7 +416,11 @@ function buildResearchEvidenceProfile(topic: string, datasets: DatasetInfo[], pa
     !hasImageLike ? "vision_analysis" : "",
     !hasPanelLike || totalRowsHint < 120 ? "panel_econometrics" : "",
     !hasTimeLike || totalRowsHint < 120 ? "advanced_time_series" : "",
-    "causal_inference",
+    !(hasOutcomeLike && totalRowsHint >= 200) ? "causal_inference" : "",
+    !(hasInstrumentLike && hasTreatmentLike && (hasOutcomeLike || hasContinuousLike) && totalRowsHint >= 120) ? "iv_2sls" : "",
+    !(hasRunningLike && hasTreatmentLike && (hasOutcomeLike || hasContinuousLike) && totalRowsHint >= 140) ? "regression_discontinuity" : "",
+    !(hasTreatmentLike && (hasOutcomeLike || hasContinuousLike) && hasContinuousLike && totalRowsHint >= 120) ? "propensity_score" : "",
+    !(hasContinuousLike && totalRowsHint >= 120) ? "quantile_regression" : "",
   ].filter(Boolean));
 
   return {
@@ -373,6 +435,9 @@ function buildResearchEvidenceProfile(topic: string, datasets: DatasetInfo[], pa
       hasGroupLike,
       hasTreatmentLike,
       hasOutcomeLike,
+      hasInstrumentLike,
+      hasRunningLike,
+      hasContinuousLike,
     },
     literatureSummary: {
       paperCount: papers.length,
@@ -390,12 +455,21 @@ function buildMethodologyApplicabilityGuide(profile: ResearchEvidenceProfile): s
     `- descriptive_statistics: ${d.datasetCount > 0 ? "executable_now" : "blocked"} | prereq: tabular rows >= 10 | evidence: datasets=${d.datasetCount}, rows~${rowsHint}`,
     `- correlation: ${d.datasetCount > 0 ? "executable_now" : "blocked"} | prereq: >=2 numeric measures with paired values | evidence: datasets=${d.datasetCount}`,
     `- linear_regression: ${rowsHint >= 30 ? "executable_now" : "partially_ready"} | prereq: rows >= 30 + meaningful dependent/independent variables | evidence: rows~${rowsHint}`,
+    `- robust_ols: ${rowsHint >= 40 ? "executable_now" : "partially_ready"} | prereq: OLS-ready data + heteroskedasticity-robust inference | evidence: rows~${rowsHint}`,
     `- group_comparison: ${d.hasGroupLike ? "executable_now" : "partially_ready"} | prereq: categorical groups + numeric outcome | evidence: group_like=${d.hasGroupLike ? "yes" : "no"}`,
     `- time_trend: ${d.hasTimeLike ? "executable_now" : "blocked"} | prereq: explicit time index + numeric outcome | evidence: time_like=${d.hasTimeLike ? "yes" : "no"}`,
     `- text_feature_analysis: ${d.hasTextLike ? "executable_now" : "blocked"} | prereq: text columns + adequate text volume | evidence: text_like=${d.hasTextLike ? "yes" : "no"}`,
+    `- panel_fixed_effects: ${d.hasPanelLike && rowsHint >= 120 ? "executable_now" : "blocked"} | prereq: entity id + time index + within-unit variation | evidence: panel_like=${d.hasPanelLike ? "yes" : "no"}, rows~${rowsHint}`,
+    `- diff_in_diff: ${d.hasTreatmentLike && d.hasOutcomeLike && d.hasTimeLike && rowsHint >= 80 ? "executable_now" : "blocked"} | prereq: treated/control structure + pre/post window | evidence: treatment_like=${d.hasTreatmentLike ? "yes" : "no"}, outcome_like=${d.hasOutcomeLike ? "yes" : "no"}, time_like=${d.hasTimeLike ? "yes" : "no"}`,
+    `- event_study: ${d.hasTreatmentLike && d.hasOutcomeLike && d.hasTimeLike && d.hasPanelLike && rowsHint >= 120 ? "executable_now" : "blocked"} | prereq: staggered or well-defined treatment timing + pre/post support | evidence: treatment_like=${d.hasTreatmentLike ? "yes" : "no"}, panel_like=${d.hasPanelLike ? "yes" : "no"}, rows~${rowsHint}`,
+    `- synthetic_control: ${d.hasTreatmentLike && d.hasOutcomeLike && d.hasTimeLike && d.hasPanelLike && rowsHint >= 120 ? "executable_now" : "blocked"} | prereq: identifiable treated unit(s) + donor pool + pre-period fit | evidence: treatment_like=${d.hasTreatmentLike ? "yes" : "no"}, panel_like=${d.hasPanelLike ? "yes" : "no"}, rows~${rowsHint}`,
     `- advanced_time_series: ${d.hasTimeLike && rowsHint >= 120 ? "partially_ready" : "blocked"} | prereq: long time horizon + stationarity diagnostics | evidence: time_like=${d.hasTimeLike ? "yes" : "no"}, rows~${rowsHint}`,
     `- panel_econometrics: ${d.hasPanelLike && rowsHint >= 120 ? "partially_ready" : "blocked"} | prereq: entity id + time panel + sufficient entities | evidence: panel_like=${d.hasPanelLike ? "yes" : "no"}, rows~${rowsHint}`,
     `- causal_inference: ${d.hasTreatmentLike && d.hasOutcomeLike && d.hasTimeLike ? "partially_ready" : "blocked"} | prereq: identification strategy + treatment/outcome + assumptions | evidence: treatment_like=${d.hasTreatmentLike ? "yes" : "no"}, outcome_like=${d.hasOutcomeLike ? "yes" : "no"}, time_like=${d.hasTimeLike ? "yes" : "no"}`,
+    `- iv_2sls: ${d.hasInstrumentLike && d.hasTreatmentLike && (d.hasOutcomeLike || d.hasContinuousLike) && rowsHint >= 120 ? "executable_now" : "blocked"} | prereq: valid instrument + first-stage strength + exclusion restriction | evidence: instrument_like=${d.hasInstrumentLike ? "yes" : "no"}, treatment_like=${d.hasTreatmentLike ? "yes" : "no"}, rows~${rowsHint}`,
+    `- regression_discontinuity: ${d.hasRunningLike && d.hasTreatmentLike && (d.hasOutcomeLike || d.hasContinuousLike) && rowsHint >= 140 ? "executable_now" : "blocked"} | prereq: running variable + cutoff + local continuity assumptions | evidence: running_like=${d.hasRunningLike ? "yes" : "no"}, treatment_like=${d.hasTreatmentLike ? "yes" : "no"}, rows~${rowsHint}`,
+    `- propensity_score: ${d.hasTreatmentLike && (d.hasOutcomeLike || d.hasContinuousLike) && d.hasContinuousLike && rowsHint >= 120 ? "executable_now" : "blocked"} | prereq: treatment assignment model + overlap/balance | evidence: treatment_like=${d.hasTreatmentLike ? "yes" : "no"}, continuous_like=${d.hasContinuousLike ? "yes" : "no"}, rows~${rowsHint}`,
+    `- quantile_regression: ${d.hasContinuousLike && rowsHint >= 120 ? "executable_now" : "blocked"} | prereq: continuous outcome + adequate tail support | evidence: continuous_like=${d.hasContinuousLike ? "yes" : "no"}, rows~${rowsHint}`,
     `- advanced_nlp: ${d.hasTextLike && rowsHint >= 300 ? "partially_ready" : "blocked"} | prereq: large text corpus + validation resources | evidence: text_like=${d.hasTextLike ? "yes" : "no"}, rows~${rowsHint}`,
     `- graph_modelling: ${d.hasGraphLike ? "partially_ready" : "blocked"} | prereq: explicit node/edge structure | evidence: graph_like=${d.hasGraphLike ? "yes" : "no"}`,
     `- vision_analysis: ${d.hasImageLike ? "partially_ready" : "blocked"} | prereq: image assets/features + labels | evidence: image_like=${d.hasImageLike ? "yes" : "no"}`,
@@ -425,6 +499,7 @@ function deriveFallbackMethodContract(methodologyText: string, profile: Research
   const blockedReasons: Record<string, string> = {};
 
   if (/(regression|ols|logit|probit)/i.test(lower)) executable.add("linear_regression");
+  if (/(robust standard errors|robust ols|hc1|hc3|heteroskedasticity[- ]robust)/i.test(lower)) executable.add("robust_ols");
   if (/(correlation|association|pearson|spearman)/i.test(lower)) executable.add("correlation");
   if (/(anova|t-test|group comparison|between-group)/i.test(lower)) executable.add("group_comparison");
   if (/(time trend|time-series|arima|var\b|lstm)/i.test(lower)) {
@@ -452,6 +527,62 @@ function deriveFallbackMethodContract(methodologyText: string, profile: Research
   if (/(causal|difference-in-differences|instrumental variable|propensity score|rdd|synthetic control)/i.test(lower)) {
     requiresMissing.add("causal_inference");
     blockedReasons.causal_inference = "Current data/identification assumptions are insufficient for robust causal claims.";
+  }
+  if (/(fixed effects|within estimator|two-way fixed effects|twfe)/i.test(lower)) {
+    if (profile.datasetSummary.hasPanelLike && profile.datasetSummary.totalRowsHint >= 120) executable.add("panel_fixed_effects");
+    else {
+      requiresMissing.add("panel_fixed_effects");
+      blockedReasons.panel_fixed_effects = "Panel fixed effects requires entity-time panel structure with sufficient repeated observations.";
+    }
+  }
+  if (/(difference-in-differences|did\b)/i.test(lower)) {
+    if (profile.datasetSummary.hasTreatmentLike && profile.datasetSummary.hasOutcomeLike && profile.datasetSummary.hasTimeLike && profile.datasetSummary.totalRowsHint >= 80) executable.add("diff_in_diff");
+    else {
+      requiresMissing.add("diff_in_diff");
+      blockedReasons.diff_in_diff = "Difference-in-differences requires treated/control structure, outcome variables, and pre/post timing support.";
+    }
+  }
+  if (/(event study|dynamic treatment effect|relative time)/i.test(lower)) {
+    if (profile.datasetSummary.hasTreatmentLike && profile.datasetSummary.hasOutcomeLike && profile.datasetSummary.hasTimeLike && profile.datasetSummary.hasPanelLike && profile.datasetSummary.totalRowsHint >= 120) executable.add("event_study");
+    else {
+      requiresMissing.add("event_study");
+      blockedReasons.event_study = "Event-study analysis requires panel timing structure with sufficient pre/post support.";
+    }
+  }
+  if (/(synthetic control|synthetic controls)/i.test(lower)) {
+    if (profile.datasetSummary.hasTreatmentLike && profile.datasetSummary.hasOutcomeLike && profile.datasetSummary.hasTimeLike && profile.datasetSummary.hasPanelLike && profile.datasetSummary.totalRowsHint >= 120) executable.add("synthetic_control");
+    else {
+      requiresMissing.add("synthetic_control");
+      blockedReasons.synthetic_control = "Synthetic control requires a treated unit, donor pool, and pre-treatment panel outcome history.";
+    }
+  }
+  if (/(instrumental variable|2sls|two-stage least squares)/i.test(lower)) {
+    if (profile.datasetSummary.hasInstrumentLike && profile.datasetSummary.hasTreatmentLike && (profile.datasetSummary.hasOutcomeLike || profile.datasetSummary.hasContinuousLike) && profile.datasetSummary.totalRowsHint >= 120) executable.add("iv_2sls");
+    else {
+      requiresMissing.add("iv_2sls");
+      blockedReasons.iv_2sls = "No validated instrument field or exclusion-restriction evidence was detected in the current data metadata.";
+    }
+  }
+  if (/(regression discontinuity|rdd\b|forcing variable|running variable)/i.test(lower)) {
+    if (profile.datasetSummary.hasRunningLike && profile.datasetSummary.hasTreatmentLike && (profile.datasetSummary.hasOutcomeLike || profile.datasetSummary.hasContinuousLike) && profile.datasetSummary.totalRowsHint >= 140) executable.add("regression_discontinuity");
+    else {
+      requiresMissing.add("regression_discontinuity");
+      blockedReasons.regression_discontinuity = "No explicit running variable and cutoff structure was detected in the current data metadata.";
+    }
+  }
+  if (/(propensity score|inverse probability weighting|matching estimator)/i.test(lower)) {
+    if (profile.datasetSummary.hasTreatmentLike && (profile.datasetSummary.hasOutcomeLike || profile.datasetSummary.hasContinuousLike) && profile.datasetSummary.hasContinuousLike && profile.datasetSummary.totalRowsHint >= 120) executable.add("propensity_score");
+    else {
+      requiresMissing.add("propensity_score");
+      blockedReasons.propensity_score = "Propensity-score designs need richer observed covariate support and overlap diagnostics than are currently evidenced.";
+    }
+  }
+  if (/(quantile regression|conditional quantile)/i.test(lower)) {
+    if (profile.datasetSummary.hasContinuousLike && profile.datasetSummary.totalRowsHint >= 120) executable.add("quantile_regression");
+    else {
+      requiresMissing.add("quantile_regression");
+      blockedReasons.quantile_regression = "Quantile regression needs richer continuous-outcome support than is currently evidenced.";
+    }
   }
 
   const executableNow = uniqMethodIds(Array.from(executable).filter(m =>
@@ -538,9 +669,18 @@ function collectExecutedMethodIds(experimentOutput: ExperimentOutput | null): st
   if (keys.some(k => k.startsWith("mean_") || k.startsWith("std_") || k.startsWith("median_"))) inferred.push("descriptive_statistics");
   if (keys.some(k => k.startsWith("strongest_correlation_"))) inferred.push("correlation");
   if (keys.some(k => k.startsWith("regression_"))) inferred.push("linear_regression");
+  if (keys.some(k => k.startsWith("robust_ols_"))) inferred.push("robust_ols");
   if (keys.some(k => k.startsWith("anova_"))) inferred.push("group_comparison");
   if (keys.some(k => k.startsWith("time_trend_"))) inferred.push("time_trend");
   if (keys.some(k => k.startsWith("text_") || k.startsWith("top_term_"))) inferred.push("text_feature_analysis");
+  if (keys.some(k => k.startsWith("panel_fe_"))) inferred.push("panel_fixed_effects");
+  if (keys.some(k => k.startsWith("did_"))) inferred.push("diff_in_diff");
+  if (keys.some(k => k.startsWith("event_study_"))) inferred.push("event_study");
+  if (keys.some(k => k.startsWith("synthetic_control_"))) inferred.push("synthetic_control");
+  if (keys.some(k => k.startsWith("iv_2sls_"))) inferred.push("iv_2sls");
+  if (keys.some(k => k.startsWith("rdd_"))) inferred.push("regression_discontinuity");
+  if (keys.some(k => k.startsWith("propensity_score_"))) inferred.push("propensity_score");
+  if (keys.some(k => k.startsWith("quantile_regression_"))) inferred.push("quantile_regression");
   if ((experimentOutput.charts || []).length > 0) inferred.push("data_visualisation");
   return uniqMethodIds(inferred);
 }
@@ -608,6 +748,15 @@ function buildClaimVerificationReport(ctx: PipelineContext, bodyText: string): C
   const assertive = /\b(we|our|this study)\b.*\b(use|used|apply|applied|implement|implemented|train|trained|estimate|estimated|demonstrate|demonstrated|find|found|show|shows)\b/i;
   const methodPatterns: Array<[string, RegExp]> = [
     ["causal_inference", /(causal|difference-in-differences|instrumental variable|propensity score|synthetic control|rdd)/i],
+    ["robust_ols", /(robust standard errors|hc1|hc3|heteroskedasticity[- ]robust)/i],
+    ["panel_fixed_effects", /(fixed effects|within estimator|two-way fixed effects|twfe)/i],
+    ["diff_in_diff", /(difference-in-differences|did\b)/i],
+    ["event_study", /(event study|dynamic treatment effect|relative time)/i],
+    ["synthetic_control", /(synthetic control|synthetic donor)/i],
+    ["iv_2sls", /(instrumental variable|2sls|two-stage least squares)/i],
+    ["regression_discontinuity", /(regression discontinuity|rdd\b|running variable|forcing variable)/i],
+    ["propensity_score", /(propensity score|inverse probability weighting|matching estimator)/i],
+    ["quantile_regression", /(quantile regression|conditional quantile)/i],
     ["graph_modelling", /(graph neural|gnn|graph convolution|network embedding)/i],
     ["vision_analysis", /(computer vision|image model|cnn|visual analysis)/i],
     ["advanced_nlp", /(transformer|bert|topic model|deep learning|embedding model|llm)/i],
@@ -674,6 +823,8 @@ function getAnalyticalMetricEntries(experimentOutput: ExperimentOutput | null): 
   const analyticalPrefixes = [
     "mean_", "std_", "median_", "min_", "max_",
     "strongest_correlation_", "p_value_", "regression_",
+    "robust_ols_", "panel_fe_", "did_", "event_study_", "synthetic_control_",
+    "iv_2sls_", "rdd_", "propensity_score_", "quantile_regression_",
     "anova_", "time_trend_", "text_", "top_",
     "method_readiness_",
   ];
@@ -708,6 +859,33 @@ function collectExecutedMethods(experimentOutput: ExperimentOutput | null): stri
   if (metricKeys.some(k => k.startsWith("regression_"))) {
     methods.add("linear regression");
   }
+  if (metricKeys.some(k => k.startsWith("robust_ols_"))) {
+    methods.add("robust OLS inference");
+  }
+  if (metricKeys.some(k => k.startsWith("panel_fe_"))) {
+    methods.add("panel fixed effects");
+  }
+  if (metricKeys.some(k => k.startsWith("did_"))) {
+    methods.add("difference-in-differences");
+  }
+  if (metricKeys.some(k => k.startsWith("event_study_"))) {
+    methods.add("event-study profiling");
+  }
+  if (metricKeys.some(k => k.startsWith("synthetic_control_"))) {
+    methods.add("synthetic control analysis");
+  }
+  if (metricKeys.some(k => k.startsWith("iv_2sls_"))) {
+    methods.add("instrumental variables / 2SLS");
+  }
+  if (metricKeys.some(k => k.startsWith("rdd_"))) {
+    methods.add("regression discontinuity");
+  }
+  if (metricKeys.some(k => k.startsWith("propensity_score_"))) {
+    methods.add("propensity-score weighting");
+  }
+  if (metricKeys.some(k => k.startsWith("quantile_regression_"))) {
+    methods.add("quantile regression");
+  }
   if (metricKeys.some(k => k.startsWith("anova_") || k.startsWith("group_"))) {
     methods.add("group comparison analysis");
   }
@@ -730,22 +908,49 @@ function collectExecutedMethods(experimentOutput: ExperimentOutput | null): stri
 function detectLikelyOverclaims(methodologyText: string, executedMethods: string[]): string[] {
   if (!methodologyText) return [];
   const lower = methodologyText.toLowerCase();
-  const hasMethod = (needle: string) => executedMethods.some(m => m.toLowerCase().includes(needle));
+  const executed = new Set<string>(executedMethods.map(normaliseMethodId));
   const overclaims: string[] = [];
 
-  if (/(causal|difference-in-differences|instrumental variable|propensity score|rdd|synthetic control)/i.test(lower)) {
+  if (/(causal|difference-in-differences|instrumental variable|propensity score|rdd|synthetic control)/i.test(lower) && !executed.has("causal_inference")) {
     overclaims.push("causal inference");
   }
-  if (/(transformer|bert|llm|deep learning|neural network|topic model|embedding)/i.test(lower) && !hasMethod("text feature")) {
+  if (/(robust standard errors|hc1|hc3|heteroskedasticity[- ]robust)/i.test(lower) && !executed.has("robust_ols")) {
+    overclaims.push("robust OLS inference");
+  }
+  if (/(fixed effects|within estimator|two-way fixed effects|twfe)/i.test(lower) && !executed.has("panel_fixed_effects")) {
+    overclaims.push("panel fixed effects");
+  }
+  if (/(difference-in-differences|did\b)/i.test(lower) && !executed.has("diff_in_diff")) {
+    overclaims.push("difference-in-differences");
+  }
+  if (/(event study|dynamic treatment effect|relative time)/i.test(lower) && !executed.has("event_study")) {
+    overclaims.push("event-study analysis");
+  }
+  if (/(synthetic control|synthetic controls)/i.test(lower) && !executed.has("synthetic_control")) {
+    overclaims.push("synthetic control");
+  }
+  if (/(instrumental variable|2sls|two-stage least squares)/i.test(lower) && !executed.has("iv_2sls")) {
+    overclaims.push("instrumental variables");
+  }
+  if (/(regression discontinuity|rdd\b|running variable)/i.test(lower) && !executed.has("regression_discontinuity")) {
+    overclaims.push("regression discontinuity");
+  }
+  if (/(propensity score|inverse probability weighting|matching estimator)/i.test(lower) && !executed.has("propensity_score")) {
+    overclaims.push("propensity-score methods");
+  }
+  if (/(quantile regression|conditional quantile)/i.test(lower) && !executed.has("quantile_regression")) {
+    overclaims.push("quantile regression");
+  }
+  if (/(transformer|bert|llm|deep learning|neural network|topic model|embedding)/i.test(lower) && !executed.has("advanced_nlp") && !executed.has("text_feature_analysis")) {
     overclaims.push("advanced NLP/deep learning");
   }
-  if (/(graph neural|gnn|network embedding|graph convolution)/i.test(lower)) {
+  if (/(graph neural|gnn|network embedding|graph convolution)/i.test(lower) && !executed.has("graph_modelling")) {
     overclaims.push("graph modelling");
   }
-  if (/(arima|var\b|vector autoregression|lstm|time-series)/i.test(lower) && !hasMethod("time trend")) {
+  if (/(arima|var\b|vector autoregression|lstm|time-series)/i.test(lower) && !executed.has("advanced_time_series") && !executed.has("time_trend")) {
     overclaims.push("advanced time-series modelling");
   }
-  if (/(panel model|fixed effects|random effects|gmm|sem|structural equation)/i.test(lower)) {
+  if (/(panel model|random effects|gmm|sem|structural equation)/i.test(lower) && !executed.has("panel_econometrics") && !executed.has("panel_fixed_effects")) {
     overclaims.push("panel/structural econometric modelling");
   }
 
@@ -759,8 +964,9 @@ function buildMethodIntegrityNote(ctx: PipelineContext): string {
   }
 
   const analyticalMetrics = getAnalyticalMetricEntries(output);
+  const executedMethodIds = collectExecutedMethodIds(output);
   const executedMethods = collectExecutedMethods(output);
-  const overclaims = detectLikelyOverclaims(ctx.methodology, executedMethods);
+  const overclaims = detectLikelyOverclaims(ctx.methodology, executedMethodIds);
 
   const lines: string[] = [];
   lines.push(`Datasets analysed: ${ctx.datasetFiles.length}`);
@@ -774,6 +980,82 @@ function buildMethodIntegrityNote(ctx: PipelineContext): string {
   }
 
   return lines.join("\n");
+}
+
+function collectActiveMethodIds(ctx: PipelineContext): string[] {
+  return uniqMethodIds([
+    ...(ctx.executionDiagnostics?.executedMethods || []),
+    ...(ctx.methodContract?.executableNow || []),
+  ].map(normaliseMethodId));
+}
+
+function buildEconometricWritingGuidance(ctx: PipelineContext): string {
+  const active = new Set<string>(collectActiveMethodIds(ctx));
+  const futureOnly = new Set<string>([
+    ...(ctx.methodContract?.requiresMissingData || []),
+    ...(ctx.methodContract?.futureWorkOnly || []),
+  ].map(normaliseMethodId));
+  const lines: string[] = [];
+  const hasEconometricContent = [
+    "robust_ols",
+    "panel_fixed_effects",
+    "diff_in_diff",
+    "event_study",
+    "synthetic_control",
+    "causal_inference",
+    "iv_2sls",
+    "regression_discontinuity",
+    "propensity_score",
+    "quantile_regression",
+  ].some(methodId => active.has(methodId) || futureOnly.has(methodId));
+
+  if (!hasEconometricContent) return "";
+
+  lines.push("For each econometric or causal design, explicitly state the estimand, the model equation, the identifying assumptions, the inference specification, and the core diagnostics or falsification tests.");
+  if (active.has("robust_ols")) {
+    lines.push("- `robust_ols` (executed): write the model as `y_i = alpha + beta x_i + eps_i`, state that heteroskedasticity-robust standard errors are used, and interpret beta with its confidence interval.");
+  }
+  if (active.has("panel_fixed_effects")) {
+    lines.push("- `panel_fixed_effects` (executed): write `y_it = alpha_i + delta_t + beta x_it + eps_it`, explain the unit and time fixed effects, and discuss within-unit variation.");
+  }
+  if (active.has("diff_in_diff")) {
+    lines.push("- `diff_in_diff` (executed): write `y_it = alpha_i + delta_t + beta (Treat_i x Post_t) + eps_it`, define beta as the average treatment effect on the treated under parallel trends, and discuss pre/post group means.");
+  }
+  if (active.has("event_study")) {
+    lines.push("- `event_study` (executed): write `y_it = alpha_i + delta_t + sum_{k != -1} beta_k 1{t-T_i=k} + eps_it`, interpret lead coefficients as pre-trend diagnostics and lag coefficients as dynamic effects.");
+  }
+  if (active.has("synthetic_control")) {
+    lines.push("- `synthetic_control` (executed): describe the donor-weight optimisation `min_W (X_1 - X_0 W)' V (X_1 - X_0 W)` subject to `W >= 0` and `sum_j W_j = 1`, and discuss pre-treatment fit, post-treatment gaps, and donor weights.");
+  }
+  if (active.has("causal_inference") && !active.has("diff_in_diff") && !active.has("event_study") && !active.has("synthetic_control")) {
+    lines.push("- `causal_inference` (executed): define the estimand in potential-outcomes notation, e.g. `tau = E[Y(1) - Y(0) | T = 1]`, and state the assumptions needed for identification.");
+  }
+  if (active.has("iv_2sls")) {
+    lines.push("- `iv_2sls` (executed): write the first and second stages as `D_i = pi Z_i + gamma' X_i + nu_i` and `y_i = beta Dhat_i + gamma' X_i + eps_i`, and discuss first-stage strength and exclusion restrictions.");
+  }
+  if (active.has("regression_discontinuity")) {
+    lines.push("- `regression_discontinuity` (executed): define the cutoff, bandwidth, local-linear specification, and the discontinuity estimand at the threshold.");
+  }
+  if (active.has("propensity_score")) {
+    lines.push("- `propensity_score` (executed): define the propensity score `e(X_i) = P(T_i = 1 | X_i)` and report overlap plus balance diagnostics before and after weighting.");
+  }
+  if (active.has("quantile_regression")) {
+    lines.push("- `quantile_regression` (executed): write the conditional quantile model `Q_tau(Y_i | X_i) = alpha_tau + beta_tau X_i` and interpret heterogeneous slopes across quantiles.");
+  }
+  if (futureOnly.has("iv_2sls")) {
+    lines.push("- `iv_2sls` (future work only): if mentioned, frame it as unexecuted and use the equations `D_i = pi Z_i + gamma' X_i + nu_i` and `y_i = beta Dhat_i + gamma' X_i + eps_i`, noting that first-stage strength and exclusion restrictions remain to be validated.");
+  }
+  if (futureOnly.has("regression_discontinuity")) {
+    lines.push("- `regression_discontinuity` (future work only): if mentioned, frame it as unexecuted and note the need for a running variable, cutoff, and local continuity diagnostics.");
+  }
+  if (futureOnly.has("propensity_score")) {
+    lines.push("- `propensity_score` (future work only): if mentioned, frame it as unexecuted and note that overlap, balance, and sensitivity diagnostics are pending.");
+  }
+  if (futureOnly.has("quantile_regression")) {
+    lines.push("- `quantile_regression` (future work only): if mentioned, frame it as unexecuted and note that the deterministic runner does not yet estimate conditional quantiles.");
+  }
+
+  return `Econometric and causal writing guidance:\n${lines.join("\n")}`;
 }
 
 // ─── Stage Implementations ───
@@ -963,7 +1245,7 @@ RULES:
    d. What the expected output of each analysis step is
 6. DO NOT promise results you cannot deliver. Every claim in the methodology about "we will show" or "we will demonstrate" must be achievable with the allowed methods and available data.
 7. Descriptive statistics are mandatory whenever at least one dataset is available; they must include central tendency, dispersion, and missing-data profiling.
-8. Include a dedicated subsection called "Methodology Applicability Matrix" with one row per major method family (descriptive, correlation, regression, group comparison, time trend, text analysis, causal inference, panel, advanced time-series, advanced NLP, graph, vision), with readiness label (executable_now/partially_ready/blocked), key prerequisite checks, and rationale.
+8. Include a dedicated subsection called "Methodology Applicability Matrix" with one row per major method family (descriptive_statistics, correlation, linear_regression, robust_ols, group_comparison, time_trend, text_feature_analysis, panel_fixed_effects, diff_in_diff, event_study, synthetic_control, causal_inference, iv_2sls, regression_discontinuity, propensity_score, quantile_regression, advanced_time_series, advanced_nlp, graph_modelling, vision_analysis), with readiness label (executable_now/partially_ready/blocked), key prerequisite checks, and rationale.
 9. Any method marked partially_ready or blocked MUST include explicit "what is missing" and "how to unlock" notes.`
     : "";
 
@@ -991,7 +1273,7 @@ async function stage8_methodValidation(ctx: PipelineContext): Promise<string> {
 
   const result = await callLLM(
     `You are a methodology reviewer and data science expert. You must critically evaluate whether the proposed methodology is ACTUALLY FEASIBLE with the available data. Be harsh and honest. Your job is to REJECT over-ambitious methodologies and force them to match reality.`,
-    `Research topic: "${ctx.topic}"\nMethodology:\n${ctx.methodology}${datasetInfo}${capabilityHints}${evidenceHints}\n\nCritically validate:\n1. DATA-METHOD ALIGNMENT: Does the proposed method match the actual data? For example:\n   - If the data is a simple CSV with 10 columns, can you really train a graph neural network on it? NO.\n   - If the data has no temporal ordering, can you do time-series analysis? NO.\n   - If the data is aggregate statistics, can you do individual-level causal inference? NO.\n   Flag ANY method that cannot be executed with the available data.\n\n2. STATISTICAL VALIDITY: Are the proposed statistical tests appropriate for the data types?\n   - Correlation on categorical ID columns (prefecture codes, year codes) is MEANINGLESS.\n   - t-tests require proper group definitions, not arbitrary splits.\n   - Regression requires meaningful dependent and independent variables.\n\n3. FEASIBILITY: Can this methodology actually be implemented in Python with standard libraries?\n\n4. HONESTY CHECK: Does the methodology over-promise? If so, recommend simpler, honest alternatives.\n\n5. Recommendations: What methodology SHOULD be used given the actual data?\n\n6. Overall feasibility score (1-10) — be strict. A methodology that proposes deep learning on a 4000-row CSV should score 2-3.\n\nCRITICAL VALIDATION RULE:\nIf the proposed methodology contains ANY method not in the recommended executable list (${evidence.recommendedExecutableMethods.join(", ")}) as a PRIMARY analysis method (not future work), your validation MUST:\n- Assign a feasibility score of 3 or below\n- Explicitly list each non-executable method and explain why it cannot be run\n- Provide a REWRITTEN methodology that uses ONLY executable methods\n- Move all non-executable methods to the "future_work_only" list in the contract\n\nADDITIONAL MANDATORY RULES:\n- If at least one dataset is available, descriptive_statistics MUST be included in executable_now.\n- The contract must include a method-family-level applicability judgement (executable_now / partially_ready / blocked) for modern methodologies (causal, panel, advanced_time_series, advanced_nlp, graph_modelling, vision_analysis), with concise blocked_reasons/evidence_notes.\n\nAfter the narrative review, output a machine-readable block using EXACTLY this format:\n[METHOD_CONTRACT_JSON]\n{\"executable_now\":[...],\"requires_missing_data\":[...],\"future_work_only\":[...],\"blocked_reasons\":{\"method\":\"reason\"},\"evidence_notes\":[...]}\n[/METHOD_CONTRACT_JSON]\n\nUse concise snake_case method ids (e.g., descriptive_statistics, correlation, linear_regression, group_comparison, time_trend, text_feature_analysis, causal_inference, graph_modelling, vision_analysis, panel_econometrics, advanced_time_series, advanced_nlp).\n\nIMPORTANT: The "executable_now" list MUST be a strict subset of: ${evidence.recommendedExecutableMethods.join(", ")}. Do NOT add methods to "executable_now" that are not in this list.`
+    `Research topic: "${ctx.topic}"\nMethodology:\n${ctx.methodology}${datasetInfo}${capabilityHints}${evidenceHints}\n\nCritically validate:\n1. DATA-METHOD ALIGNMENT: Does the proposed method match the actual data? For example:\n   - If the data is a simple CSV with 10 columns, can you really train a graph neural network on it? NO.\n   - If the data has no temporal ordering, can you do time-series analysis? NO.\n   - If the data is aggregate statistics, can you do individual-level causal inference? NO.\n   Flag ANY method that cannot be executed with the available data.\n\n2. STATISTICAL VALIDITY: Are the proposed statistical tests appropriate for the data types?\n   - Correlation on categorical ID columns (prefecture codes, year codes) is MEANINGLESS.\n   - t-tests require proper group definitions, not arbitrary splits.\n   - Regression requires meaningful dependent and independent variables.\n   - Causal estimators require explicit estimands, identifying assumptions, and diagnostics.\n\n3. FEASIBILITY: Can this methodology actually be implemented in Python with standard libraries?\n\n4. HONESTY CHECK: Does the methodology over-promise? If so, recommend simpler, honest alternatives.\n\n5. Recommendations: What methodology SHOULD be used given the actual data?\n\n6. Overall feasibility score (1-10) — be strict. A methodology that proposes deep learning on a 4000-row CSV should score 2-3.\n\nCRITICAL VALIDATION RULE:\nIf the proposed methodology contains ANY method not in the recommended executable list (${evidence.recommendedExecutableMethods.join(", ")}) as a PRIMARY analysis method (not future work), your validation MUST:\n- Assign a feasibility score of 3 or below\n- Explicitly list each non-executable method and explain why it cannot be run\n- Provide a REWRITTEN methodology that uses ONLY executable methods\n- Move all non-executable methods to the "future_work_only" list in the contract\n\nADDITIONAL MANDATORY RULES:\n- If at least one dataset is available, descriptive_statistics MUST be included in executable_now.\n- The contract must include a method-family-level applicability judgement (executable_now / partially_ready / blocked) for modern methodologies (robust_ols, panel_fixed_effects, diff_in_diff, event_study, synthetic_control, causal_inference, iv_2sls, regression_discontinuity, propensity_score, quantile_regression, advanced_time_series, advanced_nlp, graph_modelling, vision_analysis), with concise blocked_reasons/evidence_notes.\n- When causal or econometric methods are mentioned, the review must explicitly state the estimand, key identifying assumptions, and required diagnostics or falsification tests.\n\nAfter the narrative review, output a machine-readable block using EXACTLY this format:\n[METHOD_CONTRACT_JSON]\n{\"executable_now\":[...],\"requires_missing_data\":[...],\"future_work_only\":[...],\"blocked_reasons\":{\"method\":\"reason\"},\"evidence_notes\":[...]}\n[/METHOD_CONTRACT_JSON]\n\nUse concise snake_case method ids (e.g., descriptive_statistics, correlation, linear_regression, robust_ols, group_comparison, time_trend, text_feature_analysis, panel_fixed_effects, diff_in_diff, event_study, synthetic_control, causal_inference, iv_2sls, regression_discontinuity, propensity_score, quantile_regression, graph_modelling, vision_analysis, panel_econometrics, advanced_time_series, advanced_nlp).\n\nIMPORTANT: The "executable_now" list MUST be a strict subset of: ${evidence.recommendedExecutableMethods.join(", ")}. Do NOT add methods to "executable_now" that are not in this list.`
   );
   ctx.methodValidation = result;
   const contract = parseMethodContract(result, ctx.methodology, evidence);
@@ -1297,9 +1579,10 @@ async function stage15_tableGeneration(ctx: PipelineContext): Promise<string> {
 async function stage16_outlineGeneration(ctx: PipelineContext): Promise<string> {
   const fieldCtx = buildFieldContext(ctx);
   const venueLabel = ctx.config.targetConference === "General" ? `a leading venue in ${inferResearchField(ctx)}` : ctx.config.targetConference;
+  const econometricGuidance = buildEconometricWritingGuidance(ctx);
   const result = await callLLM(
     `You are an academic paper outline generator. ${fieldCtx}`,
-    `Research topic: "${ctx.topic}"\nMethod contract:\n${formatMethodContract(ctx.methodContract)}\nExecution diagnostics:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}\n\nGenerate a detailed paper outline suitable for ${venueLabel}:\n1. Title (compelling, specific)\n2. Abstract outline (key points)\n3. Introduction structure (motivation, contributions)\n4. Related Work / Literature Review organization\n5. Methodology section structure\n6. Experiments / Empirical Analysis section structure\n7. Results and Discussion\n8. Conclusion and Future Work\n9. Appendix items\n\nInclude explicit subsection placeholders for:\n- Construct operationalisation and falsification logic\n- Evidence-backed findings only\n- Execution limitations and unmet data prerequisites\n\nAdapt the section naming and structure to conventions in ${inferResearchField(ctx)}.`
+    `Research topic: "${ctx.topic}"\nMethod contract:\n${formatMethodContract(ctx.methodContract)}\nExecution diagnostics:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}${econometricGuidance ? `\n\n${econometricGuidance}` : ""}\n\nGenerate a detailed paper outline suitable for ${venueLabel}:\n1. Title (compelling, specific)\n2. Abstract outline (key points)\n3. Introduction structure (motivation, contributions)\n4. Related Work / Literature Review organization\n5. Methodology section structure\n6. Experiments / Empirical Analysis section structure\n7. Results and Discussion\n8. Conclusion and Future Work\n9. Appendix items\n\nInclude explicit subsection placeholders for:\n- Construct operationalisation and falsification logic\n- Estimands, model equations, identifying assumptions, and diagnostics where applicable\n- Evidence-backed findings only\n- Execution limitations and unmet data prerequisites\n\nAdapt the section naming and structure to conventions in ${inferResearchField(ctx)}.`
   );
   ctx.outline = result;
   return result;
@@ -1316,10 +1599,11 @@ async function stage17_abstractWriting(ctx: PipelineContext): Promise<string> {
     : "";
   const contractBlock = `\n\nMethod feasibility contract:\n${formatMethodContract(ctx.methodContract)}`;
   const executionBlock = `\n\nExecution diagnostics:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}`;
+  const econometricGuidance = buildEconometricWritingGuidance(ctx);
 
   const result = await callLLM(
     `You are an expert academic writer. ${buildFieldContext(ctx)} Write a compelling abstract. Use British English spelling and academic tone.\n\nCRITICAL ANTI-HALLUCINATION RULES:\n1. You may ONLY cite specific numbers that appear in the "Actual computed analytical metrics" section below.\n2. If no actual analytical metrics are provided, write the abstract WITHOUT specific numerical claims. Use qualitative descriptions instead (e.g., "we analyse", "we propose", "our framework examines").\n3. Do NOT invent percentages, p-values, effect sizes, or any other statistics.\n4. If methodology mentions techniques not executed, frame them as planned/future work, never as completed evidence.\n\nMETHODOLOGY ALIGNMENT RULES:\n5. The abstract MUST NOT mention unexecuted methods as contributions or methods of this paper.\n6. Only describe the methods that were actually executed (see execution diagnostics below).\n7. Unexecuted methods may be mentioned ONLY in a single sentence about future directions at the end of the abstract.\n8. The abstract should accurately reflect what the paper delivers, not what it aspires to deliver.`,
-    `Research topic: "${ctx.topic}"\nOutline:\n${ctx.outline}\nStatistical analysis:\n${ctx.statisticalAnalysis?.substring(0, 2000)}${metricsForAbstract}${methodIntegrityBlock}${contractBlock}${executionBlock}\n\nWrite a 150-250 word abstract that:\n1. States the problem clearly\n2. Describes the approach and methodology\n3. ${hasRealMetrics ? "Highlights key results using ONLY the actual computed analytical metrics above" : "Describes the analytical framework and expected contributions WITHOUT fabricating numerical results"}\n4. States the main contribution\n\n${!hasRealMetrics ? "IMPORTANT: No empirical analytical metrics are available. Write the abstract focusing on the research question, methodology, and analytical framework. Do NOT include any specific numbers, percentages, or statistical values." : ""}`
+    `Research topic: "${ctx.topic}"\nOutline:\n${ctx.outline}\nStatistical analysis:\n${ctx.statisticalAnalysis?.substring(0, 2000)}${metricsForAbstract}${methodIntegrityBlock}${contractBlock}${executionBlock}${econometricGuidance ? `\n\n${econometricGuidance}` : ""}\n\nWrite a 150-250 word abstract that:\n1. States the problem clearly\n2. Describes the approach and methodology\n3. ${hasRealMetrics ? "Highlights key results using ONLY the actual computed analytical metrics above" : "Describes the analytical framework and expected contributions WITHOUT fabricating numerical results"}\n4. States the main contribution\n5. If econometric methods are central, summarises the identification logic and empirical design without overstating causal claims\n\n${!hasRealMetrics ? "IMPORTANT: No empirical analytical metrics are available. Write the abstract focusing on the research question, methodology, and analytical framework. Do NOT include any specific numbers, percentages, or statistical values." : ""}`
   );
   ctx.abstract = result;
   await persistStageAudit(ctx, 17, {
@@ -1358,6 +1642,7 @@ async function stage18_bodyWriting(ctx: PipelineContext): Promise<string> {
   const hasRealMetrics = getAnalyticalMetricEntries(ctx.experimentOutput).length > 0;
   const hasRealCharts = ctx.experimentOutput?.charts && ctx.experimentOutput.charts.length > 0;
   const hasRealTables = ctx.experimentOutput?.tables && ctx.experimentOutput.tables.length > 0;
+  const econometricGuidance = buildEconometricWritingGuidance(ctx);
 
   const executedMethodsList = ctx.executionDiagnostics?.executedMethods?.join(", ") || "none";
   const blockedMethodsList = [
@@ -1379,10 +1664,10 @@ WRITING QUALITY REQUIREMENTS:
 - Each section must be substantive (at least 3-4 paragraphs for major sections like Methodology, Results).
 - Avoid single-sentence subsections. Every subsection must have at least 2 paragraphs of detailed content.
 - Use formal academic prose, not bullet points, for the main body text.
-- Methodology must include: (a) formal problem definition with mathematical notation where appropriate, (b) detailed description of the analytical framework or model, (c) data preprocessing steps, (d) variable operationalisation.
+- Methodology must include: (a) formal problem definition with mathematical notation where appropriate, (b) clear estimands and model equations for executed econometric/causal methods, (c) identifying assumptions and inference specification where relevant, (d) detailed description of the analytical framework or model, (e) data preprocessing steps, (f) variable operationalisation.
 - Experiments must include: (a) dataset description (source, size, time period, key variables), (b) experimental setup and implementation details, (c) evaluation metrics with definitions, (d) baseline methods for comparison.
-- Results must include: (a) main findings with reference to specific tables and figures, (b) comparison with baselines or prior work, (c) discussion of statistical significance where applicable, (d) limitations and potential confounds.`,
-    `Write the complete paper body in Markdown format.\n\nTopic: "${ctx.topic}"\nAbstract: ${ctx.abstract}\nOutline: ${ctx.outline}\nHypothesis package: ${ctx.hypothesis}\nMethodology: ${ctx.methodology}\nResults: ${ctx.experimentResults?.substring(0, 3000)}\nStatistical Analysis: ${ctx.statisticalAnalysis?.substring(0, 2000)}${dataAnalysisSection}\n\n## Available References (use these numbered citations in the text):\n${numberedRefs}\n\nWrite complete sections with the following MINIMUM requirements:\n\n1. **Introduction** (at least 4 paragraphs) — Motivate the research problem with real-world significance, cite relevant prior work using [1], [2] etc., identify the specific research gap, and clearly state contributions (as a numbered list at the end of the Introduction).\n\n2. **Related Work** (at least 3 subsections) — Thoroughly review the literature. Cite each referenced paper by its number [1]-[${ctx.papers.slice(0, 20).length}]. Group related works thematically into subsections (e.g., "2.1 Prior Work on X", "2.2 Approaches to Y", "2.3 Gap Analysis"). Each subsection must have at least 2 paragraphs.\n\n3. **Methodology** (at least 3 subsections) — This is a CRITICAL section that must be detailed:\n   3.1 **Problem Formulation** — Formally define the research problem. Use mathematical notation where appropriate (e.g., define variables, objective functions, hypotheses).\n   3.2 **Analytical Framework / Model Description** — Describe the proposed approach step by step. Include data preprocessing, feature engineering, or variable operationalisation. Explain WHY each methodological choice was made.\n   3.3 **Implementation Details** — Describe tools, libraries, parameters, and computational environment used.\n   3.4 **Operationalisation and Falsification Logic** — explicitly map each core hypothesis to operational variables, executable tests, and falsification criteria.\n\n4. **Experiments** (at least 3 subsections) —\n   4.1 **Dataset Description** — Source, collection method, time period, sample size, key variables with descriptive statistics.\n   4.2 **Experimental Setup** — ${hasRealMetrics ? "Describe the exact configuration, hyperparameters, cross-validation strategy, and reproducibility measures." : "Describe the planned experimental configuration and reproducibility measures. Acknowledge that full empirical results are pending."}\n   4.3 **Evaluation Metrics** — Define each metric mathematically (e.g., accuracy = TP+TN/N, RMSE = sqrt(1/n * sum(yi - y_hat_i)^2)). Explain why these metrics are appropriate.\n   4.4 **Baselines** — Describe comparison methods and why they were chosen.\n\n5. **Results and Discussion** (at least 4 paragraphs) — ${hasRealMetrics ? "Present findings using ONLY the actual computed metrics. Structure as: (a) Main results with table/figure references, (b) Comparison with baselines, (c) Ablation or sensitivity analysis discussion, (d) Limitations and threats to validity." : "Describe the analytical framework and what the results WOULD show. Do NOT fabricate any numbers. Use conditional language. Discuss expected patterns, potential limitations, and how results would be interpreted."}\n\n6. **Conclusion and Future Work** (at least 2 paragraphs) — Summarise contributions (matching the numbered list from Introduction), discuss broader implications, and outline concrete future research directions.\n\n7. **Research Classification** — Add one explicit label and one short justification:\n   - empirical (if supported by executed evidence), or\n   - methodological_protocol (if empirical evidence is incomplete).\n\n8. **References** — List all cited references in the format:\n   [1] Authors. "Title". Year, Venue.\n   [2] Authors. "Title". Year, Venue.\n   ... (include ALL references from the list above that were cited in the text)\n\nIMPORTANT: You MUST include inline citations [1], [2], etc. throughout the text. The References section at the end MUST list every cited paper. Each major section must be substantive — no single-sentence sections or subsections.`,
+- Results must include: (a) main findings with reference to specific tables and figures, (b) discussion of statistical uncertainty and design diagnostics where applicable, (c) comparison with baselines or prior work, (d) limitations and potential confounds.`,
+    `Write the complete paper body in Markdown format.\n\nTopic: "${ctx.topic}"\nAbstract: ${ctx.abstract}\nOutline: ${ctx.outline}\nHypothesis package: ${ctx.hypothesis}\nMethodology: ${ctx.methodology}\nResults: ${ctx.experimentResults?.substring(0, 3000)}\nStatistical Analysis: ${ctx.statisticalAnalysis?.substring(0, 2000)}${dataAnalysisSection}${econometricGuidance ? `\n\n## ${econometricGuidance}` : ""}\n\n## Available References (use these numbered citations in the text):\n${numberedRefs}\n\nWrite complete sections with the following MINIMUM requirements:\n\n1. **Introduction** (at least 4 paragraphs) — Motivate the research problem with real-world significance, cite relevant prior work using [1], [2] etc., identify the specific research gap, and clearly state contributions (as a numbered list at the end of the Introduction).\n\n2. **Related Work** (at least 3 subsections) — Thoroughly review the literature. Cite each referenced paper by its number [1]-[${ctx.papers.slice(0, 20).length}]. Group related works thematically into subsections (e.g., "2.1 Prior Work on X", "2.2 Approaches to Y", "2.3 Gap Analysis"). Each subsection must have at least 2 paragraphs.\n\n3. **Methodology** (at least 4 subsections) — This is a CRITICAL section that must be detailed:\n   3.1 **Problem Formulation and Estimands** — Formally define the research problem. Use mathematical notation where appropriate (e.g., define variables, objective functions, hypotheses, and estimands).\n   3.2 **Analytical Framework / Model Description** — Describe the proposed approach step by step. Include model equations, data preprocessing, feature engineering, or variable operationalisation. Explain WHY each methodological choice was made.\n   3.3 **Identification, Inference, and Diagnostics** — For econometric or causal methods, state identifying assumptions, uncertainty quantification, and the diagnostic/falsification logic. If a method is unexecuted, explicitly mark it as future work.\n   3.4 **Implementation Details** — Describe tools, libraries, parameters, and computational environment used.\n   3.5 **Operationalisation and Falsification Logic** — explicitly map each core hypothesis to operational variables, executable tests, and falsification criteria.\n\n4. **Experiments** (at least 3 subsections) —\n   4.1 **Dataset Description** — Source, collection method, time period, sample size, key variables with descriptive statistics.\n   4.2 **Experimental Setup** — ${hasRealMetrics ? "Describe the exact configuration, parameterisation, standard-error or uncertainty specification, and reproducibility measures." : "Describe the planned experimental configuration and reproducibility measures. Acknowledge that full empirical results are pending."}\n   4.3 **Evaluation Metrics and Diagnostic Quantities** — Define each metric mathematically (e.g., accuracy = TP+TN/N, RMSE = sqrt(1/n * sum(yi - y_hat_i)^2)). For econometric designs, define the estimands and diagnostic quantities in words and equations.\n   4.4 **Baselines / Comparison Designs** — Describe comparison methods and why they were chosen.\n\n5. **Results and Discussion** (at least 4 paragraphs) — ${hasRealMetrics ? "Present findings using ONLY the actual computed metrics. Structure as: (a) Main results with table/figure references, (b) Interpretation of coefficient intervals, design diagnostics, or specialised econometric plots where available, (c) Comparison with baselines or prior work, (d) Limitations and threats to validity." : "Describe the analytical framework and what the results WOULD show. Do NOT fabricate any numbers. Use conditional language. Discuss expected patterns, required diagnostics, potential limitations, and how results would be interpreted."}\n\n6. **Conclusion and Future Work** (at least 2 paragraphs) — Summarise contributions (matching the numbered list from Introduction), discuss broader implications, and outline concrete future research directions.\n\n7. **Research Classification** — Add one explicit label and one short justification:\n   - empirical (if supported by executed evidence), or\n   - methodological_protocol (if empirical evidence is incomplete).\n\n8. **References** — List all cited references in the format:\n   [1] Authors. "Title". Year, Venue.\n   [2] Authors. "Title". Year, Venue.\n   ... (include ALL references from the list above that were cited in the text)\n\nIMPORTANT: You MUST include inline citations [1], [2], etc. throughout the text. The References section at the end MUST list every cited paper. Each major section must be substantive — no single-sentence sections or subsections.`,
     32768
   );
   const claimCheck = buildClaimVerificationReport(ctx, firstPass);
@@ -1474,6 +1759,10 @@ async function stage20_latexCompilation(ctx: PipelineContext): Promise<string> {
     dataManifest += `\nMethod execution integrity:\n${ctx.methodIntegrityNote || "No integrity note available."}\n`;
     if (ctx.claimVerificationReport) {
       dataManifest += `\nClaim verification report:\n${ctx.claimVerificationReport}\n`;
+    }
+    const econometricGuidance = buildEconometricWritingGuidance(ctx);
+    if (econometricGuidance) {
+      dataManifest += `\n${econometricGuidance}\n`;
     }
     dataManifest += `\nRULES:\n- Every number in the Results/Discussion sections MUST come from the list above.\n- If a statistic is not listed above, do NOT include it.\n- Do NOT add p-values, effect sizes, confidence intervals, or any other statistics unless they appear above.\n- Tables must reproduce the exact values from "Computed Tables" above.\n- If the data is insufficient, state the limitation rather than fabricating values.\n- Any method not explicitly supported by the method execution integrity note must be presented as planned/future work only.`;
   } else {
@@ -1654,8 +1943,39 @@ ALL content — including figures, tables, and equations — MUST fit within A4 
 
 async function stage21_peerReview(ctx: PipelineContext): Promise<string> {
   const result = await callLLM(
-    `You are a panel of 3 expert peer reviewers for a leading academic venue in ${inferResearchField(ctx)}. ${buildFieldContext(ctx)} Provide detailed, constructive reviews.`,
-    `Review this paper submission:\n\nTitle: ${ctx.topic}\nAbstract: ${ctx.abstract}\nBody: ${ctx.paperBody || ""}\n\nProvide 3 independent reviews, each containing:\n1. Summary (2-3 sentences)\n2. Strengths (3-5 points)\n3. Weaknesses (3-5 points)\n4. Questions for authors\n5. Minor issues\n6. Overall score (1-10)\n7. Confidence (1-5)\n8. Recommendation (Accept/Weak Accept/Borderline/Weak Reject/Reject)\n\nAlso provide a meta-review summarizing the consensus.`
+    `You are a specialist review panel for a leading academic venue in ${inferResearchField(ctx)}. ${buildFieldContext(ctx)} The panel consists of:
+1. An econometrics reviewer focused on estimands, equations, identification, and inference.
+2. A causal inference reviewer focused on assumptions, threats to validity, and design diagnostics.
+3. An empirical research design reviewer focused on data quality, operationalisation, and robustness.
+4. A writing/positioning reviewer focused on clarity, novelty, and venue fit.
+
+Provide detailed, technically serious reviews.`,
+    `Review this paper submission:
+
+Title: ${ctx.topic}
+Abstract: ${ctx.abstract}
+Method feasibility contract:
+${formatMethodContract(ctx.methodContract)}
+Execution diagnostics:
+${formatExecutionDiagnostics(ctx.executionDiagnostics)}
+Body: ${ctx.paperBody || ""}
+
+Provide 4 independent reviews, one from each specialist reviewer above. For each review include:
+1. Summary (2-3 sentences)
+2. Strengths (3-5 points)
+3. Weaknesses (3-5 points)
+4. Questions for authors
+5. Required revisions
+6. Specific comments on statistical validity / identification / robustness where relevant
+7. Overall score (1-10)
+8. Confidence (1-5)
+9. Recommendation (Accept/Weak Accept/Borderline/Weak Reject/Reject)
+
+Then provide a meta-review containing:
+1. Consensus summary
+2. Whether the paper is best classified as empirical or methodological_protocol
+3. Highest-priority blocking issues
+4. Final recommendation`
   );
   ctx.reviewReport = result;
   return result;
