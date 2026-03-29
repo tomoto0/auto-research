@@ -13,6 +13,7 @@ import * as https from "https";
 import * as http from "http";
 import * as fsNode from "fs";
 import { execSync } from "child_process";
+import { storageDownload } from "./storage";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                             */
@@ -23,6 +24,8 @@ export interface ChartImage {
   key: string;
   /** Remote URL of the chart image (S3 / CDN) */
   url: string;
+  /** Storage key used for direct downloads when available */
+  fileKey?: string;
   /** Human-readable name for the figure caption */
   name: string;
   /** Description for the figure caption */
@@ -33,7 +36,19 @@ export interface ChartImage {
 /*  Image fetching helper                                              */
 /* ------------------------------------------------------------------ */
 
-async function fetchImageBuffer(url: string): Promise<Buffer | null> {
+async function fetchImageBuffer(params: { url?: string; fileKey?: string }): Promise<Buffer | null> {
+  if (params.fileKey) {
+    try {
+      const resp = await storageDownload(params.fileKey, { timeoutMs: 20000 });
+      const arrayBuffer = await resp.arrayBuffer();
+      return Buffer.from(arrayBuffer);
+    } catch (err: any) {
+      console.warn(`[PDF] Direct storage download failed for ${params.fileKey}: ${err?.message || "unknown error"}`);
+    }
+  }
+
+  const url = params.url;
+  if (!url) return null;
   return new Promise((resolve) => {
     const timeout = setTimeout(() => resolve(null), 15000);
     const protocol = url.startsWith("https") ? https : http;
@@ -41,7 +56,7 @@ async function fetchImageBuffer(url: string): Promise<Buffer | null> {
       // Follow redirects
       if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         clearTimeout(timeout);
-        fetchImageBuffer(res.headers.location).then(resolve);
+        fetchImageBuffer({ url: res.headers.location }).then(resolve);
         return;
       }
       if (res.statusCode !== 200) {
@@ -72,6 +87,14 @@ function isSvgBuffer(buffer: Buffer): boolean {
   return sample.startsWith("<svg") || sample.startsWith("<?xml") || sample.includes("<svg");
 }
 
+function sanitizeSvgForRasterization(buffer: Buffer): Buffer {
+  const svgText = buffer.toString("utf-8");
+  const sanitized = svgText
+    .replace(/[^\x09\x0A\x0D\x20-\x7E]/g, " ")
+    .replace(/\s+/g, " ");
+  return Buffer.from(sanitized, "utf-8");
+}
+
 async function ensurePdfEmbeddableImage(buffer: Buffer): Promise<Buffer | null> {
   if (!isSvgBuffer(buffer)) {
     // Validate it's actually a PNG/JPEG by checking magic bytes
@@ -86,7 +109,7 @@ async function ensurePdfEmbeddableImage(buffer: Buffer): Promise<Buffer | null> 
   }
   try {
     const sharp = (await import("sharp")).default;
-    const pngBuffer = await sharp(buffer)
+    const pngBuffer = await sharp(sanitizeSvgForRasterization(buffer))
       .resize({ width: 900, height: 560, fit: "inside", withoutEnlargement: true })
       .png()
       .toBuffer();
@@ -113,6 +136,7 @@ interface PaperSection {
   level?: number;
   items?: string[];
   imageUrl?: string;
+  imageFileKey?: string;
   caption?: string;
   headers?: string[];
   rows?: string[][];
@@ -138,6 +162,9 @@ function parseLatexToSections(
     chartUrlMap.set(c.key, c);
     chartUrlMap.set(`figure_${i + 1}`, c);
     chartUrlMap.set(`figure_${i + 1}.png`, c);
+    chartUrlMap.set(`figure_${i + 1}.jpg`, c);
+    chartUrlMap.set(`figure_${i + 1}.jpeg`, c);
+    chartUrlMap.set(`figure_${i + 1}.svg`, c);
   });
 
   // Build label→number map for cross-references (\ref{tab:X} → "1", \ref{fig:Y} → "2")
@@ -325,10 +352,14 @@ function parseLatexToSections(
       // Extract includegraphics
       const imgMatch = content.match(/\\includegraphics(?:\[([^\]]*)\])?\{([^}]+)\}/);
       let imageUrl = "";
+      let imageFileKey: string | undefined;
       if (imgMatch) {
         const src = imgMatch[2];
         const chart = chartUrlMap.get(src) || chartUrlMap.get(src.replace(/\.[^.]+$/, ""));
-        if (chart) imageUrl = chart.url;
+        if (chart) {
+          imageUrl = chart.url;
+          imageFileKey = chart.fileKey;
+        }
         else if (src.startsWith("http")) imageUrl = src;
       }
 
@@ -339,6 +370,7 @@ function parseLatexToSections(
       figureMap.set(marker, {
         type: "figure",
         imageUrl,
+        imageFileKey,
         caption: `Figure ${figureCounter}: ${caption}`,
       });
       return `\n${marker}\n`;
@@ -1062,6 +1094,7 @@ function parseMarkdownToSections(
       sections.push({
         type: "figure",
         imageUrl: chart.url,
+        imageFileKey: chart.fileKey,
         caption: `Figure ${i + 1}: ${chart.name} — ${chart.description}`,
       });
     });
@@ -1109,6 +1142,7 @@ async function renderSectionsToPdf(
       });
 
       const chunks: Buffer[] = [];
+      const imageBufferCache = new Map<string, Promise<Buffer | null>>();
       doc.on("data", (chunk: Buffer) => chunks.push(chunk));
       doc.on("end", () => resolve(Buffer.concat(chunks)));
       doc.on("error", reject);
@@ -1245,9 +1279,16 @@ async function renderSectionsToPdf(
           case "figure": {
             let imageEmbedded = false;
 
-            if (section.imageUrl) {
+            if (section.imageUrl || section.imageFileKey) {
               try {
-                const rawBuffer = await fetchImageBuffer(section.imageUrl);
+                const cacheKey = section.imageFileKey || section.imageUrl || `figure:${section.caption || doc.y}`;
+                if (!imageBufferCache.has(cacheKey)) {
+                  imageBufferCache.set(cacheKey, fetchImageBuffer({
+                    url: section.imageUrl,
+                    fileKey: section.imageFileKey,
+                  }));
+                }
+                const rawBuffer = await imageBufferCache.get(cacheKey)!;
                 const imgBuffer = rawBuffer ? await ensurePdfEmbeddableImage(rawBuffer) : null;
                 if (imgBuffer && imgBuffer.length > 500) {
                   // Calculate image dimensions to fit within content width

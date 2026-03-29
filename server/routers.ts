@@ -13,6 +13,66 @@ import { uploadChunkProcedure, assembleChunksProcedure, registerFileProcedure } 
 // ─── In-memory event store for SSE/polling ───
 const runEventBuffers = new Map<string, PipelineEvent[]>();
 const runEventListeners = new Map<string, Set<(event: PipelineEvent) => void>>();
+const ACTIVE_RUN_STATUSES = new Set(["running", "pending", "awaiting_approval"]);
+
+function truncateText(value: unknown, maxChars: number): string | null {
+  if (typeof value !== "string") return value == null ? null : String(value);
+  if (value.length <= maxChars) return value;
+  const remaining = value.length - maxChars;
+  return `${value.slice(0, maxChars)}\n\n...[truncated ${remaining.toLocaleString()} chars]`;
+}
+
+function truncateRecordValues(record: unknown, maxEntries: number, maxValueChars: number): Record<string, unknown> | null {
+  if (!record || typeof record !== "object" || Array.isArray(record)) return null;
+  const entries = Object.entries(record as Record<string, unknown>).slice(0, maxEntries);
+  return Object.fromEntries(entries.map(([key, value]) => {
+    if (typeof value === "string") return [key, truncateText(value, maxValueChars)];
+    return [key, value];
+  }));
+}
+
+function sanitizePipelineDetailPayload(payload: any) {
+  const isActive = ACTIVE_RUN_STATUSES.has(payload?.status);
+  const stageOutputLimit = isActive ? 20_000 : 80_000;
+  const textLimit = isActive ? 160_000 : 400_000;
+  const codeLimit = isActive ? 60_000 : 180_000;
+  const metricsEntryLimit = isActive ? 140 : 260;
+
+  return {
+    ...payload,
+    errorMessage: truncateText(payload?.errorMessage, 12_000),
+    paperMarkdown: truncateText(payload?.paperMarkdown, textLimit),
+    paperLatex: truncateText(payload?.paperLatex, textLimit),
+    referencesBib: truncateText(payload?.referencesBib, isActive ? 80_000 : 160_000),
+    experimentCode: truncateText(payload?.experimentCode, codeLimit),
+    reviewReport: truncateText(payload?.reviewReport, isActive ? 80_000 : 180_000),
+    stages: Array.isArray(payload?.stages) ? payload.stages.map((stage: any) => ({
+      ...stage,
+      output: truncateText(stage?.output, stageOutputLimit),
+      errorMessage: truncateText(stage?.errorMessage, 12_000),
+    })) : [],
+    datasets: Array.isArray(payload?.datasets) ? payload.datasets.map((dataset: any) => ({
+      ...dataset,
+      preview: truncateText(dataset?.preview, 10_000),
+    })) : [],
+    experiments: Array.isArray(payload?.experiments) ? payload.experiments.map((exp: any) => ({
+      ...exp,
+      pythonCode: truncateText(exp?.pythonCode, codeLimit),
+      stdout: truncateText(exp?.stdout, isActive ? 30_000 : 120_000),
+      stderr: truncateText(exp?.stderr, 20_000),
+      metrics: truncateRecordValues(exp?.metrics, metricsEntryLimit, 280),
+      generatedCharts: Array.isArray(exp?.generatedCharts) ? exp.generatedCharts.slice(0, 24).map((chart: any) => ({
+        ...chart,
+        description: truncateText(chart?.description, 500),
+      })) : [],
+      generatedTables: Array.isArray(exp?.generatedTables) ? exp.generatedTables.slice(0, 16).map((table: any) => ({
+        ...table,
+        description: truncateText(table?.description, 500),
+        data: truncateText(table?.data, isActive ? 10_000 : 30_000),
+      })) : [],
+    })) : [],
+  };
+}
 
 function createEmitter(runId: string): EventEmitter {
   return (event: PipelineEvent) => {
@@ -142,11 +202,24 @@ const pipelineRouter = router({
     .query(async ({ input }) => {
       const run = await db.getPipelineRun(input.runId);
       if (!run) return null;
-      const stages = await db.getStageLogsForRun(input.runId);
-      const artifactsList = await db.getArtifactsForRun(input.runId);
-      const datasets = await db.getDatasetFilesForRun(input.runId);
-      const experiments = await db.getExperimentResultsForRun(input.runId);
-      return { ...run, stages, artifacts: artifactsList, datasets, experiments };
+      const [stagesResult, artifactsResult, datasetsResult, experimentsResult] = await Promise.allSettled([
+        db.getStageLogsForRun(input.runId),
+        db.getArtifactsForRun(input.runId),
+        db.getDatasetFilesForRun(input.runId),
+        db.getExperimentResultsForRun(input.runId),
+      ]);
+      if (stagesResult.status === "rejected") console.error(`[pipeline.get] failed to load stages for ${input.runId}:`, stagesResult.reason);
+      if (artifactsResult.status === "rejected") console.error(`[pipeline.get] failed to load artifacts for ${input.runId}:`, artifactsResult.reason);
+      if (datasetsResult.status === "rejected") console.error(`[pipeline.get] failed to load datasets for ${input.runId}:`, datasetsResult.reason);
+      if (experimentsResult.status === "rejected") console.error(`[pipeline.get] failed to load experiments for ${input.runId}:`, experimentsResult.reason);
+
+      return sanitizePipelineDetailPayload({
+        ...run,
+        stages: stagesResult.status === "fulfilled" ? stagesResult.value : [],
+        artifacts: artifactsResult.status === "fulfilled" ? artifactsResult.value : [],
+        datasets: datasetsResult.status === "fulfilled" ? datasetsResult.value : [],
+        experiments: experimentsResult.status === "fulfilled" ? experimentsResult.value : [],
+      });
     }),
 
   list: publicProcedure

@@ -2046,7 +2046,7 @@ async function stage23_finalCompilation(ctx: PipelineContext): Promise<string> {
 
     // Refresh chart URLs (S3 pre-signed URLs may have expired since stage 11)
     const charts = ctx.experimentOutput?.charts || [];
-    for (const chart of charts) {
+    await Promise.all(charts.map(async (chart) => {
       const candidates = [
         chart.fileKey,
         `experiments/${ctx.runId}/${chart.name}.png`,
@@ -2076,7 +2076,7 @@ async function stage23_finalCompilation(ctx: PipelineContext): Promise<string> {
       } else {
         console.warn(`[Pipeline] Could not refresh URL for chart ${chart.name}, using original`);
       }
-    }
+    }));
     if (charts.length > 0) {
       console.log(`[Pipeline] Refreshed ${charts.length} chart URLs for PDF generation`);
     }
@@ -2085,22 +2085,26 @@ async function stage23_finalCompilation(ctx: PipelineContext): Promise<string> {
     const chartImages: ChartImage[] = charts.map((c, i) => ({
       key: `figure_${i + 1}`,
       url: c.url,
+      fileKey: c.fileKey,
       name: c.name,
       description: c.description,
     }));
 
     // Ensure chart images are saved as individual artifacts (even if stage11 already did this,
     // we do it again in stage23 to guarantee they appear in the Artifacts tab)
+    const existingArtifacts = await db.getArtifactsForRun(ctx.runId);
+    const existingChartKeys = new Set(
+      existingArtifacts
+        .filter(a => a.artifactType === "experiment_chart")
+        .flatMap(a => [a.fileKey || "", a.fileUrl || ""])
+        .filter(Boolean)
+    );
     for (const chart of (ctx.experimentOutput?.charts || [])) {
       try {
-        // Check if this chart already exists as an artifact (avoid duplicates)
-        const existingArtifacts = await db.getArtifactsForRun(ctx.runId);
         const inferredFormat = chart.format || (chart.mimeType === "image/svg+xml" || chart.url.includes(".svg") ? "svg" : "png");
         const inferredMime = chart.mimeType || (inferredFormat === "svg" ? "image/svg+xml" : "image/png");
         const inferredKey = chart.fileKey || `experiments/${ctx.runId}/${chart.name}.${inferredFormat}`;
-        const alreadyExists = existingArtifacts.some(
-          a => a.artifactType === "experiment_chart" && (a.fileUrl === chart.url || a.fileKey === inferredKey)
-        );
+        const alreadyExists = existingChartKeys.has(inferredKey) || existingChartKeys.has(chart.url);
         if (!alreadyExists) {
           await db.insertArtifact({
             runId: ctx.runId,
@@ -2111,6 +2115,8 @@ async function stage23_finalCompilation(ctx: PipelineContext): Promise<string> {
             fileKey: inferredKey,
             mimeType: inferredMime,
           });
+          existingChartKeys.add(inferredKey);
+          existingChartKeys.add(chart.url);
           console.log(`[Pipeline] Chart artifact saved: ${chart.name}`);
         }
       } catch (chartErr: any) {

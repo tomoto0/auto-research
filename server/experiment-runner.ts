@@ -582,10 +582,58 @@ function isPlaceholderOutput(parsed: {
  * Convert SVG buffer to PNG buffer using sharp.
  * Returns the original buffer if sharp is unavailable.
  */
+const SAFE_CHART_FONT_FAMILY = "Helvetica, Arial, sans-serif";
+
+function sanitizeSvgForRasterization(svgBuffer: Buffer): Buffer {
+  const svgText = svgBuffer.toString("utf-8");
+  const sanitized = svgText
+    .replace(/[^\x09\x0A\x0D\x20-\x7E]/g, " ")
+    .replace(/\s+/g, " ");
+  return Buffer.from(sanitized, "utf-8");
+}
+
+function applySafeChartFontConfig(config: any): any {
+  config.options = config.options || {};
+  config.options.font = {
+    ...(config.options.font || {}),
+    family: SAFE_CHART_FONT_FAMILY,
+  };
+  config.options.plugins = config.options.plugins || {};
+  if (config.options.plugins.title) {
+    config.options.plugins.title.font = {
+      ...(config.options.plugins.title.font || {}),
+      family: SAFE_CHART_FONT_FAMILY,
+    };
+  }
+  if (config.options.plugins.legend?.labels) {
+    config.options.plugins.legend.labels.font = {
+      ...(config.options.plugins.legend.labels.font || {}),
+      family: SAFE_CHART_FONT_FAMILY,
+    };
+  }
+  if (config.options.scales) {
+    for (const axis of Object.values(config.options.scales) as any[]) {
+      if (!axis || typeof axis !== "object") continue;
+      if (axis.title) {
+        axis.title.font = {
+          ...(axis.title.font || {}),
+          family: SAFE_CHART_FONT_FAMILY,
+        };
+      }
+      axis.ticks = axis.ticks || {};
+      axis.ticks.font = {
+        ...(axis.ticks.font || {}),
+        family: SAFE_CHART_FONT_FAMILY,
+      };
+    }
+  }
+  return config;
+}
+
 async function svgToPng(svgBuffer: Buffer, width: number, height: number): Promise<Buffer> {
   try {
     const sharp = (await import("sharp")).default;
-    const pngBuffer = await sharp(svgBuffer)
+    const pngBuffer = await sharp(sanitizeSvgForRasterization(svgBuffer))
       .resize(width, height)
       .png()
       .toBuffer();
@@ -626,6 +674,7 @@ async function renderChartToPng(
 
     // Transliterate non-ASCII labels to prevent garbling
     config = transliterateChartConfigSync(config);
+    config = applySafeChartFontConfig(config);
 
     config.options = config.options || {};
     config.options.animation = false;
