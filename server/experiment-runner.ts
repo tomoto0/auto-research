@@ -60,6 +60,18 @@ export interface ExperimentOutput {
   metrics: Record<string, number | string>;
 }
 
+interface DeterministicAnalysisPlan {
+  methods?: string[];
+  blockedMethods?: string[];
+  datasets?: Array<{
+    name?: string;
+    columns?: string[];
+    rows?: number;
+    fileType?: string;
+  }>;
+  topic?: string;
+}
+
 interface MethodFeasibilityContractInput {
   executableNow?: string[];
   requiresMissingData?: string[];
@@ -127,6 +139,16 @@ function buildExecutableMethodSet(
     if (normalized) set.add(normalized);
   }
   return set;
+}
+
+function parseDeterministicAnalysisPlan(analysisCode: string): DeterministicAnalysisPlan | null {
+  try {
+    const parsed = JSON.parse(analysisCode);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as DeterministicAnalysisPlan;
+    }
+  } catch {}
+  return null;
 }
 
 function methodAllowed(executableMethods: Set<string> | null, methodId: string): boolean {
@@ -1241,6 +1263,81 @@ export function generateSvgFallbackChart(
 /** Cache for LLM-translated labels to avoid redundant API calls */
 const translationCache = new Map<string, string>();
 
+function ensureAsciiLabelSync(str: string, fallbackPrefix = "Variable"): string {
+  if (!str) return str;
+  const transliterated = transliterateLabelSync(str);
+  const ascii = transliterated.replace(/[^\x20-\x7E]/g, " ").replace(/\s+/g, " ").trim();
+  if (ascii) return ascii;
+  const originalAscii = String(str).replace(/[^\x20-\x7E]/g, " ").replace(/\s+/g, " ").trim();
+  if (originalAscii) return originalAscii;
+  return `${fallbackPrefix} ${String(str).length}`;
+}
+
+function collectNonAsciiStringsDeep(value: unknown, acc: Set<string>): void {
+  if (typeof value === "string") {
+    if (/[^\x00-\x7F]/.test(value)) acc.add(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectNonAsciiStringsDeep(item, acc);
+    return;
+  }
+  if (value && typeof value === "object") {
+    for (const nested of Object.values(value as Record<string, unknown>)) {
+      collectNonAsciiStringsDeep(nested, acc);
+    }
+  }
+}
+
+function mapStringsDeep(value: unknown, transform: (input: string) => string): unknown {
+  if (typeof value === "string") return transform(value);
+  if (Array.isArray(value)) return value.map(item => mapStringsDeep(item, transform));
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = mapStringsDeep(nested, transform);
+    }
+    return out;
+  }
+  return value;
+}
+
+function buildAsciiColumnRenameMap(
+  columns: string[],
+  translations?: Map<string, string>,
+): Map<string, string> {
+  const colMap = new Map<string, string>();
+  const used = new Set<string>();
+  for (const col of columns) {
+    const preferred = translations?.get(col) || col;
+    const baseName = ensureAsciiLabelSync(preferred || col).slice(0, 80) || `Variable ${col.length}`;
+    let finalName = baseName;
+    let suffix = 2;
+    while (used.has(finalName)) {
+      finalName = `${baseName}_${suffix}`;
+      suffix += 1;
+    }
+    used.add(finalName);
+    colMap.set(col, finalName);
+  }
+  return colMap;
+}
+
+function applyColumnRenameMap(
+  dataset: { columns: string[]; data: Record<string, any>[] },
+  colMap: Map<string, string>,
+): void {
+  dataset.columns = dataset.columns.map(col => colMap.get(col) || col);
+  for (const row of dataset.data) {
+    for (const [oldCol, newCol] of Array.from(colMap.entries())) {
+      if (oldCol !== newCol && oldCol in row) {
+        row[newCol] = row[oldCol];
+        delete row[oldCol];
+      }
+    }
+  }
+}
+
 /**
  * Translate a batch of non-ASCII strings to English using LLM.
  * Results are cached to avoid redundant API calls.
@@ -1392,25 +1489,9 @@ const transliterateLabel = transliterateLabelSync;
 function transliterateChartConfigSync(config: any): any {
   if (!config) return config;
   const clone = JSON.parse(JSON.stringify(config));
-  if (clone.data?.labels) {
-    clone.data.labels = clone.data.labels.map((l: any) => transliterateLabel(String(l)));
-  }
-  if (clone.data?.datasets) {
-    for (const ds of clone.data.datasets) {
-      if (ds.label) ds.label = transliterateLabel(String(ds.label));
-    }
-  }
-  if (clone.options?.plugins?.title?.text) {
-    clone.options.plugins.title.text = transliterateLabel(String(clone.options.plugins.title.text));
-  }
-  if (clone.options?.scales) {
-    for (const axis of Object.values(clone.options.scales) as any[]) {
-      if (axis?.title?.text) {
-        axis.title.text = transliterateLabel(String(axis.title.text));
-      }
-    }
-  }
-  return clone;
+  return mapStringsDeep(clone, (value) => (
+    /[^\x00-\x7F]/.test(value) ? ensureAsciiLabelSync(value, "Label") : value
+  ));
 }
 
 /**
@@ -1420,68 +1501,19 @@ function transliterateChartConfigSync(config: any): any {
 async function transliterateChartConfigAsync(config: any): Promise<any> {
   if (!config) return config;
   const clone = JSON.parse(JSON.stringify(config));
-
-  // Collect all non-ASCII strings from the config
-  const nonAsciiStrings: string[] = [];
-  if (clone.data?.labels) {
-    for (const l of clone.data.labels) {
-      const s = String(l);
-      if (/[^\x00-\x7F]/.test(s)) nonAsciiStrings.push(s);
-    }
-  }
-  if (clone.data?.datasets) {
-    for (const ds of clone.data.datasets) {
-      if (ds.label && /[^\x00-\x7F]/.test(String(ds.label))) nonAsciiStrings.push(String(ds.label));
-    }
-  }
-  if (clone.options?.plugins?.title?.text) {
-    const t = String(clone.options.plugins.title.text);
-    if (/[^\x00-\x7F]/.test(t)) nonAsciiStrings.push(t);
-  }
-  if (clone.options?.scales) {
-    for (const axis of Object.values(clone.options.scales) as any[]) {
-      if (axis?.title?.text) {
-        const t = String(axis.title.text);
-        if (/[^\x00-\x7F]/.test(t)) nonAsciiStrings.push(t);
-      }
-    }
-  }
+  const nonAsciiSet = new Set<string>();
+  collectNonAsciiStringsDeep(clone, nonAsciiSet);
+  const nonAsciiStrings = Array.from(nonAsciiSet);
 
   // If no non-ASCII strings, return as-is
   if (nonAsciiStrings.length === 0) return clone;
 
   // Translate all non-ASCII strings in one batch
-  const translations = await translateLabelsToEnglish(Array.from(new Set(nonAsciiStrings)));
-
-  // Apply translations
-  if (clone.data?.labels) {
-    clone.data.labels = clone.data.labels.map((l: any) => {
-      const s = String(l);
-      return translations.get(s) || transliterateLabel(s);
-    });
-  }
-  if (clone.data?.datasets) {
-    for (const ds of clone.data.datasets) {
-      if (ds.label) {
-        const s = String(ds.label);
-        ds.label = translations.get(s) || transliterateLabel(s);
-      }
-    }
-  }
-  if (clone.options?.plugins?.title?.text) {
-    const s = String(clone.options.plugins.title.text);
-    clone.options.plugins.title.text = translations.get(s) || transliterateLabel(s);
-  }
-  if (clone.options?.scales) {
-    for (const axis of Object.values(clone.options.scales) as any[]) {
-      if (axis?.title?.text) {
-        const s = String(axis.title.text);
-        axis.title.text = translations.get(s) || transliterateLabel(s);
-      }
-    }
-  }
-
-  return clone;
+  const translations = await translateLabelsToEnglish(nonAsciiStrings);
+  return mapStringsDeep(clone, (value) => {
+    if (!/[^\x00-\x7F]/.test(value)) return value;
+    return ensureAsciiLabelSync(translations.get(value) || value, "Label");
+  });
 }
 
 function escapeXml(str: string): string {
@@ -1514,6 +1546,8 @@ export async function executePythonExperiment(
   methodContract?: MethodFeasibilityContractInput | null
 ): Promise<ExperimentOutput> {
   const startTime = Date.now();
+  const deterministicPlan = parseDeterministicAnalysisPlan(analysisCode);
+  const analysisTopic = typeof deterministicPlan?.topic === "string" ? deterministicPlan.topic : "";
   const workDir = path.join(os.tmpdir(), `experiment-${runId}-${nanoid(6)}`);
   const dataDir = path.join(workDir, "data");
   fs.mkdirSync(workDir, { recursive: true });
@@ -1588,48 +1622,27 @@ export async function executePythonExperiment(
       }
       if (allColNames.length > 0) {
         const colTranslations = await translateLabelsToEnglish(allColNames);
-        // Create column name mapping and rename columns in allData
         for (const ds of allData) {
-          const colMap = new Map<string, string>();
-          const newColumns: string[] = [];
-          for (const col of ds.columns) {
-            const translated = colTranslations.get(col) || transliterateLabelSync(col);
-            // Ensure unique column names
-            let finalName = translated;
-            let suffix = 2;
-            while (newColumns.includes(finalName) && finalName !== col) {
-              finalName = `${translated}_${suffix}`;
-              suffix++;
-            }
-            colMap.set(col, finalName);
-            newColumns.push(finalName);
-          }
-          // Rename columns in data rows IN-PLACE to avoid doubling memory
-          ds.columns = newColumns;
-          for (const row of ds.data) {
-            for (const [oldCol, newCol] of Array.from(colMap.entries())) {
-              if (oldCol !== newCol && oldCol in row) {
-                row[newCol] = row[oldCol];
-                delete row[oldCol];
-              }
-            }
-          }
+          applyColumnRenameMap(ds, buildAsciiColumnRenameMap(ds.columns, colTranslations));
         }
         logs.push(`[INFO] Translated ${allColNames.length} column names to English`);
       } else {
         logs.push("[INFO] All column names are already ASCII, no translation needed");
       }
     } catch (translateErr: any) {
-      logs.push(`[WARN] Column name translation failed: ${translateErr.message}, using original names`);
+      logs.push(`[WARN] Column name translation failed: ${translateErr.message}; applying deterministic ASCII fallback`);
+      for (const ds of allData) {
+        applyColumnRenameMap(ds, buildAsciiColumnRenameMap(ds.columns));
+      }
     }
 
     // 2. ALWAYS generate charts/tables/metrics from REAL DATA
     // LLM-generated analysis code is NOT trusted for data values (hallucination risk).
     // We always use generateDefaultCharts/Tables/Metrics which compute from actual data.
     logs.push("[INFO] Generating analysis from actual data (bypassing LLM data values to prevent hallucination)...");
-    const chartDefinitions = generateDefaultCharts(allData, executableMethods);
-    const tableDefinitions = generateDefaultTables(allData, executableMethods);
-    const metricsFromCode = generateDefaultMetrics(allData, executableMethods);
+    const chartDefinitions = generateDefaultCharts(allData, executableMethods, analysisTopic);
+    const tableDefinitions = generateDefaultTables(allData, executableMethods, analysisTopic);
+    const metricsFromCode = generateDefaultMetrics(allData, executableMethods, analysisTopic);
     logs.push(`[INFO] Generated ${chartDefinitions.length} charts, ${tableDefinitions.length} tables, ${Object.keys(metricsFromCode).length} metrics from real data`);
     if (executableMethods !== null) {
       logs.push(`[INFO] Enforced method contract executable_now: ${Array.from(executableMethods).join(", ")}`);
@@ -1716,7 +1729,22 @@ export async function executePythonExperiment(
         logs.push(`[INFO] Translated ${nonAsciiSet.size} non-ASCII labels in tables/metrics/charts`);
       }
     } catch (trErr: any) {
-      logs.push(`[WARN] Table/metric label translation failed: ${trErr.message}`);
+      logs.push(`[WARN] Table/metric label translation failed: ${trErr.message}; applying deterministic ASCII fallback`);
+      const tr = (s: string) => ensureAsciiLabelSync(s);
+      for (const t of tableDefinitions) {
+        t.headers = t.headers.map(h => typeof h === "string" ? tr(h) : String(h));
+        t.rows = t.rows.map(row => row.map(cell => typeof cell === "string" ? tr(cell) : cell));
+        t.description = tr(t.description);
+      }
+      const fallbackMetrics: Record<string, number | string> = {};
+      for (const [key, val] of Object.entries(metrics)) {
+        fallbackMetrics[tr(key)] = val;
+      }
+      for (const key of Object.keys(metrics)) delete metrics[key];
+      Object.assign(metrics, fallbackMetrics);
+      for (const cd of chartDefinitions) {
+        cd.description = tr(cd.description);
+      }
     }
 
     // 3. Render each chart via chartjs-node-canvas
@@ -1735,7 +1763,10 @@ export async function executePythonExperiment(
           chartDef.config = translated;
         }
       } catch (err: any) {
-        logs.push(`[WARN] LLM translation failed for ${chartDef.name}: ${err.message}`);
+        logs.push(`[WARN] LLM translation failed for ${chartDef.name}: ${err.message}; applying deterministic ASCII fallback`);
+        if (chartDef.config) {
+          chartDef.config = transliterateChartConfigSync(chartDef.config);
+        }
       }
     }
 
@@ -2330,12 +2361,48 @@ function detectTreatmentColumns(ds: ParsedDataset, numericCols: string[], catego
     .map(([col]) => col);
 }
 
-function detectOutcomeColumns(ds: ParsedDataset, numericCols: string[]): string[] {
+function extractTopicKeywords(topic?: string): string[] {
+  const stopWords = new Set([
+    "about", "across", "after", "analysis", "and", "between", "effect", "effects", "evidence",
+    "from", "into", "market", "markets", "method", "methods", "model", "models", "of",
+    "on", "paper", "research", "study", "the", "their", "through", "using", "with",
+  ]);
+  const candidates = [topic || "", ensureAsciiLabelSync(topic || "", "").toLowerCase()];
+  const keywords = new Set<string>();
+  for (const text of candidates) {
+    const tokens = text
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter(token => token.length >= 4 && !stopWords.has(token));
+    for (const token of tokens) keywords.add(token);
+  }
+  return Array.from(keywords);
+}
+
+function scoreTopicAlignment(columnName: string, topicKeywords: string[]): number {
+  if (topicKeywords.length === 0) return 0;
+  const normalized = columnName.toLowerCase().replace(/[^a-z0-9]+/g, " ");
+  let score = 0;
+  for (const keyword of topicKeywords) {
+    if (normalized.includes(keyword)) score += keyword.length >= 7 ? 3 : 2;
+    if (keyword.startsWith("mental") && /(mental|depress|anxiety|stress|distress|wellbeing|well being|health|happiness|satisfaction)/i.test(normalized)) score += 3;
+    if (/(labou?r|employment|job|wage|income|earnings|salary|hours|unemployment)/i.test(keyword) && /(employment|job|wage|income|earnings|salary|hours|unemployment|labou?r)/i.test(normalized)) score += 3;
+  }
+  return score;
+}
+
+function detectOutcomeColumns(ds: ParsedDataset, numericCols: string[], topic?: string): string[] {
+  const topicKeywords = extractTopicKeywords(topic);
   const scored = new Map<string, number>();
   for (const col of numericCols) {
     let score = 1;
-    if (/(outcome|target|response|score|rate|risk|income|wage|price|cost|value|metric|performance|sales|earnings|mortality)/i.test(col)) score += 5;
+    if (/(outcome|target|response|score|rate|risk|income|wage|price|cost|value|metric|performance|sales|earnings|mortality|health|mental|depress|anxiety|stress|wellbeing|happiness|satisfaction|employment|unemployment|hours|productivity)/i.test(col)) score += 5;
+    score += scoreTopicAlignment(col, topicKeywords);
     if (/(id|code|index)$/i.test(col)) score -= 2;
+    if (/(^age$|_age$|^year$|^month$|^wave$|post|after|dummy|flag|indicator|treated?|control)/i.test(col)) score -= 2;
+    if (/(age|gender|sex|male|female|married|education|region|prefecture|country|state|city)/i.test(col)) score -= 1;
+    if (isBinaryLikeColumn(ds, col) && !/(outcome|target|response|employment|unemployment|health|disease|mortality)/i.test(col)) score -= 1;
     scored.set(col, score);
   }
   return Array.from(scored.entries())
@@ -2356,11 +2423,12 @@ function inferEconometricDesignHints(
   numericCols: string[],
   categoricalCols: string[],
   idCols: string[],
+  topic?: string,
 ): EconometricDesignHints {
   const timeCols = detectTimeColumnsFromDataset(ds);
   const entityCols = detectEntityColumns(ds, categoricalCols, idCols);
   const treatmentCols = detectTreatmentColumns(ds, numericCols, categoricalCols);
-  const outcomeCols = detectOutcomeColumns(ds, numericCols);
+  const outcomeCols = detectOutcomeColumns(ds, numericCols, topic);
   const instrumentCols = detectInstrumentColumns(ds);
   const runningCols = detectRunningVariableColumns(ds, numericCols);
   const primaryOutcomeCol = outcomeCols[0] || numericCols[0];
@@ -3799,7 +3867,8 @@ function getPrimaryDataset(allData: ParsedDataset[]): ParsedDataset | null {
 
 export function generateDefaultCharts(
   allData: { name: string; data: Record<string, any>[]; columns: string[]; totalRows: number }[],
-  executableMethods: Set<string> | null
+  executableMethods: Set<string> | null,
+  analysisTopic = "",
 ): { name: string; description: string; config: any }[] {
   const charts: { name: string; description: string; config: any }[] = [];
   const ds = getPrimaryDataset(allData);
@@ -3808,7 +3877,7 @@ export function generateDefaultCharts(
   const { numericCols: rawNumericCols, categoricalCols, idCols } = classifyColumns(ds.data, ds.columns);
   // Exclude ID/code columns from analysis - they are not meaningful for statistics
   const numericCols = rawNumericCols.filter(c => !idCols.includes(c));
-  const designHints = inferEconometricDesignHints(ds, numericCols, categoricalCols, idCols);
+  const designHints = inferEconometricDesignHints(ds, numericCols, categoricalCols, idCols, analysisTopic);
   const robustOls =
     designHints.primaryOutcomeCol && designHints.primaryRegressorCol && designHints.primaryOutcomeCol !== designHints.primaryRegressorCol
       ? computeRobustOls(ds, designHints.primaryRegressorCol, designHints.primaryOutcomeCol)
@@ -5172,7 +5241,8 @@ function buildRoutingDiagnostics(
 
 function generateDefaultTables(
   allData: { name: string; data: Record<string, any>[]; columns: string[]; totalRows: number }[],
-  executableMethods: Set<string> | null
+  executableMethods: Set<string> | null,
+  analysisTopic = "",
 ): { name: string; description: string; headers: string[]; rows: (string | number)[][] }[] {
   const tables: { name: string; description: string; headers: string[]; rows: (string | number)[][] }[] = [];
   const ds = getPrimaryDataset(allData);
@@ -5182,7 +5252,7 @@ function generateDefaultTables(
   // Exclude ID/code columns from tables - they are not meaningful for descriptive statistics
   const numericCols = rawNumericCols.filter(c => !_idCols2.includes(c));
   const methodAssessments = buildMethodApplicabilityAssessment(ds, numericCols, categoricalCols);
-  const designHints = inferEconometricDesignHints(ds, numericCols, categoricalCols, _idCols2);
+  const designHints = inferEconometricDesignHints(ds, numericCols, categoricalCols, _idCols2, analysisTopic);
   const robustOls =
     designHints.primaryOutcomeCol && designHints.primaryRegressorCol && designHints.primaryOutcomeCol !== designHints.primaryRegressorCol
       ? computeRobustOls(ds, designHints.primaryRegressorCol, designHints.primaryOutcomeCol)
@@ -5667,7 +5737,8 @@ function generateDefaultTables(
 
 export function generateDefaultMetrics(
   allData: { name: string; data: Record<string, any>[]; columns: string[]; totalRows: number }[],
-  executableMethods: Set<string> | null
+  executableMethods: Set<string> | null,
+  analysisTopic = "",
 ): Record<string, number | string> {
   const metrics: Record<string, number | string> = {};
   const ds = getPrimaryDataset(allData);
@@ -5701,7 +5772,7 @@ export function generateDefaultMetrics(
   // Descriptive stats for meaningful numeric columns only (exclude ID/code columns)
   const meaningfulNumericCols = numericCols.filter(c => !idCols.includes(c));
   const methodAssessments = buildMethodApplicabilityAssessment(ds, meaningfulNumericCols, categoricalCols);
-  const designHints = inferEconometricDesignHints(ds, meaningfulNumericCols, categoricalCols, idCols);
+  const designHints = inferEconometricDesignHints(ds, meaningfulNumericCols, categoricalCols, idCols, analysisTopic);
   const robustOls =
     designHints.primaryOutcomeCol && designHints.primaryRegressorCol && designHints.primaryOutcomeCol !== designHints.primaryRegressorCol
       ? computeRobustOls(ds, designHints.primaryRegressorCol, designHints.primaryOutcomeCol)

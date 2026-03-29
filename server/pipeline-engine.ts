@@ -95,6 +95,29 @@ interface ClaimVerificationResult {
   flaggedClaims: string[];
 }
 
+export function describeExperimentArtifact(experimentCode: string): {
+  fileName: string;
+  storageFileName: string;
+  mimeType: string;
+} {
+  const trimmed = (experimentCode || "").trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      JSON.parse(trimmed);
+      return {
+        fileName: "analysis_plan.json",
+        storageFileName: "analysis-plan.json",
+        mimeType: "application/json",
+      };
+    } catch {}
+  }
+  return {
+    fileName: "experiment.py",
+    storageFileName: "experiment.py",
+    mimeType: "text/x-python",
+  };
+}
+
 // ─── Approval tracking for manual mode ───
 // Maps runId -> { resolve, reject } for the currently awaiting approval
 const approvalWaiters = new Map<string, {
@@ -1397,7 +1420,7 @@ async function stage11_experimentExecution(ctx: PipelineContext): Promise<string
         });
       }
 
-      const resultText = `Python experiment executed ${output.success ? "successfully" : "with errors"} in ${(output.executionTimeMs / 1000).toFixed(1)}s.\n\nExit code: ${output.exitCode}${chartSummary}${tableSummary}${metricsSummary}\n\nMETHOD FEASIBILITY CONTRACT:\n${formatMethodContract(ctx.methodContract)}\n\nEXECUTION DIAGNOSTICS:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}\n\nMETHOD EXECUTION INTEGRITY CHECK:\n${ctx.methodIntegrityNote}\n\nStdout:\n${output.stdout.substring(0, 3000)}${output.stderr ? `\n\nStderr:\n${output.stderr.substring(0, 1000)}` : ""}`;
+      const resultText = `Analysis execution completed ${output.success ? "successfully" : "with errors"} in ${(output.executionTimeMs / 1000).toFixed(1)}s.\n\nExit code: ${output.exitCode}${chartSummary}${tableSummary}${metricsSummary}\n\nMETHOD FEASIBILITY CONTRACT:\n${formatMethodContract(ctx.methodContract)}\n\nEXECUTION DIAGNOSTICS:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}\n\nMETHOD EXECUTION INTEGRITY CHECK:\n${ctx.methodIntegrityNote}\n\nStdout:\n${output.stdout.substring(0, 3000)}${output.stderr ? `\n\nStderr:\n${output.stderr.substring(0, 1000)}` : ""}`;
 
       ctx.experimentResults = resultText;
       return resultText;
@@ -1992,6 +2015,7 @@ async function stage22_revision(ctx: PipelineContext): Promise<string> {
 
 async function stage23_finalCompilation(ctx: PipelineContext): Promise<string> {
   const suffix = nanoid(8);
+  const experimentArtifact = describeExperimentArtifact(ctx.experimentCode);
 
   try {
     if (ctx.latex) {
@@ -2003,8 +2027,17 @@ async function stage23_finalCompilation(ctx: PipelineContext): Promise<string> {
       await db.insertArtifact({ runId: ctx.runId, stageNumber: 23, artifactType: "references_bib", fileName: "references.bib", fileUrl: url, fileKey: `runs/${ctx.runId}/references-${suffix}.bib`, mimeType: "text/plain" });
     }
     if (ctx.experimentCode) {
-      const { url } = await storagePut(`runs/${ctx.runId}/experiment-${suffix}.py`, ctx.experimentCode, "text/x-python");
-      await db.insertArtifact({ runId: ctx.runId, stageNumber: 23, artifactType: "experiment_code", fileName: "experiment.py", fileUrl: url, fileKey: `runs/${ctx.runId}/experiment-${suffix}.py`, mimeType: "text/x-python" });
+      const experimentStorageKey = `runs/${ctx.runId}/${experimentArtifact.storageFileName.replace(/\.(json|py)$/i, `-${suffix}.$1`)}`;
+      const { url } = await storagePut(experimentStorageKey, ctx.experimentCode, experimentArtifact.mimeType);
+      await db.insertArtifact({
+        runId: ctx.runId,
+        stageNumber: 23,
+        artifactType: "experiment_code",
+        fileName: experimentArtifact.fileName,
+        fileUrl: url,
+        fileKey: experimentStorageKey,
+        mimeType: experimentArtifact.mimeType,
+      });
     }
     if (ctx.reviewReport) {
       const { url } = await storagePut(`runs/${ctx.runId}/review-${suffix}.md`, ctx.reviewReport, "text/markdown");
