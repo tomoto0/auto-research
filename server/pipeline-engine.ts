@@ -1752,6 +1752,19 @@ async function stage19_referenceFormatting(ctx: PipelineContext): Promise<string
   return `Generated BibTeX file with ${ctx.papers.slice(0, 20).length} references.\n\n${bibtexEntries}`;
 }
 
+function postProcessLatexSource(latex: string): string {
+  let result = latex;
+  result = result.replace(/\\newcommand\{\\sci\}(?:\[[^\]]+\])?\{[\s\S]*?\}/g, "\\newcommand{\\sci}[2]{#1 \\\\times 10^{#2}}");
+  result = result.replace(/\\newcommand\{\\sci\}\\cite\{[^}]+\}\{[^}]+\}/g, "\\newcommand{\\sci}[2]{#1 \\\\times 10^{#2}}");
+  if (!/\\newcommand\{\\sci\}\[2\]/.test(result)) {
+    result = result.replace(/\\usepackage\[T1\]\{fontenc\}[^\n]*\n/, (match) => `${match}\\newcommand{\\sci}[2]{#1 \\\\times 10^{#2}}\n`);
+  }
+  result = result.replace(/`([^`\n]+)`/g, "\\texttt{$1}");
+  result = result.replace(/\\title\{\s*\\textbf\{([^}]+)\}\s*\}/g, "\\title{$1}");
+  result = result.replace(/\\author\{\s*\\textbf\{([^}]+)\}/g, "\\author{$1");
+  return result;
+}
+
 async function stage20_latexCompilation(ctx: PipelineContext): Promise<string> {
   // Build figure instructions if we have experiment-generated charts
   let figureInstructions = "";
@@ -1822,6 +1835,7 @@ ALL content — including figures, tables, and equations — MUST fit within A4 
   );
   // Strip any code block markers the LLM might have added
   let latex = stripCodeBlockMarkers(result);
+  latex = postProcessLatexSource(latex);
 
   // ─── Citation normalisation post-processing ───
   // Build a mapping from all known BibTeX keys (from any source) to the stable ref1..refN keys.

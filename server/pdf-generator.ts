@@ -143,6 +143,30 @@ interface PaperSection {
   tableCaption?: string;
 }
 
+function extractLatexCommandArgument(source: string, commandName: string): string | null {
+  const marker = `\\${commandName}{`;
+  const start = source.indexOf(marker);
+  if (start < 0) return null;
+  let depth = 1;
+  let cursor = start + marker.length;
+  let result = "";
+  while (cursor < source.length) {
+    const char = source[cursor];
+    if (char === "{") {
+      depth += 1;
+      result += char;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return result;
+      result += char;
+    } else {
+      result += char;
+    }
+    cursor += 1;
+  }
+  return null;
+}
+
 function parseLatexToSections(
   latexSource: string,
   title: string,
@@ -219,14 +243,14 @@ function parseLatexToSections(
   _activeCitationMap = citationMap;
 
   // Extract title
-  const titleMatch = tex.match(/\\title\{([^}]+)\}/);
-  const paperTitle = titleMatch ? cleanLatexInline(titleMatch[1]) : title;
+  const titleArg = extractLatexCommandArgument(tex, "title");
+  const paperTitle = titleArg ? cleanLatexInline(titleArg) : title;
   sections.push({ type: "title", text: paperTitle });
 
   // Extract author(s) - handle both single-line and multi-line \author{...}
-  const authorMatch = tex.match(/\\author\{([\s\S]*?)\}/);
-  if (authorMatch) {
-    let authorText = authorMatch[1]
+  const authorArg = extractLatexCommandArgument(tex, "author");
+  if (authorArg) {
+    let authorText = authorArg
       .replace(/\\\\+/g, ", ") // line breaks to commas
       .replace(/\\and/g, ", ") // \and to commas
       .replace(/\\texttt\{[^}]*\}/g, "") // remove email

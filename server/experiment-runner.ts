@@ -656,39 +656,9 @@ async function renderChartToPng(
   width = 900,
   height = 560
 ): Promise<Buffer> {
-  // Strategy 1: Try chartjs-node-canvas
-  try {
-    const { ChartJSNodeCanvas } = await import("chartjs-node-canvas");
-    const chartJSNodeCanvas = new ChartJSNodeCanvas({
-      width,
-      height,
-      backgroundColour: "white",
-    });
+  const preferCanvasRenderer = process.env.CHART_RENDERER === "canvas";
 
-    let config: any;
-    try {
-      config = JSON.parse(chartConfigJs);
-    } catch {
-      config = new Function(`return (${chartConfigJs})`)();
-    }
-
-    // Transliterate non-ASCII labels to prevent garbling
-    config = transliterateChartConfigSync(config);
-    config = applySafeChartFontConfig(config);
-
-    config.options = config.options || {};
-    config.options.animation = false;
-    config.options.responsive = false;
-    config.options.devicePixelRatio = 3;
-
-    const pngBuffer = await chartJSNodeCanvas.renderToBuffer(config);
-    console.log(`[Chart] chartjs-node-canvas produced ${pngBuffer.length} bytes PNG`);
-    return Buffer.from(pngBuffer);
-  } catch (err: any) {
-    console.warn(`[Chart] chartjs-node-canvas failed: ${err.message}`);
-  }
-
-  // Strategy 2: Generate SVG and convert to PNG via sharp
+  // Strategy 1: Generate SVG and convert to PNG via sharp
   console.log(`[Chart] Falling back to SVG + sharp PNG conversion...`);
   const svgBuffer = generateSvgFallbackChart(chartConfigJs, width, height);
   const pngBuffer = await svgToPng(svgBuffer, width, height);
@@ -699,8 +669,41 @@ async function renderChartToPng(
     return pngBuffer;
   }
 
+  // Strategy 2: Opt-in canvas renderer when explicitly requested
+  if (preferCanvasRenderer) {
+    try {
+      const { ChartJSNodeCanvas } = await import("chartjs-node-canvas");
+      const chartJSNodeCanvas = new ChartJSNodeCanvas({
+        width,
+        height,
+        backgroundColour: "white",
+      });
+
+      let config: any;
+      try {
+        config = JSON.parse(chartConfigJs);
+      } catch {
+        config = new Function(`return (${chartConfigJs})`)();
+      }
+
+      config = transliterateChartConfigSync(config);
+      config = applySafeChartFontConfig(config);
+
+      config.options = config.options || {};
+      config.options.animation = false;
+      config.options.responsive = false;
+      config.options.devicePixelRatio = 3;
+
+      const canvasPngBuffer = await chartJSNodeCanvas.renderToBuffer(config);
+      console.log(`[Chart] chartjs-node-canvas produced ${canvasPngBuffer.length} bytes PNG`);
+      return Buffer.from(canvasPngBuffer);
+    } catch (err: any) {
+      console.warn(`[Chart] chartjs-node-canvas failed after SVG fallback: ${err.message}`);
+    }
+  }
+
   // Strategy 3: Return SVG as-is (will be saved with .svg extension)
-  console.warn(`[Chart] All PNG strategies failed, returning raw SVG`);
+  console.warn(`[Chart] PNG strategies failed, returning raw SVG`);
   return svgBuffer;
 }
 
@@ -2065,6 +2068,91 @@ function parseNumericPairs(ds: ParsedDataset, xCol: string, yCol: string): [numb
   return pairs;
 }
 
+function getFiniteNumericValues(ds: ParsedDataset, col: string, limit = 2500): number[] {
+  const values: number[] = [];
+  for (const row of ds.data) {
+    const value = Number(row[col]);
+    if (!isNaN(value) && isFinite(value)) values.push(value);
+    if (values.length >= limit) break;
+  }
+  return values;
+}
+
+function isPathologicalNumericColumn(ds: ParsedDataset, col: string): boolean {
+  const values = getFiniteNumericValues(ds, col);
+  if (values.length < 20) return false;
+  const absValues = values.map(value => Math.abs(value));
+  const maxAbs = Math.max(...absValues);
+  if (!isFinite(maxAbs) || maxAbs === 0) return false;
+  const extremeShare = absValues.filter(value => value >= 1e12).length / values.length;
+  const maxValueCount = absValues.filter(value => value === maxAbs).length;
+  const repeatedExtremeShare = maxValueCount / values.length;
+  const zeroOrSentinelDominance = values.filter(value => value === 0 || Math.abs(value) >= 1e20).length / values.length;
+  return maxAbs >= 1e20 || extremeShare >= 0.25 || repeatedExtremeShare >= 0.4 || zeroOrSentinelDominance >= 0.75;
+}
+
+function rankMeaningfulNumericColumns(
+  ds: ParsedDataset,
+  numericCols: string[],
+  hints: EconometricDesignHints,
+  topic?: string,
+): string[] {
+  const topicKeywords = extractTopicKeywords(topic);
+  const scored = numericCols.map((col) => {
+    let score = scoreTopicAlignment(col, topicKeywords);
+    if (col === hints.primaryOutcomeCol) score += 20;
+    if (col === hints.primaryRegressorCol) score += 12;
+    if (col === hints.primaryTreatmentCol) score += 10;
+    if (hints.outcomeCols.includes(col)) score += 8;
+    if (/(mental|health|ghq|depress|anxiety|stress|wellbeing|happiness|wage|income|hours|employment|unemployment|earnings|salary|shock)/i.test(col)) score += 6;
+    if (/(age|year|month|wave|time|post|flag|dummy|index|scorecard)/i.test(col)) score -= 5;
+    if (isBinaryLikeColumn(ds, col) && !/(employment|unemployment|health|ghq|shock|treat|status)/i.test(col)) score -= 2;
+    if (isPathologicalNumericColumn(ds, col)) score -= 25;
+    return { col, score };
+  });
+
+  const usable = scored.filter(item => item.score > -20);
+  const pool = usable.length > 0 ? usable : scored;
+  return pool
+    .sort((a, b) => b.score - a.score || a.col.localeCompare(b.col))
+    .map(item => item.col);
+}
+
+function choosePreferredDescriptiveNumericColumn(
+  ds: ParsedDataset,
+  numericCols: string[],
+  hints: EconometricDesignHints,
+): string | undefined {
+  const orderedCandidates = Array.from(new Set([
+    hints.primaryOutcomeCol,
+    ...hints.outcomeCols,
+    hints.primaryRegressorCol,
+    ...numericCols,
+  ].filter((col): col is string => Boolean(col))));
+
+  return orderedCandidates.find(col => !isBinaryLikeColumn(ds, col) && !isPathologicalNumericColumn(ds, col))
+    || orderedCandidates.find(col => !isPathologicalNumericColumn(ds, col))
+    || numericCols[0];
+}
+
+function chooseSecondaryDescriptiveNumericColumn(
+  ds: ParsedDataset,
+  numericCols: string[],
+  hints: EconometricDesignHints,
+  primaryCol?: string,
+): string | undefined {
+  const orderedCandidates = Array.from(new Set([
+    hints.primaryRegressorCol,
+    hints.primaryTreatmentCol,
+    ...hints.outcomeCols,
+    ...numericCols,
+  ].filter((col): col is string => Boolean(col) && col !== primaryCol)));
+
+  return orderedCandidates.find(col => !isBinaryLikeColumn(ds, col) && !isPathologicalNumericColumn(ds, col))
+    || orderedCandidates.find(col => !isPathologicalNumericColumn(ds, col))
+    || numericCols.find(col => col !== primaryCol);
+}
+
 /**
  * Approximate two-tailed p-value for Pearson correlation using t-distribution.
  * Uses Abramowitz & Stegun rational approximation for the normal CDF when df > 30,
@@ -2435,7 +2523,8 @@ function scoreTopicAlignment(columnName: string, topicKeywords: string[]): numbe
   let score = 0;
   for (const keyword of topicKeywords) {
     if (normalized.includes(keyword)) score += keyword.length >= 7 ? 3 : 2;
-    if (keyword.startsWith("mental") && /(mental|depress|anxiety|stress|distress|wellbeing|well being|health|happiness|satisfaction)/i.test(normalized)) score += 3;
+    if (keyword.startsWith("mental") && /(mental|depress|anxiety|stress|distress|wellbeing|well being|health|happiness|satisfaction|ghq|phq|gad|k6|k10|cesd|who5|sf12|sf36)/i.test(normalized)) score += 3;
+    if (keyword.startsWith("health") && /(health|ghq|phq|gad|k6|k10|cesd|who5|sf12|sf36)/i.test(normalized)) score += 3;
     if (/(labou?r|employment|job|wage|income|earnings|salary|hours|unemployment)/i.test(keyword) && /(employment|job|wage|income|earnings|salary|hours|unemployment|labou?r)/i.test(normalized)) score += 3;
   }
   return score;
@@ -2446,7 +2535,7 @@ function detectOutcomeColumns(ds: ParsedDataset, numericCols: string[], topic?: 
   const scored = new Map<string, number>();
   for (const col of numericCols) {
     let score = 1;
-    if (/(outcome|target|response|score|rate|risk|income|wage|price|cost|value|metric|performance|sales|earnings|mortality|health|mental|depress|anxiety|stress|wellbeing|happiness|satisfaction|employment|unemployment|hours|productivity)/i.test(col)) score += 5;
+    if (/(outcome|target|response|score|rate|risk|income|wage|price|cost|value|metric|performance|sales|earnings|mortality|health|mental|depress|anxiety|stress|wellbeing|happiness|satisfaction|employment|unemployment|hours|productivity|ghq|phq|gad|k6|k10|cesd|who5|sf12|sf36)/i.test(col)) score += 5;
     score += scoreTopicAlignment(col, topicKeywords);
     if (/(id|code|index)$/i.test(col)) score -= 2;
     if (/(^age$|_age$|^year$|^month$|^wave$|post|after|dummy|flag|indicator|treated?|control)/i.test(col)) score -= 2;
@@ -3924,9 +4013,11 @@ export function generateDefaultCharts(
   if (!ds || ds.data.length === 0) return charts;
 
   const { numericCols: rawNumericCols, categoricalCols, idCols } = classifyColumns(ds.data, ds.columns);
-  // Exclude ID/code columns from analysis - they are not meaningful for statistics
-  const numericCols = rawNumericCols.filter(c => !idCols.includes(c));
-  const designHints = inferEconometricDesignHints(ds, numericCols, categoricalCols, idCols, analysisTopic);
+  const baseNumericCols = rawNumericCols.filter(c => !idCols.includes(c));
+  const designHints = inferEconometricDesignHints(ds, baseNumericCols, categoricalCols, idCols, analysisTopic);
+  const numericCols = rankMeaningfulNumericColumns(ds, baseNumericCols, designHints, analysisTopic);
+  const primaryDescriptiveCol = choosePreferredDescriptiveNumericColumn(ds, numericCols, designHints);
+  const secondaryDescriptiveCol = chooseSecondaryDescriptiveNumericColumn(ds, numericCols, designHints, primaryDescriptiveCol);
   const robustOls =
     designHints.primaryOutcomeCol && designHints.primaryRegressorCol && designHints.primaryOutcomeCol !== designHints.primaryRegressorCol
       ? computeRobustOls(ds, designHints.primaryRegressorCol, designHints.primaryOutcomeCol)
@@ -3941,8 +4032,8 @@ export function generateDefaultCharts(
   const quantileRegression = computeQuantileRegression(ds, designHints);
 
   // Chart 1: Distribution of first numeric column (histogram-like bar chart)
-  if (numericCols.length > 0 && methodAllowed(executableMethods, "descriptive_statistics")) {
-    const col = numericCols[0];
+  if (primaryDescriptiveCol && methodAllowed(executableMethods, "descriptive_statistics")) {
+    const col = primaryDescriptiveCol;
     const values = ds.data.map(r => Number(r[col])).filter(v => !isNaN(v));
     if (values.length > 0) {
       const min = Math.min(...values);
@@ -3994,8 +4085,8 @@ export function generateDefaultCharts(
   if (numericCols.length >= 2 && methodAllowed(executableMethods, "correlation")) {
     // Find the pair with highest absolute correlation (scan up to 15 pairs)
     let bestAbsCorr = -1;
-    let xCol = numericCols[0];
-    let yCol = numericCols[1];
+    let xCol = secondaryDescriptiveCol || numericCols[0];
+    let yCol = primaryDescriptiveCol || numericCols[1];
     const pairLimit = Math.min(numericCols.length, 6); // up to C(6,2)=15 pairs
     for (let ai = 0; ai < pairLimit; ai++) {
       for (let bi = ai + 1; bi < pairLimit; bi++) {
@@ -4074,9 +4165,9 @@ export function generateDefaultCharts(
   }
 
   // Chart 3: Bar chart by categorical column (if available)
-  if (categoricalCols.length > 0 && numericCols.length > 0 && methodAllowed(executableMethods, "group_comparison")) {
+  if (categoricalCols.length > 0 && primaryDescriptiveCol && methodAllowed(executableMethods, "group_comparison")) {
     const catCol = categoricalCols[0];
-    const numCol = numericCols[0];
+    const numCol = primaryDescriptiveCol;
     const groups: Record<string, number[]> = {};
     for (const row of ds.data) {
       const key = String(row[catCol] ?? "N/A").slice(0, 30);
@@ -4196,9 +4287,9 @@ export function generateDefaultCharts(
 
   // Chart 6: Time trend line chart (if time-like columns exist)
   const timeCols = ds.columns.filter(c => /(year|month|date|time|wave|period|quarter)/i.test(c));
-  if (timeCols.length > 0 && numericCols.length > 0 && methodAllowed(executableMethods, "time_trend")) {
+  if (timeCols.length > 0 && primaryDescriptiveCol && methodAllowed(executableMethods, "time_trend")) {
     const timeCol = timeCols[0];
-    const numCol = numericCols[0];
+    const numCol = primaryDescriptiveCol;
 
     // Aggregate by time value (mean of numeric col per time point)
     const timeGroups: Record<string, number[]> = {};
@@ -4275,9 +4366,9 @@ export function generateDefaultCharts(
   }
 
   // Chart 7: Box plot approximation (floating bar showing Q1–Q3 with median marker)
-  if (categoricalCols.length > 0 && numericCols.length > 0 && methodAllowed(executableMethods, "group_comparison")) {
+  if (categoricalCols.length > 0 && primaryDescriptiveCol && methodAllowed(executableMethods, "group_comparison")) {
     const catCol = categoricalCols[0];
-    const numCol = numericCols[0];
+    const numCol = primaryDescriptiveCol;
     const groups: Record<string, number[]> = {};
     for (const row of ds.data) {
       const key = String(row[catCol] ?? "N/A").slice(0, 30);
@@ -4348,7 +4439,7 @@ export function generateDefaultCharts(
   // Chart 8: Grouped bar chart (multiple numeric variables by category)
   if (categoricalCols.length > 0 && numericCols.length >= 2 && methodAllowed(executableMethods, "group_comparison")) {
     const catCol = categoricalCols[0];
-    const useCols = numericCols.slice(0, 4); // Up to 4 numeric vars
+    const useCols = Array.from(new Set([primaryDescriptiveCol, secondaryDescriptiveCol, ...numericCols].filter(Boolean) as string[])).slice(0, 4);
     const groups: Record<string, Record<string, number[]>> = {};
     for (const row of ds.data) {
       const key = String(row[catCol] ?? "N/A").slice(0, 30);
@@ -4397,8 +4488,8 @@ export function generateDefaultCharts(
   }
 
   // Chart 9: Density plot (KDE approximation) for first numeric column
-  if (numericCols.length > 0 && methodAllowed(executableMethods, "descriptive_statistics")) {
-    const col = numericCols[0];
+  if (primaryDescriptiveCol && methodAllowed(executableMethods, "descriptive_statistics")) {
+    const col = primaryDescriptiveCol;
     const values = ds.data.map(r => Number(r[col])).filter(v => !isNaN(v));
     if (values.length >= 20) {
       const sorted = [...values].sort((a, b) => a - b);
@@ -5298,10 +5389,11 @@ function generateDefaultTables(
   if (!ds || ds.data.length === 0) return tables;
 
   const { numericCols: rawNumericCols, categoricalCols, idCols: _idCols2 } = classifyColumns(ds.data, ds.columns);
-  // Exclude ID/code columns from tables - they are not meaningful for descriptive statistics
-  const numericCols = rawNumericCols.filter(c => !_idCols2.includes(c));
+  const baseNumericCols = rawNumericCols.filter(c => !_idCols2.includes(c));
+  const designHints = inferEconometricDesignHints(ds, baseNumericCols, categoricalCols, _idCols2, analysisTopic);
+  const numericCols = rankMeaningfulNumericColumns(ds, baseNumericCols, designHints, analysisTopic);
+  const primaryDescriptiveCol = choosePreferredDescriptiveNumericColumn(ds, numericCols, designHints);
   const methodAssessments = buildMethodApplicabilityAssessment(ds, numericCols, categoricalCols);
-  const designHints = inferEconometricDesignHints(ds, numericCols, categoricalCols, _idCols2, analysisTopic);
   const robustOls =
     designHints.primaryOutcomeCol && designHints.primaryRegressorCol && designHints.primaryOutcomeCol !== designHints.primaryRegressorCol
       ? computeRobustOls(ds, designHints.primaryRegressorCol, designHints.primaryOutcomeCol)
@@ -5498,9 +5590,9 @@ function generateDefaultTables(
   }
 
   // Table 5: Group comparison with significance (if group_comparison is executable)
-  if (categoricalCols.length > 0 && numericCols.length > 0 && methodAllowed(executableMethods, "group_comparison")) {
+  if (categoricalCols.length > 0 && primaryDescriptiveCol && methodAllowed(executableMethods, "group_comparison")) {
     const catCol = categoricalCols[0];
-    const numCol = numericCols[0];
+    const numCol = primaryDescriptiveCol;
 
     const groups: Record<string, number[]> = {};
     for (const row of ds.data) {
@@ -5819,9 +5911,10 @@ export function generateDefaultMetrics(
   metrics.missing_rate = `${((totalMissing / (ds.data.length * ds.columns.length)) * 100).toFixed(2)}%`;
 
   // Descriptive stats for meaningful numeric columns only (exclude ID/code columns)
-  const meaningfulNumericCols = numericCols.filter(c => !idCols.includes(c));
+  const baseMeaningfulNumericCols = numericCols.filter(c => !idCols.includes(c));
+  const designHints = inferEconometricDesignHints(ds, baseMeaningfulNumericCols, categoricalCols, idCols, analysisTopic);
+  const meaningfulNumericCols = rankMeaningfulNumericColumns(ds, baseMeaningfulNumericCols, designHints, analysisTopic);
   const methodAssessments = buildMethodApplicabilityAssessment(ds, meaningfulNumericCols, categoricalCols);
-  const designHints = inferEconometricDesignHints(ds, meaningfulNumericCols, categoricalCols, idCols, analysisTopic);
   const robustOls =
     designHints.primaryOutcomeCol && designHints.primaryRegressorCol && designHints.primaryOutcomeCol !== designHints.primaryRegressorCol
       ? computeRobustOls(ds, designHints.primaryRegressorCol, designHints.primaryOutcomeCol)
