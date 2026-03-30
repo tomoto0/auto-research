@@ -99,6 +99,32 @@ describe("Pipeline API", () => {
     }
   });
 
+  it("accepts analysisInputs in pipeline config", async () => {
+    const caller = appRouter.createCaller(createTestContext());
+    try {
+      const result = await caller.pipeline.start({
+        topic: "Test topic with design inputs",
+        autoApprove: true,
+        config: {
+          targetConference: "General",
+          analysisInputs: {
+            outcome: "ghq_score",
+          treatment: "employment_shock",
+          entity: "pidp",
+          time: "wave",
+          controls: ["age", "sex"],
+          missingDataMode: "mean_imputation",
+          missingDataStrategy: "Complete-case for main model",
+        },
+      },
+      });
+      expect(result.runId).toBeTruthy();
+      expect(result.status).toBe("pending");
+    } catch (e: any) {
+      expect(e.message).toContain("Database");
+    }
+  });
+
   it("rejects empty topic", async () => {
     const caller = appRouter.createCaller(createTestContext());
     await expect(caller.pipeline.start({
@@ -127,6 +153,20 @@ describe("RunConfig", () => {
 
     const configWithout = { ...DEFAULT_RUN_CONFIG };
     expect(configWithout.datasetFileIds).toBeUndefined();
+  });
+
+  it("RunConfig supports optional analysisInputs", () => {
+    const config = {
+      ...DEFAULT_RUN_CONFIG,
+      analysisInputs: {
+        outcome: "ghq_score",
+        treatment: "employment_shock",
+        controls: ["age", "sex"],
+      },
+    };
+
+    expect(config.analysisInputs?.outcome).toBe("ghq_score");
+    expect(config.analysisInputs?.controls).toEqual(["age", "sex"]);
   });
 });
 

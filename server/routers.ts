@@ -121,6 +121,17 @@ const pipelineRouter = router({
           pubmed: z.boolean().default(true),
           crossref: z.boolean().default(true),
         }).default({ arxiv: true, semanticScholar: true, springer: true, pubmed: true, crossref: true }),
+        analysisInputs: z.object({
+          outcome: z.string().min(1).optional(),
+          treatment: z.string().min(1).optional(),
+          entity: z.string().min(1).optional(),
+          time: z.string().min(1).optional(),
+          controls: z.array(z.string().min(1)).optional(),
+          subgroup: z.string().min(1).optional(),
+          missingDataMode: z.enum(["complete_case", "mean_imputation"]).optional(),
+          missingDataStrategy: z.string().min(1).optional(),
+          variableNotes: z.string().min(1).optional(),
+        }).optional(),
       }).default({ targetConference: "NeurIPS", experimentMode: "simulated" as const, maxRetries: 2, timeoutMinutes: 120, qualityThreshold: 0.7, dataSources: { arxiv: true, semanticScholar: true, springer: true, pubmed: true, crossref: true } }),
     }))
     .mutation(async ({ input, ctx }) => {

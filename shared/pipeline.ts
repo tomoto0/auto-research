@@ -70,6 +70,18 @@ export interface PipelineEvent {
   timestamp: number;
 }
 
+export interface AnalysisInputs {
+  outcome?: string;
+  treatment?: string;
+  entity?: string;
+  time?: string;
+  controls?: string[];
+  subgroup?: string;
+  missingDataMode?: "complete_case" | "mean_imputation";
+  missingDataStrategy?: string;
+  variableNotes?: string;
+}
+
 export interface RunConfig {
   autoApprove: boolean;
   targetConference: string;
@@ -85,6 +97,7 @@ export interface RunConfig {
     crossref: boolean;
   };
   datasetFileIds?: number[];
+  analysisInputs?: AnalysisInputs;
 }
 
 export const CONFERENCE_TEMPLATES = [

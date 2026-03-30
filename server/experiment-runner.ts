@@ -26,10 +26,10 @@ import { parseDtaFile } from "./dta-parser";
 import * as iconv from "iconv-lite";
 import chardet from "chardet";
 import { invokeLLM } from "./_core/llm";
+import type { AnalysisInputs } from "../shared/pipeline";
 
 const EXECUTION_TIMEOUT_MS = 90_000; // 90 seconds max
 const MAX_OUTPUT_LENGTH = 50_000;
-const MAX_PARSED_ROWS = 2000;
 const CSV_ENCODING_SAMPLE_BYTES = 128 * 1024;
 
 export interface DatasetInfo {
@@ -70,6 +70,7 @@ interface DeterministicAnalysisPlan {
     fileType?: string;
   }>;
   topic?: string;
+  analysisInputs?: AnalysisInputs;
 }
 
 interface MethodFeasibilityContractInput {
@@ -311,7 +312,7 @@ function detectDelimitedFileEncoding(filePath: string): string {
   }
 }
 
-async function parseDelimitedSampleWithEncoding(
+async function parseDelimitedFileWithEncoding(
   filePath: string,
   delimiter: "," | "\t",
   encoding: string,
@@ -327,7 +328,6 @@ async function parseDelimitedSampleWithEncoding(
       relax_column_count: true,
       cast: true,
       bom: true,
-      to: MAX_PARSED_ROWS,
     });
 
     const cleanup = () => {
@@ -386,13 +386,13 @@ async function parseDelimitedFile(
 
   for (const enc of encodingsToTry) {
     try {
-      const { records, columns } = await parseDelimitedSampleWithEncoding(filePath, delimiter, enc);
+      const { records, columns } = await parseDelimitedFileWithEncoding(filePath, delimiter, enc);
       if (records.length === 0 && columns.length === 0) continue;
       if (hasGarbledColumns(columns) && enc.toLowerCase().startsWith("utf")) continue;
       const hintedTotal = rowCountHint && rowCountHint > 0 ? rowCountHint : 0;
       const totalRows = Math.max(hintedTotal, records.length);
       return {
-        data: records.slice(0, MAX_PARSED_ROWS),
+        data: records,
         columns,
         totalRows,
         encoding: enc === detectedEncoding ? enc : `${enc} (retry)`,
@@ -411,7 +411,6 @@ async function parseDelimitedFile(
 /**
  * Parse a data file into a JSON-serializable array of objects.
  * Supports CSV, TSV, Excel (.xlsx/.xls), Stata (.dta), and JSON.
- * Returns at most 2,000 rows to keep memory manageable.
  * Automatically detects file encoding for CSV/TSV files.
  */
 function validateParsedData(
@@ -454,12 +453,12 @@ async function parseDataFile(
 
   if (fileType === "dta") {
     let rawBuf: Buffer | null = fs.readFileSync(filePath);
-    const result = parseDtaFile(rawBuf, { previewRows: MAX_PARSED_ROWS });
+    const result = parseDtaFile(rawBuf);
     // Release the large buffer immediately so GC can reclaim it
     rawBuf = null;
     try { global.gc?.(); } catch {}
     return {
-      data: result.data.slice(0, MAX_PARSED_ROWS),
+      data: result.data,
       columns: result.columns,
       totalRows: Math.max(
         result.totalRows > 0 ? result.totalRows : result.data.length,
@@ -475,7 +474,7 @@ async function parseDataFile(
     const records: Record<string, any>[] = XLSX.utils.sheet_to_json(sheet);
     const columns = records.length > 0 ? Object.keys(records[0]) : [];
     return {
-      data: records.slice(0, MAX_PARSED_ROWS),
+      data: records,
       columns,
       totalRows: Math.max(hintedRows ?? 0, records.length),
     };
@@ -497,7 +496,7 @@ async function parseDataFile(
     }
     const columns = parsed.length > 0 ? Object.keys(parsed[0]) : [];
     return {
-      data: parsed.slice(0, MAX_PARSED_ROWS),
+      data: parsed,
       columns,
       totalRows: Math.max(hintedRows ?? 0, parsed.length),
     };
@@ -1600,6 +1599,7 @@ export async function executePythonExperiment(
   const startTime = Date.now();
   const deterministicPlan = parseDeterministicAnalysisPlan(analysisCode);
   const analysisTopic = typeof deterministicPlan?.topic === "string" ? deterministicPlan.topic : "";
+  const analysisInputs = deterministicPlan?.analysisInputs;
   const workDir = path.join(os.tmpdir(), `experiment-${runId}-${nanoid(6)}`);
   const dataDir = path.join(workDir, "data");
   fs.mkdirSync(workDir, { recursive: true });
@@ -1692,9 +1692,12 @@ export async function executePythonExperiment(
     // LLM-generated analysis code is NOT trusted for data values (hallucination risk).
     // We always use generateDefaultCharts/Tables/Metrics which compute from actual data.
     logs.push("[INFO] Generating analysis from actual data (bypassing LLM data values to prevent hallucination)...");
-    const chartDefinitions = generateDefaultCharts(allData, executableMethods, analysisTopic);
-    const tableDefinitions = generateDefaultTables(allData, executableMethods, analysisTopic);
-    const metricsFromCode = generateDefaultMetrics(allData, executableMethods, analysisTopic);
+    if (analysisInputs && Object.keys(analysisInputs).length > 0) {
+      logs.push(`[INFO] Using user-specified analysis inputs: ${JSON.stringify(analysisInputs)}`);
+    }
+    const chartDefinitions = generateDefaultCharts(allData, executableMethods, analysisTopic, analysisInputs);
+    const tableDefinitions = generateDefaultTables(allData, executableMethods, analysisTopic, analysisInputs);
+    const metricsFromCode = generateDefaultMetrics(allData, executableMethods, analysisTopic, analysisInputs);
     logs.push(`[INFO] Generated ${chartDefinitions.length} charts, ${tableDefinitions.length} tables, ${Object.keys(metricsFromCode).length} metrics from real data`);
     if (executableMethods !== null) {
       logs.push(`[INFO] Enforced method contract executable_now: ${Array.from(executableMethods).join(", ")}`);
@@ -1993,6 +1996,10 @@ export function isIdOrCodeColumn(col: string, data: Record<string, any>[]): bool
   return false;
 }
 
+function isMissingValue(value: unknown): boolean {
+  return value === null || value === undefined || value === "" || value === "NA" || value === "NaN" || value === ".";
+}
+
 export function classifyColumns(
   data: Record<string, any>[],
   columns: string[]
@@ -2009,7 +2016,7 @@ export function classifyColumns(
 
     for (let i = 0; i < sampleSize; i++) {
       const val = data[i][col];
-      if (val === null || val === undefined || val === "" || val === "NA" || val === "NaN" || val === ".") continue;
+      if (isMissingValue(val)) continue;
       totalNonNull++;
       if (typeof val === "number" || (typeof val === "string" && !isNaN(Number(val)) && val.trim() !== "")) {
         numericCount++;
@@ -2246,8 +2253,8 @@ function parseBinaryValue(raw: any): number | null {
   if (typeof raw === "number" && isFinite(raw) && (raw === 0 || raw === 1)) return raw;
   const text = String(raw).trim().toLowerCase();
   if (!text) return null;
-  if (["1", "true", "yes", "y", "treated", "treatment", "post", "after", "eligible"].includes(text)) return 1;
-  if (["0", "false", "no", "n", "control", "pre", "before", "ineligible"].includes(text)) return 0;
+  if (["1", "true", "yes", "y", "treated", "treatment", "post", "after", "eligible", "male", "man", "m"].includes(text)) return 1;
+  if (["0", "false", "no", "n", "control", "pre", "before", "ineligible", "female", "woman", "f"].includes(text)) return 0;
   return null;
 }
 
@@ -2274,6 +2281,87 @@ function isBinaryLikeColumn(ds: ParsedDataset, col: string): boolean {
   return values.every(v => parseBinaryValue(v) !== null);
 }
 
+function normaliseColumnReference(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function resolveDatasetColumn(ds: ParsedDataset, requested?: string): string | undefined {
+  if (!requested || !requested.trim()) return undefined;
+  const trimmed = requested.trim();
+  const exact = ds.columns.find(column => column === trimmed);
+  if (exact) return exact;
+  const exactCaseInsensitive = ds.columns.find(column => column.toLowerCase() === trimmed.toLowerCase());
+  if (exactCaseInsensitive) return exactCaseInsensitive;
+  const normalizedRequested = normaliseColumnReference(trimmed);
+  if (!normalizedRequested) return undefined;
+  return ds.columns.find(column => normaliseColumnReference(column) === normalizedRequested);
+}
+
+function uniqueDefinedColumns(columns: Array<string | undefined>): string[] {
+  return Array.from(new Set(columns.filter((column): column is string => Boolean(column))));
+}
+
+function mergeAnalysisInputsIntoDesignHints(
+  ds: ParsedDataset,
+  hints: EconometricDesignHints,
+  analysisInputs?: AnalysisInputs,
+): EconometricDesignHints {
+  if (!analysisInputs) {
+    return {
+      ...hints,
+      controlCols: [],
+      specifiedInputMatches: [],
+      specifiedInputMissing: [],
+    };
+  }
+
+  const specifiedInputMatches: string[] = [];
+  const specifiedInputMissing: string[] = [];
+  const resolveAndTrack = (label: string, requested?: string): string | undefined => {
+    if (!requested || !requested.trim()) return undefined;
+    const resolved = resolveDatasetColumn(ds, requested);
+    if (resolved) specifiedInputMatches.push(`${label}:${resolved}`);
+    else specifiedInputMissing.push(`${label}:${requested.trim()}`);
+    return resolved;
+  };
+
+  const resolvedOutcome = resolveAndTrack("outcome", analysisInputs.outcome);
+  const resolvedTreatment = resolveAndTrack("treatment", analysisInputs.treatment);
+  const resolvedEntity = resolveAndTrack("entity", analysisInputs.entity);
+  const resolvedTime = resolveAndTrack("time", analysisInputs.time);
+  const resolvedSubgroup = resolveAndTrack("subgroup", analysisInputs.subgroup);
+  const resolvedControls = uniqueDefinedColumns(
+    (analysisInputs.controls || []).map(control => resolveAndTrack("control", control))
+  ).filter(column => column !== resolvedOutcome && column !== resolvedTreatment);
+
+  const primaryOutcomeCol = resolvedOutcome || hints.primaryOutcomeCol;
+  const primaryTreatmentCol = resolvedTreatment || hints.primaryTreatmentCol;
+  const primaryRegressorCol = (
+    primaryTreatmentCol && primaryTreatmentCol !== primaryOutcomeCol
+      ? primaryTreatmentCol
+      : hints.primaryRegressorCol && hints.primaryRegressorCol !== primaryOutcomeCol
+        ? hints.primaryRegressorCol
+        : resolvedControls.find(column => column !== primaryOutcomeCol)
+  ) || hints.primaryRegressorCol;
+
+  return {
+    ...hints,
+    outcomeCols: uniqueDefinedColumns([resolvedOutcome, ...hints.outcomeCols]),
+    treatmentCols: uniqueDefinedColumns([resolvedTreatment, ...hints.treatmentCols]),
+    entityCols: uniqueDefinedColumns([resolvedEntity, ...hints.entityCols]),
+    timeCols: uniqueDefinedColumns([resolvedTime, ...hints.timeCols]),
+    primaryOutcomeCol,
+    primaryTreatmentCol,
+    primaryEntityCol: resolvedEntity || hints.primaryEntityCol,
+    primaryTimeCol: resolvedTime || hints.primaryTimeCol,
+    primaryRegressorCol,
+    controlCols: resolvedControls,
+    subgroupCol: resolvedSubgroup,
+    specifiedInputMatches,
+    specifiedInputMissing,
+  };
+}
+
 interface EconometricDesignHints {
   timeCols: string[];
   entityCols: string[];
@@ -2281,6 +2369,9 @@ interface EconometricDesignHints {
   outcomeCols: string[];
   instrumentCols: string[];
   runningCols: string[];
+  controlCols: string[];
+  specifiedInputMatches: string[];
+  specifiedInputMissing: string[];
   primaryTimeCol?: string;
   primaryEntityCol?: string;
   primaryTreatmentCol?: string;
@@ -2288,11 +2379,28 @@ interface EconometricDesignHints {
   primaryRegressorCol?: string;
   primaryInstrumentCol?: string;
   primaryRunningCol?: string;
+  subgroupCol?: string;
+}
+
+type MissingDataMode = "complete_case" | "mean_imputation";
+
+interface RegressionCoefficientEstimate {
+  name: string;
+  coefficient: number;
+  se: number;
+  tStat: number;
+  pValue: number;
+  ciLower: number;
+  ciUpper: number;
 }
 
 interface RobustOlsResult {
   xCol: string;
   yCol: string;
+  regressorCols: string[];
+  controlCols: string[];
+  omittedControlCols: string[];
+  droppedCollinearCols: string[];
   intercept: number;
   slope: number;
   seIntercept: number;
@@ -2304,6 +2412,12 @@ interface RobustOlsResult {
   n: number;
   ciLower: number;
   ciUpper: number;
+  vcovType: "hc1" | "cluster";
+  clusterCol?: string;
+  clusterCount?: number;
+  missingDataMode: MissingDataMode;
+  imputedPredictorCells: number;
+  coefficients: RegressionCoefficientEstimate[];
   fittedResiduals: Array<{ fitted: number; residual: number }>;
 }
 
@@ -2312,6 +2426,10 @@ interface PanelFixedEffectsResult {
   timeCol: string;
   xCol: string;
   yCol: string;
+  regressorCols: string[];
+  controlCols: string[];
+  omittedControlCols: string[];
+  droppedCollinearCols: string[];
   beta: number;
   se: number;
   tStat: number;
@@ -2320,7 +2438,42 @@ interface PanelFixedEffectsResult {
   entities: number;
   periods: number;
   r2Within: number;
+  vcovType: "hc1" | "cluster";
+  clusterCol?: string;
+  clusterCount?: number;
+  missingDataMode: MissingDataMode;
+  imputedPredictorCells: number;
+  coefficients: RegressionCoefficientEstimate[];
   fittedResiduals: Array<{ fitted: number; residual: number }>;
+}
+
+interface PanelFixedEffectsDiagnostics {
+  status: "passed" | "blocked";
+  reason: string;
+  reasons: string[];
+  entityCol?: string;
+  timeCol?: string;
+  xCol?: string;
+  yCol?: string;
+  completeCaseRows: number;
+  completeCaseEntities: number;
+  completeCasePeriods: number;
+  repeatedEntityCount: number;
+  informativeEntityCountX: number;
+  informativeEntityCountY: number;
+  informativeEntityCountBoth: number;
+  minObsPerEntity: number;
+  medianObsPerEntity: number;
+  maxObsPerEntity: number;
+  transformedRows: number;
+}
+
+interface PanelFixedEffectsAssessment {
+  diagnostics: PanelFixedEffectsDiagnostics;
+  prepared: PreparedPanelRegressionData | null;
+  transformed: Array<{ x: number[]; ydd: number; clusterId: string }>;
+  transformedPredictorNames: string[];
+  transformedSsTot: number;
 }
 
 interface DiffInDiffPoint {
@@ -2455,13 +2608,30 @@ interface QuantileRegressionEstimate {
   tau: number;
   intercept: number;
   slope: number;
+  interceptSe: number;
+  slopeSe: number;
+  tStat: number;
+  pValue: number;
+  ciLower: number;
+  ciUpper: number;
   pseudoR1: number;
+  coefficients: RegressionCoefficientEstimate[];
+  bootstrapReplicates: number;
 }
 
 interface QuantileRegressionResult {
   xCol: string;
   yCol: string;
+  regressorCols: string[];
+  controlCols: string[];
+  omittedControlCols: string[];
+  droppedCollinearCols: string[];
   n: number;
+  vcovType: "bootstrap";
+  clusterCol?: string;
+  clusterCount?: number;
+  missingDataMode: MissingDataMode;
+  imputedPredictorCells: number;
   estimates: QuantileRegressionEstimate[];
 }
 
@@ -2562,6 +2732,7 @@ function inferEconometricDesignHints(
   categoricalCols: string[],
   idCols: string[],
   topic?: string,
+  analysisInputs?: AnalysisInputs,
 ): EconometricDesignHints {
   const timeCols = detectTimeColumnsFromDataset(ds);
   const entityCols = detectEntityColumns(ds, categoricalCols, idCols);
@@ -2579,13 +2750,16 @@ function inferEconometricDesignHints(
     (primaryTreatmentCol && primaryTreatmentCol !== primaryOutcomeCol ? primaryTreatmentCol : undefined) ||
     numericCols.find(col => col !== primaryOutcomeCol);
 
-  return {
+  return mergeAnalysisInputsIntoDesignHints(ds, {
     timeCols,
     entityCols,
     treatmentCols,
     outcomeCols,
     instrumentCols,
     runningCols,
+    controlCols: [],
+    specifiedInputMatches: [],
+    specifiedInputMissing: [],
     primaryTimeCol: timeCols[0],
     primaryEntityCol: entityCols[0],
     primaryTreatmentCol,
@@ -2593,7 +2767,7 @@ function inferEconometricDesignHints(
     primaryRegressorCol,
     primaryInstrumentCol,
     primaryRunningCol: runningCols[0],
-  };
+  }, analysisInputs);
 }
 
 function invert2x2(a: number, b: number, c: number, d: number): [number, number, number, number] | null {
@@ -2750,49 +2924,583 @@ function computeEmpiricalQuantile(values: number[], tau: number): number {
   return sorted[position];
 }
 
-function fitQuantileRegression1D(
-  observations: Array<{ x: number; y: number }>,
+function createDeterministicRng(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (1664525 * state + 1013904223) >>> 0;
+    return state / 0x100000000;
+  };
+}
+
+function sampleWithReplacement(length: number, drawCount: number, rng: () => number): number[] {
+  return Array.from({ length: drawCount }, () => Math.floor(rng() * length));
+}
+
+function fitQuantileRegressionModel(
+  observations: PreparedRegressionRow[],
   tau: number,
-): { intercept: number; slope: number; pseudoR1: number } | null {
-  if (observations.length < 40) return null;
-  const xMean = mean(observations.map(obs => obs.x));
-  const xStd = stdDev(observations.map(obs => obs.x), false) || 1;
+  iterations = 1600,
+): { intercept: number; slopes: number[]; pseudoR1: number } | null {
+  if (observations.length < 40 || observations[0]?.x.length === 0) return null;
+  const predictorCount = observations[0].x.length;
+  const xMeans = Array.from({ length: predictorCount }, (_, index) => mean(observations.map(obs => obs.x[index])));
+  const xStds = Array.from({ length: predictorCount }, (_, index) => stdDev(observations.map(obs => obs.x[index]), false) || 1);
   const yMean = mean(observations.map(obs => obs.y));
   const yStd = stdDev(observations.map(obs => obs.y), false) || 1;
   const standardized = observations.map(obs => ({
-    x: (obs.x - xMean) / xStd,
+    x: obs.x.map((value, index) => (value - xMeans[index]) / xStds[index]),
     y: (obs.y - yMean) / yStd,
   }));
 
-  let intercept = computeEmpiricalQuantile(standardized.map(obs => obs.y), tau);
-  let slope = 0;
+  let coefficients = [computeEmpiricalQuantile(standardized.map(obs => obs.y), tau), ...Array(predictorCount).fill(0)];
   let step = 0.08;
-  for (let iter = 0; iter < 1800; iter++) {
-    let gradIntercept = 0;
-    let gradSlope = 0;
+  const epsilon = 0.05;
+  const penalty = 5e-4;
+  for (let iter = 0; iter < iterations; iter++) {
+    const gradient = Array(coefficients.length).fill(0);
     for (const obs of standardized) {
-      const residual = obs.y - (intercept + slope * obs.x);
-      const indicator = residual < 0 ? 1 : 0;
-      const subGrad = tau - indicator;
-      gradIntercept -= subGrad;
-      gradSlope -= subGrad * obs.x;
+      const linearPredictor = coefficients[0] + obs.x.reduce((sum, value, index) => sum + value * coefficients[index + 1], 0);
+      const residual = obs.y - linearPredictor;
+      const smoothIndicator =
+        residual <= -epsilon ? 1 :
+        residual >= epsilon ? 0 :
+        0.5 * (1 - residual / epsilon);
+      const psi = tau - smoothIndicator;
+      gradient[0] -= psi;
+      for (let j = 0; j < predictorCount; j++) {
+        gradient[j + 1] -= psi * obs.x[j];
+      }
     }
-    intercept -= (step / standardized.length) * gradIntercept;
-    slope -= (step / standardized.length) * gradSlope;
+    coefficients[0] -= (step / standardized.length) * gradient[0];
+    for (let j = 0; j < predictorCount; j++) {
+      coefficients[j + 1] -= (step / standardized.length) * (gradient[j + 1] + penalty * coefficients[j + 1]);
+    }
     step *= 0.999;
   }
 
-  const interceptOriginal = yMean + yStd * intercept - (yStd * slope * xMean) / xStd;
-  const slopeOriginal = (yStd * slope) / xStd;
+  const slopesOriginal = coefficients.slice(1).map((value, index) => (yStd * value) / xStds[index]);
+  const interceptOriginal = yMean + yStd * coefficients[0] - slopesOriginal.reduce((sum, slope, index) => sum + slope * xMeans[index], 0);
 
   const rho = (residual: number) => residual >= 0 ? tau * residual : (tau - 1) * residual;
-  const objective = observations.reduce((sum, obs) => sum + rho(obs.y - (interceptOriginal + slopeOriginal * obs.x)), 0);
+  const objective = observations.reduce((sum, obs) => {
+    const predicted = interceptOriginal + obs.x.reduce((acc, value, index) => acc + slopesOriginal[index] * value, 0);
+    return sum + rho(obs.y - predicted);
+  }, 0);
   const unconditionalQuantile = computeEmpiricalQuantile(observations.map(obs => obs.y), tau);
   const nullObjective = observations.reduce((sum, obs) => sum + rho(obs.y - unconditionalQuantile), 0);
   const pseudoR1 = nullObjective > 0 ? Math.max(0, 1 - objective / nullObjective) : 0;
 
-  if (!isFinite(interceptOriginal) || !isFinite(slopeOriginal)) return null;
-  return { intercept: interceptOriginal, slope: slopeOriginal, pseudoR1 };
+  if (!isFinite(interceptOriginal) || !slopesOriginal.every(value => isFinite(value))) return null;
+  return { intercept: interceptOriginal, slopes: slopesOriginal, pseudoR1 };
+}
+
+function computeBootstrapStandardErrors(
+  observations: PreparedRegressionRow[],
+  tau: number,
+  coefficientCount: number,
+): { standardErrors: number[]; replicates: number; clusterCount?: number } | null {
+  if (observations.length < 40) return null;
+  const clusterMap = new Map<string, PreparedRegressionRow[]>();
+  for (const row of observations) {
+    const key = row.clusterId || "";
+    const bucket = clusterMap.get(key) || [];
+    bucket.push(row);
+    clusterMap.set(key, bucket);
+  }
+  const clusterKeys = Array.from(clusterMap.keys()).filter(Boolean);
+  const useClusterBootstrap = clusterKeys.length >= Math.max(8, observations[0].x.length + 2);
+  const targetReplicates = observations.length > 1500 ? 18 : observations.length > 600 ? 24 : 36;
+  const minSuccessfulReplicates = Math.max(12, Math.floor(targetReplicates * 0.6));
+  const rng = createDeterministicRng(
+    Math.round(tau * 1000) * 97 + observations.length * 13 + coefficientCount * 31 + clusterKeys.length * 7
+  );
+
+  const bootstrapCoefficients: number[][] = [];
+  for (let rep = 0; rep < targetReplicates; rep++) {
+    let sampledRows: PreparedRegressionRow[] = [];
+    if (useClusterBootstrap) {
+      const sampledClusterIndexes = sampleWithReplacement(clusterKeys.length, clusterKeys.length, rng);
+      sampledRows = sampledClusterIndexes.flatMap(index => {
+        const clusterId = clusterKeys[index];
+        return (clusterMap.get(clusterId) || []).map(row => ({ ...row }));
+      });
+    } else {
+      const sampledIndexes = sampleWithReplacement(observations.length, observations.length, rng);
+      sampledRows = sampledIndexes.map(index => ({ ...observations[index] }));
+    }
+    const fit = fitQuantileRegressionModel(sampledRows, tau, 900);
+    if (!fit) continue;
+    const coefficientVector = [fit.intercept, ...fit.slopes];
+    if (coefficientVector.length !== coefficientCount || !coefficientVector.every(value => isFinite(value))) continue;
+    bootstrapCoefficients.push(coefficientVector);
+  }
+
+  if (bootstrapCoefficients.length < minSuccessfulReplicates) return null;
+  const standardErrors = Array.from({ length: coefficientCount }, (_, index) => {
+    const values = bootstrapCoefficients.map(row => row[index]);
+    return stdDev(values);
+  });
+  if (!standardErrors.every(value => isFinite(value) && value >= 0)) return null;
+  return {
+    standardErrors,
+    replicates: bootstrapCoefficients.length,
+    clusterCount: useClusterBootstrap ? clusterKeys.length : undefined,
+  };
+}
+
+interface PreparedRegressionRow {
+  y: number;
+  x: number[];
+  clusterId?: string;
+}
+
+interface PreparedRegressionData {
+  yCol: string;
+  primaryRegressorCol: string;
+  regressorCols: string[];
+  controlCols: string[];
+  omittedControlCols: string[];
+  missingDataMode: MissingDataMode;
+  imputedPredictorCells: number;
+  rowsDropped: number;
+  clusterCol?: string;
+  rows: PreparedRegressionRow[];
+}
+
+interface PreparedPanelRegressionRow {
+  entity: string;
+  time: number;
+  y: number;
+  x: number[];
+  clusterId: string;
+}
+
+interface PreparedPanelRegressionData {
+  entityCol: string;
+  timeCol: string;
+  yCol: string;
+  primaryRegressorCol: string;
+  regressorCols: string[];
+  controlCols: string[];
+  omittedControlCols: string[];
+  missingDataMode: MissingDataMode;
+  imputedPredictorCells: number;
+  rowsDropped: number;
+  rows: PreparedPanelRegressionRow[];
+}
+
+interface LinearModelFit {
+  coefficients: number[];
+  standardErrors: number[];
+  tStats: number[];
+  pValues: number[];
+  ciLower: number[];
+  ciUpper: number[];
+  fitted: number[];
+  residuals: number[];
+  r2: number;
+  adjR2: number;
+  n: number;
+  parameterCount: number;
+  vcovType: "hc1" | "cluster";
+  clusterCount?: number;
+}
+
+interface SelectedLinearModelFit {
+  fit: LinearModelFit;
+  regressorCols: string[];
+  droppedCols: string[];
+}
+
+function resolveMissingDataMode(analysisInputs?: AnalysisInputs): MissingDataMode {
+  if (analysisInputs?.missingDataMode === "mean_imputation") return "mean_imputation";
+  if (analysisInputs?.missingDataMode === "complete_case") return "complete_case";
+  const notes = `${analysisInputs?.missingDataStrategy || ""}`.toLowerCase();
+  if (/(mean imputation|mean-imputation|impute|imputation)/i.test(notes)) return "mean_imputation";
+  return "complete_case";
+}
+
+function coerceRegressionValue(raw: unknown): number | null {
+  if (isMissingValue(raw)) return null;
+  const asNumber = Number(raw);
+  if (!isNaN(asNumber) && isFinite(asNumber)) return asNumber;
+  return parseBinaryValue(raw);
+}
+
+function isRegressionCompatibleColumn(ds: ParsedDataset, col: string): boolean {
+  const sample = ds.data
+    .map(row => row[col])
+    .filter(value => !isMissingValue(value))
+    .slice(0, 200);
+  if (sample.length < 10) return false;
+  const coercible = sample.filter(value => coerceRegressionValue(value) !== null).length;
+  return coercible / sample.length >= 0.8;
+}
+
+function uniqueColumns(columns: Array<string | undefined>): string[] {
+  return Array.from(new Set(columns.filter((column): column is string => Boolean(column))));
+}
+
+function resolveModelRegressorColumns(
+  ds: ParsedDataset,
+  hints: EconometricDesignHints,
+): {
+  primaryRegressorCol?: string;
+  regressorCols: string[];
+  controlCols: string[];
+  omittedControlCols: string[];
+} {
+  const yCol = hints.primaryOutcomeCol;
+  const primaryRegressorCol = hints.primaryRegressorCol && hints.primaryRegressorCol !== yCol
+    ? hints.primaryRegressorCol
+    : undefined;
+  const candidateControls = uniqueColumns(hints.controlCols)
+    .filter(column => column !== yCol && column !== primaryRegressorCol);
+  const controlCols = candidateControls.filter(column => isRegressionCompatibleColumn(ds, column));
+  const omittedControlCols = candidateControls.filter(column => !controlCols.includes(column));
+  return {
+    primaryRegressorCol,
+    regressorCols: uniqueColumns([primaryRegressorCol, ...controlCols]),
+    controlCols,
+    omittedControlCols,
+  };
+}
+
+function buildPredictorMeans(ds: ParsedDataset, regressorCols: string[]): Map<string, number> {
+  const means = new Map<string, number>();
+  for (const column of regressorCols) {
+    const values = ds.data
+      .map(row => coerceRegressionValue(row[column]))
+      .filter((value): value is number => value !== null);
+    if (values.length > 0) {
+      means.set(column, mean(values));
+    }
+  }
+  return means;
+}
+
+function prepareRegressionData(
+  ds: ParsedDataset,
+  hints: EconometricDesignHints,
+  missingDataMode: MissingDataMode,
+): PreparedRegressionData | null {
+  const yCol = hints.primaryOutcomeCol;
+  const clusterCol = hints.primaryEntityCol;
+  const { primaryRegressorCol, regressorCols, controlCols, omittedControlCols } = resolveModelRegressorColumns(ds, hints);
+  if (!yCol || !primaryRegressorCol || regressorCols.length === 0) return null;
+
+  const predictorMeans = buildPredictorMeans(ds, regressorCols);
+  if (!predictorMeans.has(primaryRegressorCol)) return null;
+
+  const rows: PreparedRegressionRow[] = [];
+  let imputedPredictorCells = 0;
+  let rowsDropped = 0;
+
+  for (const row of ds.data) {
+    const y = coerceRegressionValue(row[yCol]);
+    if (y === null) {
+      rowsDropped++;
+      continue;
+    }
+
+    const predictors: number[] = [];
+    let invalid = false;
+    for (const column of regressorCols) {
+      let value = coerceRegressionValue(row[column]);
+      if (value === null) {
+        if (missingDataMode === "mean_imputation" && predictorMeans.has(column)) {
+          value = predictorMeans.get(column)!;
+          imputedPredictorCells++;
+        } else {
+          invalid = true;
+          break;
+        }
+      }
+      predictors.push(value);
+    }
+    if (invalid) {
+      rowsDropped++;
+      continue;
+    }
+
+    const clusterId = clusterCol ? String(row[clusterCol] ?? "").trim() : undefined;
+    if (clusterCol && !clusterId) {
+      rowsDropped++;
+      continue;
+    }
+
+    rows.push({ y, x: predictors, clusterId });
+  }
+
+  return {
+    yCol,
+    primaryRegressorCol,
+    regressorCols,
+    controlCols,
+    omittedControlCols,
+    missingDataMode,
+    imputedPredictorCells,
+    rowsDropped,
+    clusterCol,
+    rows,
+  };
+}
+
+function preparePanelRegressionData(
+  ds: ParsedDataset,
+  hints: EconometricDesignHints,
+  missingDataMode: MissingDataMode,
+): PreparedPanelRegressionData | null {
+  const entityCol = hints.primaryEntityCol;
+  const timeCol = hints.primaryTimeCol;
+  const yCol = hints.primaryOutcomeCol;
+  const { primaryRegressorCol, regressorCols, controlCols, omittedControlCols } = resolveModelRegressorColumns(ds, hints);
+  if (!entityCol || !timeCol || !yCol || !primaryRegressorCol || regressorCols.length === 0) return null;
+
+  const predictorMeans = buildPredictorMeans(ds, regressorCols);
+  if (!predictorMeans.has(primaryRegressorCol)) return null;
+
+  const rows: PreparedPanelRegressionRow[] = [];
+  let imputedPredictorCells = 0;
+  let rowsDropped = 0;
+
+  for (const row of ds.data) {
+    const entity = String(row[entityCol] ?? "").trim();
+    const time = parseTimeValue(row[timeCol]);
+    const y = coerceRegressionValue(row[yCol]);
+    if (!entity || time === null || y === null) {
+      rowsDropped++;
+      continue;
+    }
+
+    const predictors: number[] = [];
+    let invalid = false;
+    for (const column of regressorCols) {
+      let value = coerceRegressionValue(row[column]);
+      if (value === null) {
+        if (missingDataMode === "mean_imputation" && predictorMeans.has(column)) {
+          value = predictorMeans.get(column)!;
+          imputedPredictorCells++;
+        } else {
+          invalid = true;
+          break;
+        }
+      }
+      predictors.push(value);
+    }
+    if (invalid) {
+      rowsDropped++;
+      continue;
+    }
+
+    rows.push({ entity, time, y, x: predictors, clusterId: entity });
+  }
+
+  return {
+    entityCol,
+    timeCol,
+    yCol,
+    primaryRegressorCol,
+    regressorCols,
+    controlCols,
+    omittedControlCols,
+    missingDataMode,
+    imputedPredictorCells,
+    rowsDropped,
+    rows,
+  };
+}
+
+function identityMatrix(size: number): number[][] {
+  return Array.from({ length: size }, (_, rowIndex) =>
+    Array.from({ length: size }, (_, colIndex) => (rowIndex === colIndex ? 1 : 0))
+  );
+}
+
+function outerProduct(left: number[], right: number[]): number[][] {
+  return left.map(lv => right.map(rv => lv * rv));
+}
+
+function multiplyMatrixVector(matrix: number[][], vector: number[]): number[] {
+  return matrix.map(row => row.reduce((sum, value, index) => sum + value * vector[index], 0));
+}
+
+function multiplyMatrices(left: number[][], right: number[][]): number[][] {
+  return left.map(row =>
+    right[0].map((_, colIndex) =>
+      row.reduce((sum, value, rowIndex) => sum + value * right[rowIndex][colIndex], 0)
+    )
+  );
+}
+
+function invertMatrix(matrix: number[][]): number[][] | null {
+  const size = matrix.length;
+  if (size === 0 || matrix.some(row => row.length !== size)) return null;
+
+  const augmented = matrix.map((row, rowIndex) => [...row, ...identityMatrix(size)[rowIndex]]);
+  for (let pivotIndex = 0; pivotIndex < size; pivotIndex++) {
+    let bestRow = pivotIndex;
+    for (let rowIndex = pivotIndex + 1; rowIndex < size; rowIndex++) {
+      if (Math.abs(augmented[rowIndex][pivotIndex]) > Math.abs(augmented[bestRow][pivotIndex])) {
+        bestRow = rowIndex;
+      }
+    }
+    if (Math.abs(augmented[bestRow][pivotIndex]) < 1e-10) return null;
+    if (bestRow !== pivotIndex) {
+      const temp = augmented[pivotIndex];
+      augmented[pivotIndex] = augmented[bestRow];
+      augmented[bestRow] = temp;
+    }
+
+    const pivot = augmented[pivotIndex][pivotIndex];
+    for (let colIndex = 0; colIndex < 2 * size; colIndex++) {
+      augmented[pivotIndex][colIndex] /= pivot;
+    }
+
+    for (let rowIndex = 0; rowIndex < size; rowIndex++) {
+      if (rowIndex === pivotIndex) continue;
+      const factor = augmented[rowIndex][pivotIndex];
+      if (Math.abs(factor) < 1e-12) continue;
+      for (let colIndex = 0; colIndex < 2 * size; colIndex++) {
+        augmented[rowIndex][colIndex] -= factor * augmented[pivotIndex][colIndex];
+      }
+    }
+  }
+
+  return augmented.map(row => row.slice(size));
+}
+
+function fitLinearModel(observations: PreparedRegressionRow[]): LinearModelFit | null {
+  if (observations.length === 0) return null;
+  const predictorCount = observations[0].x.length;
+  const parameterCount = predictorCount + 1;
+  const n = observations.length;
+  if (n <= parameterCount + 1) return null;
+
+  const designRows = observations.map(obs => [1, ...obs.x]);
+  const xtx = Array.from({ length: parameterCount }, () => Array(parameterCount).fill(0));
+  const xty = Array(parameterCount).fill(0);
+  for (let rowIndex = 0; rowIndex < n; rowIndex++) {
+    const xRow = designRows[rowIndex];
+    const y = observations[rowIndex].y;
+    for (let i = 0; i < parameterCount; i++) {
+      xty[i] += xRow[i] * y;
+      for (let j = 0; j < parameterCount; j++) {
+        xtx[i][j] += xRow[i] * xRow[j];
+      }
+    }
+  }
+
+  const xtxInv = invertMatrix(xtx);
+  if (!xtxInv) return null;
+  const coefficients = multiplyMatrixVector(xtxInv, xty);
+  const fitted = designRows.map(row => row.reduce((sum, value, index) => sum + value * coefficients[index], 0));
+  const residuals = observations.map((obs, index) => obs.y - fitted[index]);
+  const meanY = observations.reduce((sum, obs) => sum + obs.y, 0) / n;
+  const ssRes = residuals.reduce((sum, residual) => sum + residual * residual, 0);
+  const ssTot = observations.reduce((sum, obs) => sum + (obs.y - meanY) ** 2, 0);
+  const r2 = ssTot > 0 ? Math.max(0, 1 - ssRes / ssTot) : 0;
+  const adjR2 = n > parameterCount
+    ? 1 - (1 - r2) * (n - 1) / Math.max(1, n - parameterCount)
+    : r2;
+
+  let meat = Array.from({ length: parameterCount }, () => Array(parameterCount).fill(0));
+  let vcovType: "hc1" | "cluster" = "hc1";
+  let clusterCount: number | undefined;
+  const clusters = new Map<string, number[]>();
+  observations.forEach((obs, index) => {
+    if (obs.clusterId) {
+      const bucket = clusters.get(obs.clusterId) || [];
+      bucket.push(index);
+      clusters.set(obs.clusterId, bucket);
+    }
+  });
+
+  if (clusters.size >= Math.max(8, parameterCount + 1)) {
+    vcovType = "cluster";
+    clusterCount = clusters.size;
+    for (const indices of Array.from(clusters.values())) {
+      const score = Array(parameterCount).fill(0);
+      for (const index of indices) {
+        const xRow = designRows[index];
+        const residual = residuals[index];
+        for (let paramIndex = 0; paramIndex < parameterCount; paramIndex++) {
+          score[paramIndex] += xRow[paramIndex] * residual;
+        }
+      }
+      const clusterOuter = outerProduct(score, score);
+      meat = meat.map((row, rowIndex) => row.map((value, colIndex) => value + clusterOuter[rowIndex][colIndex]));
+    }
+  } else {
+    for (let index = 0; index < n; index++) {
+      const xRow = designRows[index];
+      const residual = residuals[index];
+      const observationOuter = outerProduct(xRow, xRow).map(row => row.map(value => value * residual * residual));
+      meat = meat.map((row, rowIndex) => row.map((value, colIndex) => value + observationOuter[rowIndex][colIndex]));
+    }
+  }
+
+  const correction = vcovType === "cluster" && clusterCount
+    ? (clusterCount / Math.max(1, clusterCount - 1)) * ((n - 1) / Math.max(1, n - parameterCount))
+    : n / Math.max(1, n - parameterCount);
+  const vcov = multiplyMatrices(multiplyMatrices(xtxInv, meat), xtxInv)
+    .map(row => row.map(value => value * correction));
+  const standardErrors = vcov.map((row, index) => Math.sqrt(Math.max(row[index], 0)));
+  if (!standardErrors.every(se => isFinite(se) && se >= 0)) return null;
+
+  const degreesOfFreedom = vcovType === "cluster" && clusterCount
+    ? Math.max(1, clusterCount - 1)
+    : Math.max(1, n - parameterCount);
+  const tStats = coefficients.map((coefficient, index) => standardErrors[index] > 0 ? coefficient / standardErrors[index] : 0);
+  const pValues = tStats.map(tStat => approxTwoTailPValue(tStat, degreesOfFreedom));
+  const ciLower = coefficients.map((coefficient, index) => coefficient - 1.96 * standardErrors[index]);
+  const ciUpper = coefficients.map((coefficient, index) => coefficient + 1.96 * standardErrors[index]);
+
+  return {
+    coefficients,
+    standardErrors,
+    tStats,
+    pValues,
+    ciLower,
+    ciUpper,
+    fitted,
+    residuals,
+    r2,
+    adjR2,
+    n,
+    parameterCount,
+    vcovType,
+    clusterCount,
+  };
+}
+
+function fitLinearModelWithSelection(
+  rows: PreparedRegressionRow[],
+  regressorCols: string[],
+): SelectedLinearModelFit | null {
+  const activeIndices = regressorCols.map((_, index) => index);
+  const droppedCols: string[] = [];
+
+  while (activeIndices.length > 0) {
+    const subsetRows = rows.map(row => ({
+      y: row.y,
+      x: activeIndices.map(index => row.x[index]),
+      clusterId: row.clusterId,
+    }));
+    const fit = fitLinearModel(subsetRows);
+    if (fit) {
+      return {
+        fit,
+        regressorCols: activeIndices.map(index => regressorCols[index]),
+        droppedCols,
+      };
+    }
+    if (activeIndices.length === 1) break;
+    const droppedIndex = activeIndices.pop()!;
+    droppedCols.unshift(regressorCols[droppedIndex]);
+  }
+
+  return null;
 }
 
 function inferRddCutoff(
@@ -2830,165 +3538,320 @@ function inferRddCutoff(
   };
 }
 
-function computeRobustOls(ds: ParsedDataset, xCol: string, yCol: string): RobustOlsResult | null {
-  const observations = ds.data
-    .map(row => ({ x: Number(row[xCol]), y: Number(row[yCol]) }))
-    .filter(obs => !isNaN(obs.x) && !isNaN(obs.y) && isFinite(obs.x) && isFinite(obs.y));
-  if (observations.length < 20) return null;
+function countNumericCompleteCaseRows(ds: ParsedDataset, columns: Array<string | undefined>): number {
+  const required = columns.filter((column): column is string => Boolean(column));
+  if (required.length === 0) return 0;
+  let count = 0;
+  for (const row of ds.data) {
+    const valid = required.every(column => {
+      const value = Number(row[column]);
+      return !isNaN(value) && isFinite(value);
+    });
+    if (valid) count++;
+  }
+  return count;
+}
 
-  const pairs: [number, number][] = observations.map(obs => [obs.x, obs.y]);
-  const reg = regressionStatsFromPairs(pairs);
-  if (!reg) return null;
+function countDiffInDiffCompleteCaseRows(ds: ParsedDataset, hints: EconometricDesignHints): number {
+  const timeCol = hints.primaryTimeCol;
+  const treatmentCol = hints.primaryTreatmentCol;
+  const outcomeCol = hints.primaryOutcomeCol;
+  if (!timeCol || !treatmentCol || !outcomeCol) return 0;
+  return ds.data
+    .map(row => ({
+      timeValue: parseTimeValue(row[timeCol]),
+      treatment: parseBinaryValue(row[treatmentCol]),
+      outcome: Number(row[outcomeCol]),
+    }))
+    .filter(row => row.timeValue !== null && row.treatment !== null && !isNaN(row.outcome))
+    .length;
+}
 
-  const n = observations.length;
-  const sumX = observations.reduce((sum, obs) => sum + obs.x, 0);
-  const sumXX = observations.reduce((sum, obs) => sum + obs.x * obs.x, 0);
-  const inv = invert2x2(n, sumX, sumX, sumXX);
-  if (!inv) return null;
-  const [inv00, inv01, inv10, inv11] = inv;
+function assessPanelFixedEffects(
+  ds: ParsedDataset,
+  hints: EconometricDesignHints,
+  missingDataMode: MissingDataMode,
+): PanelFixedEffectsAssessment {
+  const entityCol = hints.primaryEntityCol;
+  const timeCol = hints.primaryTimeCol;
+  const yCol = hints.primaryOutcomeCol;
+  const xCol = hints.primaryRegressorCol;
+  const reasons: string[] = [];
 
-  let meat00 = 0;
-  let meat01 = 0;
-  let meat11 = 0;
-  let ssRes = 0;
-  const meanY = observations.reduce((sum, obs) => sum + obs.y, 0) / n;
-  const ssTot = observations.reduce((sum, obs) => sum + (obs.y - meanY) ** 2, 0);
-  const fittedResiduals: Array<{ fitted: number; residual: number }> = [];
-  for (const obs of observations) {
-    const fitted = reg.intercept + reg.slope * obs.x;
-    const residual = obs.y - fitted;
-    const u2 = residual * residual;
-    meat00 += u2;
-    meat01 += u2 * obs.x;
-    meat11 += u2 * obs.x * obs.x;
-    ssRes += residual * residual;
-    if (fittedResiduals.length < 400) {
-      fittedResiduals.push({ fitted, residual });
-    }
+  if (!entityCol) reasons.push("entity column not specified or detected");
+  if (!timeCol) reasons.push("time column not specified or detected");
+  if (!yCol) reasons.push("outcome column not specified or detected");
+  if (!xCol) reasons.push("regressor column not specified or detected");
+  if (xCol && yCol && xCol === yCol) reasons.push("outcome and regressor resolve to the same column");
+
+  if (reasons.length > 0) {
+    return {
+      diagnostics: {
+        status: "blocked",
+        reason: reasons.join("; "),
+        reasons,
+        entityCol,
+        timeCol,
+        xCol,
+        yCol,
+        completeCaseRows: 0,
+        completeCaseEntities: 0,
+        completeCasePeriods: 0,
+        repeatedEntityCount: 0,
+        informativeEntityCountX: 0,
+        informativeEntityCountY: 0,
+        informativeEntityCountBoth: 0,
+        minObsPerEntity: 0,
+        medianObsPerEntity: 0,
+        maxObsPerEntity: 0,
+        transformedRows: 0,
+      },
+      prepared: null,
+      transformed: [],
+      transformedPredictorNames: [],
+      transformedSsTot: 0,
+    };
   }
 
-  const tmp00 = inv00 * meat00 + inv01 * meat01;
-  const tmp01 = inv00 * meat01 + inv01 * meat11;
-  const tmp10 = inv10 * meat00 + inv11 * meat01;
-  const tmp11 = inv10 * meat01 + inv11 * meat11;
-  const hc1 = n / Math.max(1, n - 2);
-  const var00 = (tmp00 * inv00 + tmp01 * inv10) * hc1;
-  const var11 = (tmp10 * inv01 + tmp11 * inv11) * hc1;
-  const seIntercept = Math.sqrt(Math.max(var00, 0));
-  const seSlope = Math.sqrt(Math.max(var11, 0));
-  if (!isFinite(seSlope) || seSlope <= 0) return null;
+  const prepared = preparePanelRegressionData(ds, hints, missingDataMode);
+  if (!prepared) {
+    reasons.push("panel regression data could not be prepared");
+    return {
+      diagnostics: {
+        status: "blocked",
+        reason: reasons.join("; "),
+        reasons,
+        entityCol,
+        timeCol,
+        xCol,
+        yCol,
+        completeCaseRows: 0,
+        completeCaseEntities: 0,
+        completeCasePeriods: 0,
+        repeatedEntityCount: 0,
+        informativeEntityCountX: 0,
+        informativeEntityCountY: 0,
+        informativeEntityCountBoth: 0,
+        minObsPerEntity: 0,
+        medianObsPerEntity: 0,
+        maxObsPerEntity: 0,
+        transformedRows: 0,
+      },
+      prepared: null,
+      transformed: [],
+      transformedPredictorNames: [],
+      transformedSsTot: 0,
+    };
+  }
 
-  const tStat = reg.slope / seSlope;
-  const pValue = approxTwoTailPValue(tStat, n - 2);
-  const ciLower = reg.slope - 1.96 * seSlope;
-  const ciUpper = reg.slope + 1.96 * seSlope;
-  const adjR2 = 1 - (1 - reg.r2) * (n - 1) / Math.max(1, n - 2);
+  const rows = prepared.rows;
 
-  return {
+  const obsPerEntity = new Map<string, number>();
+  const xByEntity = new Map<string, number[]>();
+  const yByEntity = new Map<string, number[]>();
+  const timeValues = new Set<number>();
+  for (const row of rows) {
+    obsPerEntity.set(row.entity, (obsPerEntity.get(row.entity) || 0) + 1);
+    timeValues.add(row.time);
+    const entityX = xByEntity.get(row.entity) || [];
+    entityX.push(row.x[0]);
+    xByEntity.set(row.entity, entityX);
+    const entityY = yByEntity.get(row.entity) || [];
+    entityY.push(row.y);
+    yByEntity.set(row.entity, entityY);
+  }
+
+  const counts = Array.from(obsPerEntity.values()).sort((a, b) => a - b);
+  const completeCaseEntities = obsPerEntity.size;
+  const completeCasePeriods = timeValues.size;
+  const repeatedEntityCount = counts.filter(count => count >= 2).length;
+  const informativeEntityCountX = Array.from(xByEntity.values()).filter(values => values.length >= 2 && Math.max(...values) - Math.min(...values) > 1e-10).length;
+  const informativeEntityCountY = Array.from(yByEntity.values()).filter(values => values.length >= 2 && Math.max(...values) - Math.min(...values) > 1e-10).length;
+  const informativeEntityCountBoth = Array.from(obsPerEntity.keys()).filter(entity => {
+    const xValues = xByEntity.get(entity) || [];
+    const yValues = yByEntity.get(entity) || [];
+    return xValues.length >= 2 && yValues.length >= 2 &&
+      Math.max(...xValues) - Math.min(...xValues) > 1e-10 &&
+      Math.max(...yValues) - Math.min(...yValues) > 1e-10;
+  }).length;
+
+  if (rows.length < 40) reasons.push(`complete-case rows too small (${rows.length} < 40)`);
+  if (completeCaseEntities < 8) reasons.push(`too few entities (${completeCaseEntities} < 8)`);
+  if (completeCasePeriods < 3) reasons.push(`too few periods (${completeCasePeriods} < 3)`);
+  if (repeatedEntityCount < 5) reasons.push(`too few entities with repeated observations (${repeatedEntityCount} < 5)`);
+  if (informativeEntityCountBoth < 5) reasons.push(`insufficient within-entity variation (${informativeEntityCountBoth} informative entities < 5)`);
+
+  const predictorCount = prepared.regressorCols.length;
+  const entityXMeans = new Map<string, { sum: number[]; count: number }>();
+  const entityYMeans = new Map<string, { sum: number; count: number }>();
+  const timeXMeans = new Map<number, { sum: number[]; count: number }>();
+  const timeYMeans = new Map<number, { sum: number; count: number }>();
+  for (const row of rows) {
+    const ex = entityXMeans.get(row.entity) || { sum: Array(predictorCount).fill(0), count: 0 };
+    for (let index = 0; index < predictorCount; index++) ex.sum[index] += row.x[index];
+    ex.count++;
+    entityXMeans.set(row.entity, ex);
+    const ey = entityYMeans.get(row.entity) || { sum: 0, count: 0 };
+    ey.sum += row.y;
+    ey.count++;
+    entityYMeans.set(row.entity, ey);
+    const tx = timeXMeans.get(row.time) || { sum: Array(predictorCount).fill(0), count: 0 };
+    for (let index = 0; index < predictorCount; index++) tx.sum[index] += row.x[index];
+    tx.count++;
+    timeXMeans.set(row.time, tx);
+    const ty = timeYMeans.get(row.time) || { sum: 0, count: 0 };
+    ty.sum += row.y;
+    ty.count++;
+    timeYMeans.set(row.time, ty);
+  }
+
+  const grandX = Array.from({ length: predictorCount }, (_, index) =>
+    rows.length > 0 ? rows.reduce((sum, row) => sum + row.x[index], 0) / rows.length : 0
+  );
+  const grandY = rows.length > 0 ? rows.reduce((sum, row) => sum + row.y, 0) / rows.length : 0;
+  const transformed: Array<{ x: number[]; ydd: number; clusterId: string }> = [];
+  let transformedSsTot = 0;
+  for (const row of rows) {
+    const meanEntityX = entityXMeans.get(row.entity)!.sum.map(value => value / entityXMeans.get(row.entity)!.count);
+    const meanEntityY = entityYMeans.get(row.entity)!.sum / entityYMeans.get(row.entity)!.count;
+    const meanTimeX = timeXMeans.get(row.time)!.sum.map(value => value / timeXMeans.get(row.time)!.count);
+    const meanTimeY = timeYMeans.get(row.time)!.sum / timeYMeans.get(row.time)!.count;
+    const transformedX = row.x.map((value, index) => value - meanEntityX[index] - meanTimeX[index] + grandX[index]);
+    const ydd = row.y - meanEntityY - meanTimeY + grandY;
+    if (!transformedX.every(value => isFinite(value)) || !isFinite(ydd)) continue;
+    transformed.push({ x: transformedX, ydd, clusterId: row.clusterId });
+    transformedSsTot += ydd * ydd;
+  }
+
+  if (transformed.length < 30) reasons.push(`effective transformed observations too small (${transformed.length} < 30)`);
+  const primaryVariance = transformed.reduce((sum, row) => sum + row.x[0] * row.x[0], 0);
+  if (primaryVariance <= 1e-10) reasons.push("demeaned regressor has no within variation");
+
+  const diagnostics: PanelFixedEffectsDiagnostics = {
+    status: reasons.length === 0 ? "passed" : "blocked",
+    reason: reasons.join("; "),
+    reasons,
+    entityCol,
+    timeCol,
     xCol,
     yCol,
-    intercept: reg.intercept,
-    slope: reg.slope,
-    seIntercept,
-    seSlope,
-    tStat,
-    pValue,
-    r2: reg.r2,
-    adjR2,
-    n,
-    ciLower,
-    ciUpper,
+    completeCaseRows: rows.length,
+    completeCaseEntities,
+    completeCasePeriods,
+    repeatedEntityCount,
+    informativeEntityCountX,
+    informativeEntityCountY,
+    informativeEntityCountBoth,
+    minObsPerEntity: counts[0] || 0,
+    medianObsPerEntity: counts.length > 0 ? counts[Math.floor(counts.length / 2)] : 0,
+    maxObsPerEntity: counts[counts.length - 1] || 0,
+    transformedRows: transformed.length,
+  };
+
+  return {
+    diagnostics,
+    prepared,
+    transformed,
+    transformedPredictorNames: prepared.regressorCols,
+    transformedSsTot,
+  };
+}
+
+function computeRobustOls(
+  ds: ParsedDataset,
+  hints: EconometricDesignHints,
+  missingDataMode: MissingDataMode,
+): RobustOlsResult | null {
+  const prepared = prepareRegressionData(ds, hints, missingDataMode);
+  if (!prepared || prepared.rows.length < 20) return null;
+
+  const selected = fitLinearModelWithSelection(prepared.rows, prepared.regressorCols);
+  if (!selected) return null;
+
+  const primaryIndex = selected.regressorCols.findIndex(column => column === prepared.primaryRegressorCol);
+  if (primaryIndex < 0) return null;
+
+  const { fit, regressorCols, droppedCols } = selected;
+  const coefficientNames = ["intercept", ...regressorCols];
+  const coefficients: RegressionCoefficientEstimate[] = coefficientNames.map((name, index) => ({
+    name,
+    coefficient: fit.coefficients[index],
+    se: fit.standardErrors[index],
+    tStat: fit.tStats[index],
+    pValue: fit.pValues[index],
+    ciLower: fit.ciLower[index],
+    ciUpper: fit.ciUpper[index],
+  }));
+  const fittedResiduals = fit.fitted.slice(0, 400).map((fitted, index) => ({
+    fitted,
+    residual: fit.residuals[index],
+  }));
+
+  return {
+    xCol: prepared.primaryRegressorCol,
+    yCol: prepared.yCol,
+    regressorCols,
+    controlCols: regressorCols.filter(column => column !== prepared.primaryRegressorCol),
+    omittedControlCols: uniqueColumns([...prepared.omittedControlCols, ...droppedCols]),
+    droppedCollinearCols: droppedCols,
+    intercept: fit.coefficients[0],
+    slope: fit.coefficients[primaryIndex + 1],
+    seIntercept: fit.standardErrors[0],
+    seSlope: fit.standardErrors[primaryIndex + 1],
+    tStat: fit.tStats[primaryIndex + 1],
+    pValue: fit.pValues[primaryIndex + 1],
+    r2: fit.r2,
+    adjR2: fit.adjR2,
+    n: fit.n,
+    ciLower: fit.ciLower[primaryIndex + 1],
+    ciUpper: fit.ciUpper[primaryIndex + 1],
+    vcovType: fit.vcovType,
+    clusterCol: fit.vcovType === "cluster" ? prepared.clusterCol : undefined,
+    clusterCount: fit.clusterCount,
+    missingDataMode,
+    imputedPredictorCells: prepared.imputedPredictorCells,
+    coefficients,
     fittedResiduals,
   };
 }
 
-function computePanelFixedEffects(ds: ParsedDataset, hints: EconometricDesignHints): PanelFixedEffectsResult | null {
-  const entityCol = hints.primaryEntityCol;
-  const timeCol = hints.primaryTimeCol;
-  const yCol = hints.primaryOutcomeCol;
-  const xCol =
-    (hints.primaryTreatmentCol && hints.primaryTreatmentCol !== hints.primaryOutcomeCol ? hints.primaryTreatmentCol : undefined) ||
-    hints.primaryRegressorCol;
-  if (!entityCol || !timeCol || !yCol || !xCol || xCol === yCol) return null;
+function computePanelFixedEffects(
+  ds: ParsedDataset,
+  hints: EconometricDesignHints,
+  missingDataMode: MissingDataMode,
+): PanelFixedEffectsResult | null {
+  const assessment = assessPanelFixedEffects(ds, hints, missingDataMode);
+  if (assessment.diagnostics.status !== "passed") return null;
 
-  const rows = ds.data
-    .map(row => ({
-      entity: String(row[entityCol] ?? "").trim(),
-      time: parseTimeValue(row[timeCol]),
-      x: Number(row[xCol]),
-      y: Number(row[yCol]),
-    }))
-    .filter(row => row.entity && row.time !== null && !isNaN(row.x) && !isNaN(row.y));
-  if (rows.length < 40) return null;
+  const { diagnostics, prepared, transformed, transformedPredictorNames, transformedSsTot: ssTot } = assessment;
+  if (!prepared) return null;
+  const entityCol = diagnostics.entityCol!;
+  const timeCol = diagnostics.timeCol!;
+  const xCol = diagnostics.xCol!;
+  const yCol = diagnostics.yCol!;
+  const selected = fitLinearModelWithSelection(
+    transformed.map(row => ({ y: row.ydd, x: row.x, clusterId: row.clusterId })),
+    transformedPredictorNames,
+  );
+  if (!selected) return null;
+  const primaryIndex = selected.regressorCols.findIndex(column => column === prepared.primaryRegressorCol);
+  if (primaryIndex < 0) return null;
 
-  const entityX = new Map<string, { sum: number; count: number }>();
-  const entityY = new Map<string, { sum: number; count: number }>();
-  const timeX = new Map<number, { sum: number; count: number }>();
-  const timeY = new Map<number, { sum: number; count: number }>();
-  for (const row of rows) {
-    const ex = entityX.get(row.entity) || { sum: 0, count: 0 };
-    ex.sum += row.x;
-    ex.count++;
-    entityX.set(row.entity, ex);
-    const ey = entityY.get(row.entity) || { sum: 0, count: 0 };
-    ey.sum += row.y;
-    ey.count++;
-    entityY.set(row.entity, ey);
-    const tx = timeX.get(row.time!) || { sum: 0, count: 0 };
-    tx.sum += row.x;
-    tx.count++;
-    timeX.set(row.time!, tx);
-    const ty = timeY.get(row.time!) || { sum: 0, count: 0 };
-    ty.sum += row.y;
-    ty.count++;
-    timeY.set(row.time!, ty);
-  }
-
-  const entityCount = entityX.size;
-  const periodCount = timeX.size;
-  if (entityCount < 2 || periodCount < 3) return null;
-
-  const grandX = rows.reduce((sum, row) => sum + row.x, 0) / rows.length;
-  const grandY = rows.reduce((sum, row) => sum + row.y, 0) / rows.length;
-  let num = 0;
-  let den = 0;
-  let ssTot = 0;
-  const transformed: Array<{ xdd: number; ydd: number }> = [];
-  for (const row of rows) {
-    const meanEntityX = entityX.get(row.entity)!.sum / entityX.get(row.entity)!.count;
-    const meanEntityY = entityY.get(row.entity)!.sum / entityY.get(row.entity)!.count;
-    const meanTimeX = timeX.get(row.time!)!.sum / timeX.get(row.time!)!.count;
-    const meanTimeY = timeY.get(row.time!)!.sum / timeY.get(row.time!)!.count;
-    const xdd = row.x - meanEntityX - meanTimeX + grandX;
-    const ydd = row.y - meanEntityY - meanTimeY + grandY;
-    if (!isFinite(xdd) || !isFinite(ydd)) continue;
-    transformed.push({ xdd, ydd });
-    num += xdd * ydd;
-    den += xdd * xdd;
-    ssTot += ydd * ydd;
-  }
-  if (transformed.length < 30 || den <= 1e-10) return null;
-
-  const beta = num / den;
-  let ssRes = 0;
-  let robustNumerator = 0;
-  const fittedResiduals: Array<{ fitted: number; residual: number }> = [];
-  for (const row of transformed) {
-    const fitted = beta * row.xdd;
-    const residual = row.ydd - fitted;
-    ssRes += residual * residual;
-    robustNumerator += row.xdd * row.xdd * residual * residual;
-    if (fittedResiduals.length < 400) {
-      fittedResiduals.push({ fitted, residual });
-    }
-  }
-
-  const n = transformed.length;
-  const hc1 = n / Math.max(1, n - 1);
-  const se = Math.sqrt(Math.max((robustNumerator / (den * den)) * hc1, 0));
-  if (!isFinite(se) || se <= 0) return null;
-  const tStat = beta / se;
-  const pValue = approxTwoTailPValue(tStat, n - 1);
+  const coefficientNames = ["intercept", ...selected.regressorCols];
+  const coefficients: RegressionCoefficientEstimate[] = coefficientNames.map((name, index) => ({
+    name,
+    coefficient: selected.fit.coefficients[index],
+    se: selected.fit.standardErrors[index],
+    tStat: selected.fit.tStats[index],
+    pValue: selected.fit.pValues[index],
+    ciLower: selected.fit.ciLower[index],
+    ciUpper: selected.fit.ciUpper[index],
+  }));
+  const fittedResiduals = selected.fit.fitted.slice(0, 400).map((fitted, index) => ({
+    fitted,
+    residual: selected.fit.residuals[index],
+  }));
+  const ssRes = selected.fit.residuals.reduce((sum, residual) => sum + residual * residual, 0);
   const r2Within = ssTot > 0 ? Math.max(0, 1 - ssRes / ssTot) : 0;
 
   return {
@@ -2996,14 +3859,24 @@ function computePanelFixedEffects(ds: ParsedDataset, hints: EconometricDesignHin
     timeCol,
     xCol,
     yCol,
-    beta,
-    se,
-    tStat,
-    pValue,
-    n,
-    entities: entityCount,
-    periods: periodCount,
+    regressorCols: selected.regressorCols,
+    controlCols: selected.regressorCols.filter(column => column !== prepared.primaryRegressorCol),
+    omittedControlCols: uniqueColumns([...prepared.omittedControlCols, ...selected.droppedCols]),
+    droppedCollinearCols: selected.droppedCols,
+    beta: selected.fit.coefficients[primaryIndex + 1],
+    se: selected.fit.standardErrors[primaryIndex + 1],
+    tStat: selected.fit.tStats[primaryIndex + 1],
+    pValue: selected.fit.pValues[primaryIndex + 1],
+    n: selected.fit.n,
+    entities: diagnostics.completeCaseEntities,
+    periods: diagnostics.completeCasePeriods,
     r2Within,
+    vcovType: selected.fit.vcovType,
+    clusterCol: selected.fit.vcovType === "cluster" ? prepared.entityCol : undefined,
+    clusterCount: selected.fit.clusterCount,
+    missingDataMode,
+    imputedPredictorCells: prepared.imputedPredictorCells,
+    coefficients,
     fittedResiduals,
   };
 }
@@ -3627,28 +4500,91 @@ function computePropensityScore(ds: ParsedDataset, hints: EconometricDesignHints
   };
 }
 
-function computeQuantileRegression(ds: ParsedDataset, hints: EconometricDesignHints): QuantileRegressionResult | null {
-  const yCol = hints.primaryOutcomeCol;
-  const xCol = hints.primaryRegressorCol;
-  if (!xCol || !yCol || xCol === yCol) return null;
+function computeQuantileRegression(
+  ds: ParsedDataset,
+  hints: EconometricDesignHints,
+  missingDataMode: MissingDataMode,
+): QuantileRegressionResult | null {
+  const prepared = prepareRegressionData(ds, hints, missingDataMode);
+  if (!prepared || prepared.rows.length < 80) return null;
 
-  const observations = ds.data
-    .map(row => ({ x: Number(row[xCol]), y: Number(row[yCol]) }))
-    .filter(obs => !isNaN(obs.x) && !isNaN(obs.y) && isFinite(obs.x) && isFinite(obs.y));
-  if (observations.length < 80) return null;
+  const variances = prepared.regressorCols.map((_, index) =>
+    variance(prepared.rows.map(row => row.x[index]), false)
+  );
+  const activeIndexes = prepared.regressorCols
+    .map((column, index) => ({ column, index }))
+    .filter(item => variances[item.index] > 1e-10)
+    .map(item => item.index);
+  const primaryActiveIndex = prepared.regressorCols.findIndex(column => column === prepared.primaryRegressorCol);
+  if (primaryActiveIndex < 0 || !activeIndexes.includes(primaryActiveIndex)) return null;
+
+  const activeRows = prepared.rows.map(row => ({
+    y: row.y,
+    x: activeIndexes.map(index => row.x[index]),
+    clusterId: row.clusterId,
+  }));
+  const activeRegressorCols = activeIndexes.map(index => prepared.regressorCols[index]);
+  const droppedCollinearCols = prepared.regressorCols.filter((_, index) => !activeIndexes.includes(index));
 
   const estimates = [0.25, 0.5, 0.75]
     .map(tau => {
-      const fit = fitQuantileRegression1D(observations, tau);
-      return fit ? { tau, intercept: fit.intercept, slope: fit.slope, pseudoR1: fit.pseudoR1 } : null;
+      const fit = fitQuantileRegressionModel(activeRows, tau);
+      if (!fit) return null;
+      const bootstrap = computeBootstrapStandardErrors(activeRows, tau, activeRegressorCols.length + 1);
+      if (!bootstrap) return null;
+      const primaryIndex = activeRegressorCols.findIndex(column => column === prepared.primaryRegressorCol);
+      if (primaryIndex < 0) return null;
+      const coefficientVector = [fit.intercept, ...fit.slopes];
+      const degreesOfFreedom = bootstrap.clusterCount
+        ? Math.max(1, bootstrap.clusterCount - 1)
+        : Math.max(1, activeRows.length - activeRegressorCols.length - 1);
+      const coefficients: RegressionCoefficientEstimate[] = ["intercept", ...activeRegressorCols].map((name, index) => {
+        const se = bootstrap.standardErrors[index];
+        const tStat = se > 0 ? coefficientVector[index] / se : 0;
+        const pValue = approxTwoTailPValue(tStat, degreesOfFreedom);
+        return {
+          name,
+          coefficient: coefficientVector[index],
+          se,
+          tStat,
+          pValue,
+          ciLower: coefficientVector[index] - 1.96 * se,
+          ciUpper: coefficientVector[index] + 1.96 * se,
+        };
+      });
+      const primaryEstimate = coefficients[primaryIndex + 1];
+      return {
+        tau,
+        intercept: fit.intercept,
+        slope: fit.slopes[primaryIndex],
+        interceptSe: coefficients[0].se,
+        slopeSe: primaryEstimate.se,
+        tStat: primaryEstimate.tStat,
+        pValue: primaryEstimate.pValue,
+        ciLower: primaryEstimate.ciLower,
+        ciUpper: primaryEstimate.ciUpper,
+        pseudoR1: fit.pseudoR1,
+        coefficients,
+        bootstrapReplicates: bootstrap.replicates,
+      };
     })
     .filter((item): item is QuantileRegressionEstimate => item !== null);
   if (estimates.length < 3) return null;
 
+  const clusterIds = Array.from(new Set(activeRows.map(row => row.clusterId).filter((value): value is string => Boolean(value))));
   return {
-    xCol,
-    yCol,
-    n: observations.length,
+    xCol: prepared.primaryRegressorCol,
+    yCol: prepared.yCol,
+    regressorCols: activeRegressorCols,
+    controlCols: activeRegressorCols.filter(column => column !== prepared.primaryRegressorCol),
+    omittedControlCols: uniqueColumns([...prepared.omittedControlCols, ...droppedCollinearCols]),
+    droppedCollinearCols,
+    n: activeRows.length,
+    vcovType: "bootstrap",
+    clusterCol: clusterIds.length >= Math.max(8, activeRegressorCols.length + 1) ? prepared.clusterCol : undefined,
+    clusterCount: clusterIds.length >= Math.max(8, activeRegressorCols.length + 1) ? clusterIds.length : undefined,
+    missingDataMode,
+    imputedPredictorCells: prepared.imputedPredictorCells,
     estimates,
   };
 }
@@ -4007,6 +4943,7 @@ export function generateDefaultCharts(
   allData: { name: string; data: Record<string, any>[]; columns: string[]; totalRows: number }[],
   executableMethods: Set<string> | null,
   analysisTopic = "",
+  analysisInputs?: AnalysisInputs,
 ): { name: string; description: string; config: any }[] {
   const charts: { name: string; description: string; config: any }[] = [];
   const ds = getPrimaryDataset(allData);
@@ -4014,22 +4951,20 @@ export function generateDefaultCharts(
 
   const { numericCols: rawNumericCols, categoricalCols, idCols } = classifyColumns(ds.data, ds.columns);
   const baseNumericCols = rawNumericCols.filter(c => !idCols.includes(c));
-  const designHints = inferEconometricDesignHints(ds, baseNumericCols, categoricalCols, idCols, analysisTopic);
+  const designHints = inferEconometricDesignHints(ds, baseNumericCols, categoricalCols, idCols, analysisTopic, analysisInputs);
+  const missingDataMode = resolveMissingDataMode(analysisInputs);
   const numericCols = rankMeaningfulNumericColumns(ds, baseNumericCols, designHints, analysisTopic);
   const primaryDescriptiveCol = choosePreferredDescriptiveNumericColumn(ds, numericCols, designHints);
   const secondaryDescriptiveCol = chooseSecondaryDescriptiveNumericColumn(ds, numericCols, designHints, primaryDescriptiveCol);
-  const robustOls =
-    designHints.primaryOutcomeCol && designHints.primaryRegressorCol && designHints.primaryOutcomeCol !== designHints.primaryRegressorCol
-      ? computeRobustOls(ds, designHints.primaryRegressorCol, designHints.primaryOutcomeCol)
-      : null;
-  const panelFixedEffects = computePanelFixedEffects(ds, designHints);
+  const robustOls = computeRobustOls(ds, designHints, missingDataMode);
+  const panelFixedEffects = computePanelFixedEffects(ds, designHints, missingDataMode);
   const diffInDiff = computeDiffInDiff(ds, designHints);
   const syntheticControl = computeSyntheticControl(ds, designHints);
   const syntheticControlPlacebos = syntheticControl ? computeSyntheticControlPlacebos(ds, designHints, syntheticControl) : null;
   const iv2Sls = computeIv2Sls(ds, designHints);
   const rdd = computeRegressionDiscontinuity(ds, designHints);
   const propensityScore = computePropensityScore(ds, designHints);
-  const quantileRegression = computeQuantileRegression(ds, designHints);
+  const quantileRegression = computeQuantileRegression(ds, designHints, missingDataMode);
 
   // Chart 1: Distribution of first numeric column (histogram-like bar chart)
   if (primaryDescriptiveCol && methodAllowed(executableMethods, "descriptive_statistics")) {
@@ -5320,7 +6255,7 @@ function buildRoutingDiagnostics(
   if (metricKeys.some(k => k.startsWith("anova_"))) executedMethods.push("group_comparison");
   if (metricKeys.some(k => k.startsWith("time_trend_"))) executedMethods.push("time_trend");
   if (metricKeys.some(k => k.startsWith("text_") || k.startsWith("top_term_"))) executedMethods.push("text_feature_analysis");
-  if (metricKeys.some(k => k.startsWith("panel_fe_"))) executedMethods.push("panel_fixed_effects");
+  if (metricKeys.some(k => k.startsWith("panel_fe_beta_") || k.startsWith("panel_fe_within_r2_") || k.startsWith("panel_fe_sample_size_"))) executedMethods.push("panel_fixed_effects");
   if (metricKeys.some(k => k.startsWith("did_"))) executedMethods.push("diff_in_diff");
   if (metricKeys.some(k => k.startsWith("event_study_"))) executedMethods.push("event_study");
   if (metricKeys.some(k => k.startsWith("synthetic_control_"))) executedMethods.push("synthetic_control");
@@ -5359,12 +6294,22 @@ function buildRoutingDiagnostics(
   if (blockedMethods.includes("iv_2sls")) unresolvedPrerequisites.push("iv_2sls: instrument field not detected");
   if (blockedMethods.includes("regression_discontinuity")) unresolvedPrerequisites.push("regression_discontinuity: running variable/cutoff not detected");
   if (blockedMethods.includes("propensity_score")) unresolvedPrerequisites.push("propensity_score: treatment/covariate overlap structure not detected");
+  if (typeof metrics.analysis_inputs_missing_columns === "string" && metrics.analysis_inputs_missing_columns.trim()) {
+    unresolvedPrerequisites.push(`analysis_inputs: requested columns missing (${metrics.analysis_inputs_missing_columns})`);
+  }
 
   const requested = executableMethods ? Array.from(executableMethods) : [];
+  const panelFeRequested = requested.some(methodId => normaliseMethodId(methodId) === "panel_fixed_effects");
+  if (panelFeRequested && metrics.panel_fe_gate_status === "blocked") {
+    unresolvedPrerequisites.push(`panel_fixed_effects: ${String(metrics.panel_fe_gate_reason || "failed diagnostics")}`);
+  }
   const skippedExecutableMethods = requested.filter(m => !executedSet.has(normaliseMethodId(m)));
   const noOutputReasons: string[] = [];
   if (skippedExecutableMethods.length > 0) {
     noOutputReasons.push(`Executable methods without observed outputs: ${skippedExecutableMethods.join(", ")}`);
+  }
+  if (panelFeRequested && metrics.panel_fe_gate_status === "blocked") {
+    noOutputReasons.push(`Panel fixed effects skipped: ${String(metrics.panel_fe_gate_reason || "failed diagnostics")}`);
   }
   if (charts.length === 0) noOutputReasons.push("No charts were generated from executable methods.");
   if (tables.length === 0) noOutputReasons.push("No tables were generated from executable methods.");
@@ -5383,6 +6328,7 @@ function generateDefaultTables(
   allData: { name: string; data: Record<string, any>[]; columns: string[]; totalRows: number }[],
   executableMethods: Set<string> | null,
   analysisTopic = "",
+  analysisInputs?: AnalysisInputs,
 ): { name: string; description: string; headers: string[]; rows: (string | number)[][] }[] {
   const tables: { name: string; description: string; headers: string[]; rows: (string | number)[][] }[] = [];
   const ds = getPrimaryDataset(allData);
@@ -5390,21 +6336,19 @@ function generateDefaultTables(
 
   const { numericCols: rawNumericCols, categoricalCols, idCols: _idCols2 } = classifyColumns(ds.data, ds.columns);
   const baseNumericCols = rawNumericCols.filter(c => !_idCols2.includes(c));
-  const designHints = inferEconometricDesignHints(ds, baseNumericCols, categoricalCols, _idCols2, analysisTopic);
+  const designHints = inferEconometricDesignHints(ds, baseNumericCols, categoricalCols, _idCols2, analysisTopic, analysisInputs);
+  const missingDataMode = resolveMissingDataMode(analysisInputs);
   const numericCols = rankMeaningfulNumericColumns(ds, baseNumericCols, designHints, analysisTopic);
   const primaryDescriptiveCol = choosePreferredDescriptiveNumericColumn(ds, numericCols, designHints);
   const methodAssessments = buildMethodApplicabilityAssessment(ds, numericCols, categoricalCols);
-  const robustOls =
-    designHints.primaryOutcomeCol && designHints.primaryRegressorCol && designHints.primaryOutcomeCol !== designHints.primaryRegressorCol
-      ? computeRobustOls(ds, designHints.primaryRegressorCol, designHints.primaryOutcomeCol)
-      : null;
-  const panelFixedEffects = computePanelFixedEffects(ds, designHints);
+  const robustOls = computeRobustOls(ds, designHints, missingDataMode);
+  const panelFixedEffects = computePanelFixedEffects(ds, designHints, missingDataMode);
   const diffInDiff = computeDiffInDiff(ds, designHints);
   const syntheticControl = computeSyntheticControl(ds, designHints);
   const iv2Sls = computeIv2Sls(ds, designHints);
   const rdd = computeRegressionDiscontinuity(ds, designHints);
   const propensityScore = computePropensityScore(ds, designHints);
-  const quantileRegression = computeQuantileRegression(ds, designHints);
+  const quantileRegression = computeQuantileRegression(ds, designHints, missingDataMode);
 
   // Table 1: Descriptive statistics of numeric variables
   if (numericCols.length > 0 && methodAllowed(executableMethods, "descriptive_statistics")) {
@@ -5677,7 +6621,7 @@ function generateDefaultTables(
 
       for (const row of ds.data) {
         const val = row[col];
-        if (val === null || val === undefined || val === "" || val === "NA" || val === "NaN" || val === ".") {
+        if (isMissingValue(val)) {
           missing++;
         } else {
           totalNonNull++;
@@ -5727,19 +6671,22 @@ function generateDefaultTables(
   if (robustOls && methodAllowed(executableMethods, "robust_ols")) {
     tables.push({
       name: "robust_ols_results",
-      description: `Heteroskedasticity-robust OLS results for ${robustOls.yCol} on ${robustOls.xCol}`,
-      headers: ["Outcome", "Regressor", "Coeff", "Robust SE", "t-stat", "p-value", "95% CI", "R2", "Adj R2", "N"],
+      description: `Multivariate OLS results for ${robustOls.yCol} on ${robustOls.xCol}${robustOls.controlCols.length > 0 ? ` with controls ${robustOls.controlCols.join(", ")}` : ""}`,
+      headers: ["Outcome", "Primary regressor", "Controls", "Coeff", "SE", "SE type", "Clusters", "p-value", "95% CI", "R2", "Adj R2", "N", "Missing-data"],
       rows: [[
         robustOls.yCol.length > 18 ? `${robustOls.yCol.slice(0, 15)}...` : robustOls.yCol,
         robustOls.xCol.length > 18 ? `${robustOls.xCol.slice(0, 15)}...` : robustOls.xCol,
+        robustOls.controlCols.join(", ") || "none",
         Math.round(robustOls.slope * 10000) / 10000,
         Math.round(robustOls.seSlope * 10000) / 10000,
-        Math.round(robustOls.tStat * 1000) / 1000,
+        robustOls.vcovType,
+        robustOls.clusterCount || 0,
         robustOls.pValue < 0.001 ? "<0.001" : robustOls.pValue.toFixed(4),
         `[${(Math.round(robustOls.ciLower * 1000) / 1000).toFixed(3)}, ${(Math.round(robustOls.ciUpper * 1000) / 1000).toFixed(3)}]`,
         Math.round(robustOls.r2 * 1000) / 1000,
         Math.round(robustOls.adjR2 * 1000) / 1000,
         robustOls.n,
+        robustOls.missingDataMode,
       ]],
     });
   }
@@ -5747,19 +6694,22 @@ function generateDefaultTables(
   if (panelFixedEffects && methodAllowed(executableMethods, "panel_fixed_effects")) {
     tables.push({
       name: "panel_fixed_effects_results",
-      description: `Two-way de-meaned fixed-effects regression for ${panelFixedEffects.yCol} on ${panelFixedEffects.xCol}`,
-      headers: ["Outcome", "Regressor", "Beta", "Robust SE", "t-stat", "p-value", "Within R2", "Entities", "Periods", "N"],
+      description: `Two-way fixed-effects regression for ${panelFixedEffects.yCol} on ${panelFixedEffects.xCol}${panelFixedEffects.controlCols.length > 0 ? ` with controls ${panelFixedEffects.controlCols.join(", ")}` : ""}`,
+      headers: ["Outcome", "Primary regressor", "Controls", "Beta", "SE", "SE type", "Clusters", "p-value", "Within R2", "Entities", "Periods", "N", "Missing-data"],
       rows: [[
         panelFixedEffects.yCol.length > 18 ? `${panelFixedEffects.yCol.slice(0, 15)}...` : panelFixedEffects.yCol,
         panelFixedEffects.xCol.length > 18 ? `${panelFixedEffects.xCol.slice(0, 15)}...` : panelFixedEffects.xCol,
+        panelFixedEffects.controlCols.join(", ") || "none",
         Math.round(panelFixedEffects.beta * 10000) / 10000,
         Math.round(panelFixedEffects.se * 10000) / 10000,
-        Math.round(panelFixedEffects.tStat * 1000) / 1000,
+        panelFixedEffects.vcovType,
+        panelFixedEffects.clusterCount || 0,
         panelFixedEffects.pValue < 0.001 ? "<0.001" : panelFixedEffects.pValue.toFixed(4),
         Math.round(panelFixedEffects.r2Within * 1000) / 1000,
         panelFixedEffects.entities,
         panelFixedEffects.periods,
         panelFixedEffects.n,
+        panelFixedEffects.missingDataMode,
       ]],
     });
   }
@@ -5859,16 +6809,21 @@ function generateDefaultTables(
   if (quantileRegression && methodAllowed(executableMethods, "quantile_regression")) {
     tables.push({
       name: "quantile_regression_results",
-      description: `Quantile-regression slope profile for ${quantileRegression.yCol} on ${quantileRegression.xCol}`,
-      headers: ["Outcome", "Regressor", "Tau", "Intercept", "Slope", "Pseudo R1", "N"],
+      description: `Conditional quantile-regression profile for ${quantileRegression.yCol} on ${quantileRegression.xCol}${quantileRegression.controlCols.length > 0 ? ` with controls ${quantileRegression.controlCols.join(", ")}` : ""}`,
+      headers: ["Outcome", "Primary regressor", "Controls", "Tau", "Slope", "Bootstrap SE", "p-value", "95% CI", "Pseudo R1", "Bootstraps", "N", "Missing-data"],
       rows: quantileRegression.estimates.map(estimate => ([
         quantileRegression.yCol.length > 18 ? `${quantileRegression.yCol.slice(0, 15)}...` : quantileRegression.yCol,
         quantileRegression.xCol.length > 18 ? `${quantileRegression.xCol.slice(0, 15)}...` : quantileRegression.xCol,
+        quantileRegression.controlCols.join(", ") || "none",
         estimate.tau,
-        Math.round(estimate.intercept * 1000) / 1000,
         Math.round(estimate.slope * 1000) / 1000,
+        Math.round(estimate.slopeSe * 1000) / 1000,
+        estimate.pValue < 0.001 ? "<0.001" : estimate.pValue.toFixed(4),
+        `[${(Math.round(estimate.ciLower * 1000) / 1000).toFixed(3)}, ${(Math.round(estimate.ciUpper * 1000) / 1000).toFixed(3)}]`,
         Math.round(estimate.pseudoR1 * 1000) / 1000,
+        estimate.bootstrapReplicates,
         quantileRegression.n,
+        quantileRegression.missingDataMode,
       ])),
     });
   }
@@ -5880,6 +6835,7 @@ export function generateDefaultMetrics(
   allData: { name: string; data: Record<string, any>[]; columns: string[]; totalRows: number }[],
   executableMethods: Set<string> | null,
   analysisTopic = "",
+  analysisInputs?: AnalysisInputs,
 ): Record<string, number | string> {
   const metrics: Record<string, number | string> = {};
   const ds = getPrimaryDataset(allData);
@@ -5902,31 +6858,34 @@ export function generateDefaultMetrics(
   let totalMissing = 0;
   for (const row of ds.data) {
     for (const col of ds.columns) {
-      if (row[col] === null || row[col] === undefined || row[col] === "" || row[col] === "NA" || row[col] === "NaN" || row[col] === ".") {
+      if (isMissingValue(row[col])) {
         totalMissing++;
       }
     }
   }
   metrics.missing_values = totalMissing;
   metrics.missing_rate = `${((totalMissing / (ds.data.length * ds.columns.length)) * 100).toFixed(2)}%`;
+  metrics.sample_waterfall_total_rows = ds.totalRows;
+  metrics.sample_waterfall_rows_loaded = ds.data.length;
+  metrics.sample_waterfall_rows_not_loaded = Math.max(0, ds.totalRows - ds.data.length);
 
   // Descriptive stats for meaningful numeric columns only (exclude ID/code columns)
   const baseMeaningfulNumericCols = numericCols.filter(c => !idCols.includes(c));
-  const designHints = inferEconometricDesignHints(ds, baseMeaningfulNumericCols, categoricalCols, idCols, analysisTopic);
+  const designHints = inferEconometricDesignHints(ds, baseMeaningfulNumericCols, categoricalCols, idCols, analysisTopic, analysisInputs);
+  const missingDataMode = resolveMissingDataMode(analysisInputs);
   const meaningfulNumericCols = rankMeaningfulNumericColumns(ds, baseMeaningfulNumericCols, designHints, analysisTopic);
   const methodAssessments = buildMethodApplicabilityAssessment(ds, meaningfulNumericCols, categoricalCols);
-  const robustOls =
-    designHints.primaryOutcomeCol && designHints.primaryRegressorCol && designHints.primaryOutcomeCol !== designHints.primaryRegressorCol
-      ? computeRobustOls(ds, designHints.primaryRegressorCol, designHints.primaryOutcomeCol)
-      : null;
-  const panelFixedEffects = computePanelFixedEffects(ds, designHints);
+  const panelFeAssessment = assessPanelFixedEffects(ds, designHints, missingDataMode);
+  const preparedRegression = prepareRegressionData(ds, designHints, missingDataMode);
+  const robustOls = computeRobustOls(ds, designHints, missingDataMode);
+  const panelFixedEffects = computePanelFixedEffects(ds, designHints, missingDataMode);
   const diffInDiff = computeDiffInDiff(ds, designHints);
   const syntheticControl = computeSyntheticControl(ds, designHints);
   const syntheticControlPlacebos = syntheticControl ? computeSyntheticControlPlacebos(ds, designHints, syntheticControl) : null;
   const iv2Sls = computeIv2Sls(ds, designHints);
   const rdd = computeRegressionDiscontinuity(ds, designHints);
   const propensityScore = computePropensityScore(ds, designHints);
-  const quantileRegression = computeQuantileRegression(ds, designHints);
+  const quantileRegression = computeQuantileRegression(ds, designHints, missingDataMode);
   const executableNowCount = methodAssessments.filter(item => item.status === "executable_now").length;
   const partiallyReadyCount = methodAssessments.filter(item => item.status === "partially_ready").length;
   const blockedCount = methodAssessments.filter(item => item.status === "blocked").length;
@@ -5945,6 +6904,51 @@ export function generateDefaultMetrics(
     .join(", ");
   metrics.method_applicability_top_executable = topExecutable || "none";
   metrics.method_applicability_summary = `executable_now=${executableNowCount}, partially_ready=${partiallyReadyCount}, blocked=${blockedCount}`;
+  metrics.analysis_missing_data_mode = missingDataMode;
+  metrics.analysis_design_outcome = designHints.primaryOutcomeCol || "not_detected";
+  metrics.analysis_design_treatment = designHints.primaryTreatmentCol || "not_detected";
+  metrics.analysis_design_regressor = designHints.primaryRegressorCol || "not_detected";
+  metrics.analysis_design_entity = designHints.primaryEntityCol || "not_detected";
+  metrics.analysis_design_time = designHints.primaryTimeCol || "not_detected";
+  if (designHints.controlCols.length > 0) {
+    metrics.analysis_design_controls = designHints.controlCols.join(", ");
+  }
+  if (designHints.subgroupCol) {
+    metrics.analysis_design_subgroup = designHints.subgroupCol;
+  }
+  if (designHints.specifiedInputMatches.length > 0) {
+    metrics.analysis_inputs_matched_columns = designHints.specifiedInputMatches.join(", ");
+  }
+  if (designHints.specifiedInputMissing.length > 0) {
+    metrics.analysis_inputs_missing_columns = designHints.specifiedInputMissing.join(", ");
+  }
+
+  const primaryRegressionRows = preparedRegression?.rows.length || 0;
+  metrics.sample_waterfall_complete_case_primary_regression = primaryRegressionRows;
+  metrics.sample_waterfall_rows_used_primary_regression = primaryRegressionRows;
+  metrics.sample_waterfall_rows_dropped_primary_regression = Math.max(0, ds.data.length - primaryRegressionRows);
+  metrics.sample_waterfall_imputed_predictor_cells_primary_regression = preparedRegression?.imputedPredictorCells || 0;
+  const diffInDiffCompleteCases = countDiffInDiffCompleteCaseRows(ds, designHints);
+  metrics.sample_waterfall_complete_case_diff_in_diff = diffInDiffCompleteCases;
+  metrics.sample_waterfall_rows_dropped_diff_in_diff = Math.max(0, ds.data.length - diffInDiffCompleteCases);
+  const panelFeRows = panelFeAssessment.prepared?.rows.length || panelFeAssessment.diagnostics.completeCaseRows;
+  metrics.sample_waterfall_complete_case_panel_fe = panelFeRows;
+  metrics.sample_waterfall_rows_used_panel_fe = panelFeRows;
+  metrics.sample_waterfall_rows_dropped_panel_fe = Math.max(0, ds.data.length - panelFeRows);
+  metrics.sample_waterfall_imputed_predictor_cells_panel_fe = panelFeAssessment.prepared?.imputedPredictorCells || 0;
+  metrics.panel_fe_gate_status = panelFeAssessment.diagnostics.status;
+  metrics.panel_fe_gate_reason = panelFeAssessment.diagnostics.reason || "passed";
+  metrics.panel_fe_complete_case_rows = panelFeAssessment.diagnostics.completeCaseRows;
+  metrics.panel_fe_complete_case_entities = panelFeAssessment.diagnostics.completeCaseEntities;
+  metrics.panel_fe_complete_case_periods = panelFeAssessment.diagnostics.completeCasePeriods;
+  metrics.panel_fe_repeated_entities = panelFeAssessment.diagnostics.repeatedEntityCount;
+  metrics.panel_fe_informative_entities_x = panelFeAssessment.diagnostics.informativeEntityCountX;
+  metrics.panel_fe_informative_entities_y = panelFeAssessment.diagnostics.informativeEntityCountY;
+  metrics.panel_fe_informative_entities_both = panelFeAssessment.diagnostics.informativeEntityCountBoth;
+  metrics.panel_fe_min_obs_per_entity = panelFeAssessment.diagnostics.minObsPerEntity;
+  metrics.panel_fe_median_obs_per_entity = panelFeAssessment.diagnostics.medianObsPerEntity;
+  metrics.panel_fe_max_obs_per_entity = panelFeAssessment.diagnostics.maxObsPerEntity;
+  metrics.panel_fe_transformed_rows = panelFeAssessment.diagnostics.transformedRows;
 
   if (methodAllowed(executableMethods, "descriptive_statistics")) {
     for (const col of meaningfulNumericCols.slice(0, 5)) {
@@ -6082,6 +7086,15 @@ export function generateDefaultMetrics(
     metrics[`robust_ols_ci_high_${yKey}_on_${xKey}`] = Math.round(robustOls.ciUpper * 1000) / 1000;
     metrics[`robust_ols_r2_${yKey}_on_${xKey}`] = Math.round(robustOls.r2 * 1000) / 1000;
     metrics[`robust_ols_sample_size_${yKey}_on_${xKey}`] = robustOls.n;
+    metrics[`robust_ols_control_count_${yKey}_on_${xKey}`] = robustOls.controlCols.length;
+    metrics[`robust_ols_controls_${yKey}_on_${xKey}`] = robustOls.controlCols.join(", ") || "none";
+    metrics[`robust_ols_vcov_${yKey}_on_${xKey}`] = robustOls.vcovType;
+    metrics[`robust_ols_cluster_count_${yKey}_on_${xKey}`] = robustOls.clusterCount || 0;
+    metrics[`robust_ols_missing_data_${yKey}_on_${xKey}`] = robustOls.missingDataMode;
+    metrics[`robust_ols_imputed_predictor_cells_${yKey}_on_${xKey}`] = robustOls.imputedPredictorCells;
+    if (robustOls.omittedControlCols.length > 0) {
+      metrics[`robust_ols_omitted_controls_${yKey}_on_${xKey}`] = robustOls.omittedControlCols.join(", ");
+    }
   }
 
   if (panelFixedEffects && methodAllowed(executableMethods, "panel_fixed_effects")) {
@@ -6095,6 +7108,15 @@ export function generateDefaultMetrics(
     metrics[`panel_fe_entities_${yKey}_on_${xKey}`] = panelFixedEffects.entities;
     metrics[`panel_fe_periods_${yKey}_on_${xKey}`] = panelFixedEffects.periods;
     metrics[`panel_fe_sample_size_${yKey}_on_${xKey}`] = panelFixedEffects.n;
+    metrics[`panel_fe_control_count_${yKey}_on_${xKey}`] = panelFixedEffects.controlCols.length;
+    metrics[`panel_fe_controls_${yKey}_on_${xKey}`] = panelFixedEffects.controlCols.join(", ") || "none";
+    metrics[`panel_fe_vcov_${yKey}_on_${xKey}`] = panelFixedEffects.vcovType;
+    metrics[`panel_fe_cluster_count_${yKey}_on_${xKey}`] = panelFixedEffects.clusterCount || 0;
+    metrics[`panel_fe_missing_data_${yKey}_on_${xKey}`] = panelFixedEffects.missingDataMode;
+    metrics[`panel_fe_imputed_predictor_cells_${yKey}_on_${xKey}`] = panelFixedEffects.imputedPredictorCells;
+    if (panelFixedEffects.omittedControlCols.length > 0) {
+      metrics[`panel_fe_omitted_controls_${yKey}_on_${xKey}`] = panelFixedEffects.omittedControlCols.join(", ");
+    }
   }
 
   if (diffInDiff && methodAllowed(executableMethods, "diff_in_diff")) {
@@ -6186,9 +7208,23 @@ export function generateDefaultMetrics(
       const tauKey = `q${Math.round(estimate.tau * 100)}`;
       metrics[`quantile_regression_slope_${tauKey}_${outcomeKey}_on_${regressorKey}`] = Math.round(estimate.slope * 1000) / 1000;
       metrics[`quantile_regression_intercept_${tauKey}_${outcomeKey}_on_${regressorKey}`] = Math.round(estimate.intercept * 1000) / 1000;
+      metrics[`quantile_regression_se_${tauKey}_${outcomeKey}_on_${regressorKey}`] = Math.round(estimate.slopeSe * 1000) / 1000;
+      metrics[`quantile_regression_p_value_${tauKey}_${outcomeKey}_on_${regressorKey}`] = estimate.pValue < 0.001 ? "<0.001" : (Math.round(estimate.pValue * 10000) / 10000).toString();
+      metrics[`quantile_regression_ci_low_${tauKey}_${outcomeKey}_on_${regressorKey}`] = Math.round(estimate.ciLower * 1000) / 1000;
+      metrics[`quantile_regression_ci_high_${tauKey}_${outcomeKey}_on_${regressorKey}`] = Math.round(estimate.ciUpper * 1000) / 1000;
       metrics[`quantile_regression_pseudo_r1_${tauKey}_${outcomeKey}_on_${regressorKey}`] = Math.round(estimate.pseudoR1 * 1000) / 1000;
+      metrics[`quantile_regression_bootstrap_replicates_${tauKey}_${outcomeKey}_on_${regressorKey}`] = estimate.bootstrapReplicates;
     }
     metrics[`quantile_regression_sample_size_${outcomeKey}_on_${regressorKey}`] = quantileRegression.n;
+    metrics[`quantile_regression_control_count_${outcomeKey}_on_${regressorKey}`] = quantileRegression.controlCols.length;
+    metrics[`quantile_regression_controls_${outcomeKey}_on_${regressorKey}`] = quantileRegression.controlCols.join(", ") || "none";
+    metrics[`quantile_regression_vcov_${outcomeKey}_on_${regressorKey}`] = quantileRegression.vcovType;
+    metrics[`quantile_regression_cluster_count_${outcomeKey}_on_${regressorKey}`] = quantileRegression.clusterCount || 0;
+    metrics[`quantile_regression_missing_data_${outcomeKey}_on_${regressorKey}`] = quantileRegression.missingDataMode;
+    metrics[`quantile_regression_imputed_predictor_cells_${outcomeKey}_on_${regressorKey}`] = quantileRegression.imputedPredictorCells;
+    if (quantileRegression.omittedControlCols.length > 0) {
+      metrics[`quantile_regression_omitted_controls_${outcomeKey}_on_${regressorKey}`] = quantileRegression.omittedControlCols.join(", ");
+    }
   }
 
   // Group comparison (ANOVA-like between/within decomposition)

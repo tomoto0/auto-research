@@ -5,7 +5,7 @@
  * Supports dataset-driven experiments: uploads data files, generates analysis code, executes Python
  */
 import { invokeLLM } from "./_core/llm";
-import { PIPELINE_STAGES, RunConfig, PipelineEvent } from "../shared/pipeline";
+import { PIPELINE_STAGES, type AnalysisInputs, RunConfig, PipelineEvent } from "../shared/pipeline";
 import * as db from "./db";
 import { unifiedSearch, type LiteratureResult } from "./literature";
 import { storagePut, storageGet } from "./storage";
@@ -265,6 +265,43 @@ function buildDatasetCapabilityHints(datasets: DatasetInfo[]): string {
     const hasTextLike = cols.some(c => /(text|comment|abstract|title|description|review|note)/i.test(c));
     return `Dataset ${i + 1}: ${ds.originalName}\n- Rows: ${ds.rowCount ?? "unknown"}\n- Columns: ${cols.length || "unknown"}\n- Time-like columns detected: ${hasTimeLike ? "yes" : "no"}\n- Text-like columns detected: ${hasTextLike ? "yes" : "no"}\n- Column names: ${colText}`;
   }).join("\n\n");
+}
+
+function hasAnalysisInputs(inputs?: AnalysisInputs): boolean {
+  if (!inputs) return false;
+  return Boolean(
+    inputs.outcome ||
+    inputs.treatment ||
+    inputs.entity ||
+    inputs.time ||
+    inputs.subgroup ||
+    inputs.missingDataMode ||
+    inputs.missingDataStrategy ||
+    inputs.variableNotes ||
+    (inputs.controls && inputs.controls.length > 0)
+  );
+}
+
+function buildAnalysisInputContext(inputs?: AnalysisInputs): string {
+  if (!hasAnalysisInputs(inputs)) return "";
+  const lines = [
+    "User-specified research variable mapping (treat as higher-priority than heuristics when feasible):",
+    `- Outcome variable: ${inputs?.outcome || "not specified"}`,
+    `- Treatment variable: ${inputs?.treatment || "not specified"}`,
+    `- Entity / panel ID: ${inputs?.entity || "not specified"}`,
+    `- Time variable: ${inputs?.time || "not specified"}`,
+    `- Control variables: ${inputs?.controls?.join(", ") || "not specified"}`,
+    `- Subgroup variable: ${inputs?.subgroup || "not specified"}`,
+    `- Missing-data mode: ${inputs?.missingDataMode || "complete_case"}`,
+    `- Missing-data strategy: ${inputs?.missingDataStrategy || "not specified"}`,
+  ];
+  if (inputs?.variableNotes) {
+    lines.push(`- Variable notes: ${inputs.variableNotes}`);
+  }
+  lines.push(
+    "- If a specified column is absent from the uploaded data, explicitly say so and downgrade the relevant method instead of inventing a substitute.",
+  );
+  return `\n\n${lines.join("\n")}`;
 }
 
 function normaliseMethodId(raw: string): string {
@@ -1075,7 +1112,7 @@ function buildEconometricWritingGuidance(ctx: PipelineContext): string {
     lines.push("- `propensity_score` (future work only): if mentioned, frame it as unexecuted and note that overlap, balance, and sensitivity diagnostics are pending.");
   }
   if (futureOnly.has("quantile_regression")) {
-    lines.push("- `quantile_regression` (future work only): if mentioned, frame it as unexecuted and note that the deterministic runner does not yet estimate conditional quantiles.");
+    lines.push("- `quantile_regression` (future work only): if mentioned, frame it as unexecuted and note that conditional quantile estimation remains blocked by data support or design constraints.");
   }
 
   return `Econometric and causal writing guidance:\n${lines.join("\n")}`;
@@ -1220,7 +1257,8 @@ async function stage5_gapIdentification(ctx: PipelineContext): Promise<string> {
 
 async function stage6_hypothesisGeneration(ctx: PipelineContext): Promise<string> {
   const evidence = ensureEvidenceProfile(ctx);
-  const hypothesisConstraint = `\n\nDataset/literature feasibility profile:\n- Dataset count: ${evidence.datasetSummary.datasetCount}\n- Capabilities: time=${evidence.datasetSummary.hasTimeLike ? "yes" : "no"}, text=${evidence.datasetSummary.hasTextLike ? "yes" : "no"}, panel=${evidence.datasetSummary.hasPanelLike ? "yes" : "no"}, graph=${evidence.datasetSummary.hasGraphLike ? "yes" : "no"}, image=${evidence.datasetSummary.hasImageLike ? "yes" : "no"}, group=${evidence.datasetSummary.hasGroupLike ? "yes" : "no"}, treatment=${evidence.datasetSummary.hasTreatmentLike ? "yes" : "no"}, outcome=${evidence.datasetSummary.hasOutcomeLike ? "yes" : "no"}\n- Executable method hints: ${evidence.recommendedExecutableMethods.join(", ") || "none"}\n- Constrained method hints: ${evidence.constrainedMethods.join(", ") || "none"}\n\nMethodology applicability guide (derive hypotheses that can be empirically tested now):\n${buildMethodologyApplicabilityGuide(evidence)}`;
+  const analysisInputContext = buildAnalysisInputContext(ctx.config.analysisInputs);
+  const hypothesisConstraint = `\n\nDataset/literature feasibility profile:\n- Dataset count: ${evidence.datasetSummary.datasetCount}\n- Capabilities: time=${evidence.datasetSummary.hasTimeLike ? "yes" : "no"}, text=${evidence.datasetSummary.hasTextLike ? "yes" : "no"}, panel=${evidence.datasetSummary.hasPanelLike ? "yes" : "no"}, graph=${evidence.datasetSummary.hasGraphLike ? "yes" : "no"}, image=${evidence.datasetSummary.hasImageLike ? "yes" : "no"}, group=${evidence.datasetSummary.hasGroupLike ? "yes" : "no"}, treatment=${evidence.datasetSummary.hasTreatmentLike ? "yes" : "no"}, outcome=${evidence.datasetSummary.hasOutcomeLike ? "yes" : "no"}\n- Executable method hints: ${evidence.recommendedExecutableMethods.join(", ") || "none"}\n- Constrained method hints: ${evidence.constrainedMethods.join(", ") || "none"}${analysisInputContext}\n\nMethodology applicability guide (derive hypotheses that can be empirically tested now):\n${buildMethodologyApplicabilityGuide(evidence)}`;
   const result = await callLLM(
     "You are a research hypothesis generator. Create testable hypotheses from identified gaps.",
     `Research topic: "${ctx.topic}"${hypothesisConstraint}\n\nBased on identified research gaps, generate:\n1. Primary hypothesis (clear, testable, specific)\n2. Secondary hypotheses (2-3)\n3. Null hypotheses\n4. Expected outcomes\n5. Variables (independent, dependent, control)\n6. Theoretical framework\n7. Operationalisation table (construct -> dataset column(s) -> expected sign/direction)\n8. Falsification criteria and rejection conditions for each core hypothesis\n\nRules:\n- Keep hypotheses executable with available data modalities.\n- If a hypothesis needs unavailable modalities, explicitly mark it as future-work only.`
@@ -1236,6 +1274,7 @@ async function stage6_hypothesisGeneration(ctx: PipelineContext): Promise<string
 async function stage7_methodDesign(ctx: PipelineContext): Promise<string> {
   const evidence = ensureEvidenceProfile(ctx);
   const hasDatasets = ctx.datasetFiles.length > 0;
+  const analysisInputContext = buildAnalysisInputContext(ctx.config.analysisInputs);
   const datasetInfo = hasDatasets
     ? `\n\nAvailable datasets for analysis:\n${buildDatasetDescription(ctx.datasetFiles)}`
     : "";
@@ -1274,7 +1313,7 @@ RULES:
 
   const result = await callLLM(
     `You are a research methodology designer. You must design methods that are REALISTIC and EXECUTABLE with the available data. Do NOT propose methods that sound impressive but cannot actually be implemented with the given dataset.`,
-    `Research topic: "${ctx.topic}"\nHypothesis: ${ctx.hypothesis}${datasetInfo}${capabilityHints}${evidenceHints}${dataConstraint}\n\nDesign a complete experimental methodology:\n1. Research design (experimental/quasi-experimental/observational) — choose based on what the DATA actually supports\n2. Data description and variable operationalisation — map dataset columns to research variables\n3. Data preprocessing steps — handling missing values, encoding, normalisation\n4. Statistical analysis plan — specific tests/models matched to data type and research questions\n5. Evaluation approach — how will you assess the quality of the analysis?\n6. Baseline comparisons — what simple benchmarks will you compare against?\n7. Limitations — what CAN'T be answered with this data?\n8. Potential confounding variables and how to address them\n9. Hypothesis-to-test alignment matrix (hypothesis -> executable test -> decision rule -> expected falsification outcome)\n10. Methodology applicability matrix covering the major modern method families and readiness labels\n\nAt the end, add two sections:\n- "Executable Analyses" with concrete analyses runnable now.\n- "Blocked Analyses" with methods that require missing data/modalities and why.\n\nAlso add a final short section named "Empirical Readiness Classification" with one label:\n- empirical (if executable analyses can produce evidence-backed quantitative claims)\n- methodological_protocol (if evidence is mainly design/protocol and quantitative claims are not yet supported).`
+    `Research topic: "${ctx.topic}"\nHypothesis: ${ctx.hypothesis}${datasetInfo}${capabilityHints}${evidenceHints}${analysisInputContext}${dataConstraint}\n\nDesign a complete experimental methodology:\n1. Research design (experimental/quasi-experimental/observational) — choose based on what the DATA actually supports\n2. Data description and variable operationalisation — map dataset columns to research variables\n3. Data preprocessing steps — handling missing values, encoding, normalisation\n4. Statistical analysis plan — specific tests/models matched to data type and research questions\n5. Evaluation approach — how will you assess the quality of the analysis?\n6. Baseline comparisons — what simple benchmarks will you compare against?\n7. Limitations — what CAN'T be answered with this data?\n8. Potential confounding variables and how to address them\n9. Hypothesis-to-test alignment matrix (hypothesis -> executable test -> decision rule -> expected falsification outcome)\n10. Methodology applicability matrix covering the major modern method families and readiness labels\n\nAt the end, add two sections:\n- "Executable Analyses" with concrete analyses runnable now.\n- "Blocked Analyses" with methods that require missing data/modalities and why.\n\nAlso add a final short section named "Empirical Readiness Classification" with one label:\n- empirical (if executable analyses can produce evidence-backed quantitative claims)\n- methodological_protocol (if evidence is mainly design/protocol and quantitative claims are not yet supported).`
   );
   ctx.methodology = result;
   await persistStageAudit(ctx, 7, {
@@ -1286,6 +1325,7 @@ RULES:
 
 async function stage8_methodValidation(ctx: PipelineContext): Promise<string> {
   const evidence = ensureEvidenceProfile(ctx);
+  const analysisInputContext = buildAnalysisInputContext(ctx.config.analysisInputs);
   const datasetInfo = ctx.datasetFiles.length > 0
     ? `\n\nAvailable datasets:\n${buildDatasetDescription(ctx.datasetFiles)}`
     : "";
@@ -1296,7 +1336,7 @@ async function stage8_methodValidation(ctx: PipelineContext): Promise<string> {
 
   const result = await callLLM(
     `You are a methodology reviewer and data science expert. You must critically evaluate whether the proposed methodology is ACTUALLY FEASIBLE with the available data. Be harsh and honest. Your job is to REJECT over-ambitious methodologies and force them to match reality.`,
-    `Research topic: "${ctx.topic}"\nMethodology:\n${ctx.methodology}${datasetInfo}${capabilityHints}${evidenceHints}\n\nCritically validate:\n1. DATA-METHOD ALIGNMENT: Does the proposed method match the actual data? For example:\n   - If the data is a simple CSV with 10 columns, can you really train a graph neural network on it? NO.\n   - If the data has no temporal ordering, can you do time-series analysis? NO.\n   - If the data is aggregate statistics, can you do individual-level causal inference? NO.\n   Flag ANY method that cannot be executed with the available data.\n\n2. STATISTICAL VALIDITY: Are the proposed statistical tests appropriate for the data types?\n   - Correlation on categorical ID columns (prefecture codes, year codes) is MEANINGLESS.\n   - t-tests require proper group definitions, not arbitrary splits.\n   - Regression requires meaningful dependent and independent variables.\n   - Causal estimators require explicit estimands, identifying assumptions, and diagnostics.\n\n3. FEASIBILITY: Can this methodology actually be implemented in Python with standard libraries?\n\n4. HONESTY CHECK: Does the methodology over-promise? If so, recommend simpler, honest alternatives.\n\n5. Recommendations: What methodology SHOULD be used given the actual data?\n\n6. Overall feasibility score (1-10) — be strict. A methodology that proposes deep learning on a 4000-row CSV should score 2-3.\n\nCRITICAL VALIDATION RULE:\nIf the proposed methodology contains ANY method not in the recommended executable list (${evidence.recommendedExecutableMethods.join(", ")}) as a PRIMARY analysis method (not future work), your validation MUST:\n- Assign a feasibility score of 3 or below\n- Explicitly list each non-executable method and explain why it cannot be run\n- Provide a REWRITTEN methodology that uses ONLY executable methods\n- Move all non-executable methods to the "future_work_only" list in the contract\n\nADDITIONAL MANDATORY RULES:\n- If at least one dataset is available, descriptive_statistics MUST be included in executable_now.\n- The contract must include a method-family-level applicability judgement (executable_now / partially_ready / blocked) for modern methodologies (robust_ols, panel_fixed_effects, diff_in_diff, event_study, synthetic_control, causal_inference, iv_2sls, regression_discontinuity, propensity_score, quantile_regression, advanced_time_series, advanced_nlp, graph_modelling, vision_analysis), with concise blocked_reasons/evidence_notes.\n- When causal or econometric methods are mentioned, the review must explicitly state the estimand, key identifying assumptions, and required diagnostics or falsification tests.\n\nAfter the narrative review, output a machine-readable block using EXACTLY this format:\n[METHOD_CONTRACT_JSON]\n{\"executable_now\":[...],\"requires_missing_data\":[...],\"future_work_only\":[...],\"blocked_reasons\":{\"method\":\"reason\"},\"evidence_notes\":[...]}\n[/METHOD_CONTRACT_JSON]\n\nUse concise snake_case method ids (e.g., descriptive_statistics, correlation, linear_regression, robust_ols, group_comparison, time_trend, text_feature_analysis, panel_fixed_effects, diff_in_diff, event_study, synthetic_control, causal_inference, iv_2sls, regression_discontinuity, propensity_score, quantile_regression, graph_modelling, vision_analysis, panel_econometrics, advanced_time_series, advanced_nlp).\n\nIMPORTANT: The "executable_now" list MUST be a strict subset of: ${evidence.recommendedExecutableMethods.join(", ")}. Do NOT add methods to "executable_now" that are not in this list.`
+    `Research topic: "${ctx.topic}"\nMethodology:\n${ctx.methodology}${datasetInfo}${capabilityHints}${evidenceHints}${analysisInputContext}\n\nCritically validate:\n1. DATA-METHOD ALIGNMENT: Does the proposed method match the actual data? For example:\n   - If the data is a simple CSV with 10 columns, can you really train a graph neural network on it? NO.\n   - If the data has no temporal ordering, can you do time-series analysis? NO.\n   - If the data is aggregate statistics, can you do individual-level causal inference? NO.\n   Flag ANY method that cannot be executed with the available data.\n\n2. STATISTICAL VALIDITY: Are the proposed statistical tests appropriate for the data types?\n   - Correlation on categorical ID columns (prefecture codes, year codes) is MEANINGLESS.\n   - t-tests require proper group definitions, not arbitrary splits.\n   - Regression requires meaningful dependent and independent variables.\n   - Causal estimators require explicit estimands, identifying assumptions, and diagnostics.\n\n3. FEASIBILITY: Can this methodology actually be implemented in Python with standard libraries?\n\n4. HONESTY CHECK: Does the methodology over-promise? If so, recommend simpler, honest alternatives.\n\n5. Recommendations: What methodology SHOULD be used given the actual data?\n\n6. Overall feasibility score (1-10) — be strict. A methodology that proposes deep learning on a 4000-row CSV should score 2-3.\n\nCRITICAL VALIDATION RULE:\nIf the proposed methodology contains ANY method not in the recommended executable list (${evidence.recommendedExecutableMethods.join(", ")}) as a PRIMARY analysis method (not future work), your validation MUST:\n- Assign a feasibility score of 3 or below\n- Explicitly list each non-executable method and explain why it cannot be run\n- Provide a REWRITTEN methodology that uses ONLY executable methods\n- Move all non-executable methods to the "future_work_only" list in the contract\n\nADDITIONAL MANDATORY RULES:\n- If at least one dataset is available, descriptive_statistics MUST be included in executable_now.\n- The contract must include a method-family-level applicability judgement (executable_now / partially_ready / blocked) for modern methodologies (robust_ols, panel_fixed_effects, diff_in_diff, event_study, synthetic_control, causal_inference, iv_2sls, regression_discontinuity, propensity_score, quantile_regression, advanced_time_series, advanced_nlp, graph_modelling, vision_analysis), with concise blocked_reasons/evidence_notes.\n- When causal or econometric methods are mentioned, the review must explicitly state the estimand, key identifying assumptions, and required diagnostics or falsification tests.\n- If the user supplied a variable mapping, validate it explicitly and list any mismatches against detected dataset columns.\n\nAfter the narrative review, output a machine-readable block using EXACTLY this format:\n[METHOD_CONTRACT_JSON]\n{\"executable_now\":[...],\"requires_missing_data\":[...],\"future_work_only\":[...],\"blocked_reasons\":{\"method\":\"reason\"},\"evidence_notes\":[...]}\n[/METHOD_CONTRACT_JSON]\n\nUse concise snake_case method ids (e.g., descriptive_statistics, correlation, linear_regression, robust_ols, group_comparison, time_trend, text_feature_analysis, panel_fixed_effects, diff_in_diff, event_study, synthetic_control, causal_inference, iv_2sls, regression_discontinuity, propensity_score, quantile_regression, graph_modelling, vision_analysis, panel_econometrics, advanced_time_series, advanced_nlp).\n\nIMPORTANT: The "executable_now" list MUST be a strict subset of: ${evidence.recommendedExecutableMethods.join(", ")}. Do NOT add methods to "executable_now" that are not in this list.`
   );
   ctx.methodValidation = result;
   const contract = parseMethodContract(result, ctx.methodology, evidence);
@@ -1328,6 +1368,7 @@ async function stage9_codeGeneration(ctx: PipelineContext): Promise<string> {
         fileType: d.fileType,
       })),
       topic: ctx.topic,
+      analysisInputs: ctx.config.analysisInputs,
     };
     ctx.experimentCode = JSON.stringify(analysisPlan, null, 2);
     await persistStageAudit(ctx, 9, {

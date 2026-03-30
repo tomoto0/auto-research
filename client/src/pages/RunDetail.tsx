@@ -50,6 +50,31 @@ function formatFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function formatMetricValue(value: unknown): string {
+  if (typeof value === "number") {
+    return Number.isInteger(value) ? value.toLocaleString() : value.toFixed(4);
+  }
+  return String(value);
+}
+
+function formatMetricLabel(key: string): string {
+  const normalized = key
+    .replace(/^sample_waterfall_/, "")
+    .replace(/^panel_fe_/, "")
+    .replace(/^analysis_design_/, "")
+    .replace(/^analysis_inputs_/, "");
+  return normalized
+    .split("_")
+    .filter(Boolean)
+    .map(part => part.length <= 3 ? part.toUpperCase() : part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function hasAnyAnalysisInputs(value: any): boolean {
+  if (!value || typeof value !== "object") return false;
+  return Object.values(value).some(entry => Array.isArray(entry) ? entry.length > 0 : Boolean(entry));
+}
+
 export default function RunDetail({ runId }: { runId: string }) {
   const [, setLocation] = useLocation();
   const runQuery = trpc.pipeline.get.useQuery({ runId }, {
@@ -197,6 +222,8 @@ export default function RunDetail({ runId }: { runId: string }) {
 
   const datasets = (run as any).datasets || [];
   const experiments = (run as any).experiments || [];
+  const analysisInputs = (run as any).config?.analysisInputs;
+  const showAnalysisInputs = hasAnyAnalysisInputs(analysisInputs);
 
   const stageStatusIcon = (status: string) => {
     switch (status) {
@@ -256,6 +283,73 @@ export default function RunDetail({ runId }: { runId: string }) {
           </p>
         )}
       </div>
+
+      {showAnalysisInputs && (
+        <Card className="bg-card/40 border-border/30">
+          <CardHeader className="py-3 px-4">
+            <CardTitle className="text-sm flex items-center gap-2">
+              <Compass className="h-4 w-4 text-primary" />
+              Research Setup
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="px-4 pb-4 grid gap-2 md:grid-cols-2 lg:grid-cols-3">
+            {analysisInputs.outcome && (
+              <div className="rounded-md border border-border/20 bg-background/50 p-2.5">
+                <p className="text-[10px] text-muted-foreground">Outcome</p>
+                <p className="text-sm font-mono mt-0.5">{analysisInputs.outcome}</p>
+              </div>
+            )}
+            {analysisInputs.treatment && (
+              <div className="rounded-md border border-border/20 bg-background/50 p-2.5">
+                <p className="text-[10px] text-muted-foreground">Treatment</p>
+                <p className="text-sm font-mono mt-0.5">{analysisInputs.treatment}</p>
+              </div>
+            )}
+            {analysisInputs.entity && (
+              <div className="rounded-md border border-border/20 bg-background/50 p-2.5">
+                <p className="text-[10px] text-muted-foreground">Entity / Panel ID</p>
+                <p className="text-sm font-mono mt-0.5">{analysisInputs.entity}</p>
+              </div>
+            )}
+            {analysisInputs.time && (
+              <div className="rounded-md border border-border/20 bg-background/50 p-2.5">
+                <p className="text-[10px] text-muted-foreground">Time</p>
+                <p className="text-sm font-mono mt-0.5">{analysisInputs.time}</p>
+              </div>
+            )}
+            {Array.isArray(analysisInputs.controls) && analysisInputs.controls.length > 0 && (
+              <div className="rounded-md border border-border/20 bg-background/50 p-2.5">
+                <p className="text-[10px] text-muted-foreground">Controls</p>
+                <p className="text-sm mt-0.5">{analysisInputs.controls.join(", ")}</p>
+              </div>
+            )}
+            {analysisInputs.missingDataMode && (
+              <div className="rounded-md border border-border/20 bg-background/50 p-2.5">
+                <p className="text-[10px] text-muted-foreground">Missing-data option</p>
+                <p className="text-sm mt-0.5">{analysisInputs.missingDataMode}</p>
+              </div>
+            )}
+            {analysisInputs.subgroup && (
+              <div className="rounded-md border border-border/20 bg-background/50 p-2.5">
+                <p className="text-[10px] text-muted-foreground">Subgroup</p>
+                <p className="text-sm font-mono mt-0.5">{analysisInputs.subgroup}</p>
+              </div>
+            )}
+            {analysisInputs.missingDataStrategy && (
+              <div className="rounded-md border border-border/20 bg-background/50 p-2.5 md:col-span-2 lg:col-span-3">
+                <p className="text-[10px] text-muted-foreground">Missing-data plan</p>
+                <p className="text-sm mt-0.5 whitespace-pre-wrap">{analysisInputs.missingDataStrategy}</p>
+              </div>
+            )}
+            {analysisInputs.variableNotes && (
+              <div className="rounded-md border border-border/20 bg-background/50 p-2.5 md:col-span-2 lg:col-span-3">
+                <p className="text-[10px] text-muted-foreground">Variable notes</p>
+                <p className="text-sm mt-0.5 whitespace-pre-wrap">{analysisInputs.variableNotes}</p>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
 
       {/* ─── Approval Banner ─── */}
       {isAwaiting && awaitingStage && (
@@ -477,7 +571,29 @@ export default function RunDetail({ runId }: { runId: string }) {
         {/* ─── Experiment Results Tab ─── */}
         <TabsContent value="experiments">
           <div className="space-y-4">
-            {experiments.map((exp: any) => (
+            {experiments.map((exp: any) => {
+              const metricEntries = Object.entries(exp.metrics || {}) as [string, any][];
+              const isPanelFeMetric = (key: string) =>
+                key.startsWith("panel_fe_complete_case_") ||
+                key.startsWith("panel_fe_repeated_") ||
+                key.startsWith("panel_fe_informative_") ||
+                key.startsWith("panel_fe_min_") ||
+                key.startsWith("panel_fe_median_") ||
+                key.startsWith("panel_fe_max_") ||
+                key.startsWith("panel_fe_transformed_");
+              const designMetrics = metricEntries.filter(([key]) => key.startsWith("analysis_design_") || key.startsWith("analysis_inputs_"));
+              const sampleWaterfallMetrics = metricEntries.filter(([key]) => key.startsWith("sample_waterfall_"));
+              const panelFeMetrics = metricEntries.filter(([key]) => isPanelFeMetric(key));
+              const keyMetrics = metricEntries.filter(([key]) =>
+                !key.startsWith("analysis_design_") &&
+                !key.startsWith("analysis_inputs_") &&
+                !key.startsWith("sample_waterfall_") &&
+                !isPanelFeMetric(key)
+              );
+              const panelFeStatus = exp.metrics?.panel_fe_gate_status;
+              const panelFeReason = exp.metrics?.panel_fe_gate_reason;
+
+              return (
               <Card key={exp.id} className="bg-card/40 border-border/30">
                 <CardHeader className="py-3 px-4">
                   <div className="flex items-center justify-between">
@@ -500,19 +616,84 @@ export default function RunDetail({ runId }: { runId: string }) {
                   </div>
                 </CardHeader>
                 <CardContent className="px-4 pb-4 space-y-4">
+                  {designMetrics.length > 0 && (
+                    <div>
+                      <h4 className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-2 flex items-center gap-1.5">
+                        <Compass className="h-3 w-3" /> Resolved Design
+                      </h4>
+                      <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+                        {designMetrics.map(([key, value]) => (
+                          <div key={key} className="bg-background/50 rounded-md p-2.5 border border-border/20">
+                            <p className="text-[10px] text-muted-foreground">{formatMetricLabel(key)}</p>
+                            <p className="text-sm mt-0.5 break-words">{formatMetricValue(value)}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {sampleWaterfallMetrics.length > 0 && (
+                    <div>
+                      <h4 className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-2 flex items-center gap-1.5">
+                        <TrendingUp className="h-3 w-3" /> Sample Waterfall
+                      </h4>
+                      <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+                        {sampleWaterfallMetrics.map(([key, value]) => (
+                          <div key={key} className="bg-background/50 rounded-md p-2.5 border border-border/20">
+                            <p className="text-[10px] text-muted-foreground">{formatMetricLabel(key)}</p>
+                            <p className="text-sm font-mono font-bold mt-0.5">{formatMetricValue(value)}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {(panelFeStatus || panelFeMetrics.length > 0) && (
+                    <div className="rounded-lg border border-border/20 bg-background/40 p-3">
+                      <div className="flex items-center justify-between gap-2 mb-2">
+                        <h4 className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-1.5">
+                          <Activity className="h-3 w-3" /> Fixed Effects Gate
+                        </h4>
+                        {panelFeStatus && (
+                          <Badge
+                            variant="outline"
+                            className={`text-[10px] px-1.5 py-0 h-5 ${
+                              panelFeStatus === "passed"
+                                ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                                : "bg-amber-500/10 text-amber-400 border-amber-500/20"
+                            }`}
+                          >
+                            {panelFeStatus}
+                          </Badge>
+                        )}
+                      </div>
+                      {panelFeReason && (
+                        <p className="text-xs text-muted-foreground mb-3">{panelFeReason}</p>
+                      )}
+                      {panelFeMetrics.length > 0 && (
+                        <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+                          {panelFeMetrics.map(([key, value]) => (
+                            <div key={key} className="bg-background/50 rounded-md p-2.5 border border-border/20">
+                              <p className="text-[10px] text-muted-foreground">{formatMetricLabel(key)}</p>
+                              <p className="text-sm font-mono font-bold mt-0.5">{formatMetricValue(value)}</p>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   {/* Metrics */}
-                  {exp.metrics && Object.keys(exp.metrics).length > 0 && (
+                  {keyMetrics.length > 0 && (
                     <div>
                       <h4 className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-2 flex items-center gap-1.5">
                         <TrendingUp className="h-3 w-3" /> Key Metrics
                       </h4>
                       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2">
-                        {Object.entries(exp.metrics).map(([key, value]: [string, any]) => (
+                        {keyMetrics.map(([key, value]) => (
                           <div key={key} className="bg-background/50 rounded-md p-2.5 border border-border/20">
                             <p className="text-[10px] text-muted-foreground truncate">{key}</p>
-                            <p className="text-sm font-mono font-bold mt-0.5">
-                              {typeof value === "number" ? (Number.isInteger(value) ? value.toLocaleString() : value.toFixed(4)) : String(value)}
-                            </p>
+                            <p className="text-sm font-mono font-bold mt-0.5">{formatMetricValue(value)}</p>
                           </div>
                         ))}
                       </div>
@@ -619,7 +800,7 @@ export default function RunDetail({ runId }: { runId: string }) {
                   )}
                 </CardContent>
               </Card>
-            ))}
+            )})}
 
             {experiments.length === 0 && (
               <Card className="bg-card/40 border-border/30">

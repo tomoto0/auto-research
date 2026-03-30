@@ -7,6 +7,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
 import { Progress } from "@/components/ui/progress";
+import { Textarea } from "@/components/ui/textarea";
 import { chunkedUpload, type ChunkedUploadProgress } from "@/lib/chunked-upload";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
@@ -57,6 +58,15 @@ export default function Dashboard() {
   const [topic, setTopic] = useState("");
   const [autoApprove, setAutoApprove] = useState(true);
   const [targetConference, setTargetConference] = useState("General");
+  const [outcome, setOutcome] = useState("");
+  const [treatment, setTreatment] = useState("");
+  const [entity, setEntity] = useState("");
+  const [time, setTime] = useState("");
+  const [controls, setControls] = useState("");
+  const [subgroup, setSubgroup] = useState("");
+  const [missingDataMode, setMissingDataMode] = useState<"complete_case" | "mean_imputation">("complete_case");
+  const [missingDataStrategy, setMissingDataStrategy] = useState("");
+  const [variableNotes, setVariableNotes] = useState("");
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<ChunkedUploadProgress | null>(null);
@@ -81,11 +91,38 @@ export default function Dashboard() {
       toast.error("Please enter a research topic");
       return;
     }
+
+    const normalize = (value: string) => {
+      const trimmed = value.trim();
+      return trimmed ? trimmed : undefined;
+    };
+    const controlVariables = controls
+      .split(",")
+      .map(value => value.trim())
+      .filter(Boolean);
+    const analysisInputs = {
+      outcome: normalize(outcome),
+      treatment: normalize(treatment),
+      entity: normalize(entity),
+      time: normalize(time),
+      controls: controlVariables.length > 0 ? controlVariables : undefined,
+      subgroup: normalize(subgroup),
+      missingDataMode,
+      missingDataStrategy: normalize(missingDataStrategy),
+      variableNotes: normalize(variableNotes),
+    };
+    const hasAnalysisInputs = Object.values(analysisInputs).some(value =>
+      Array.isArray(value) ? value.length > 0 : Boolean(value)
+    );
+
     startMutation.mutate({
       topic: topic.trim(),
       autoApprove,
       datasetFileIds: uploadedFiles.map(f => f.id),
-      config: { targetConference },
+      config: {
+        targetConference,
+        analysisInputs: hasAnalysisInputs ? analysisInputs : undefined,
+      },
     });
   };
 
@@ -294,10 +331,90 @@ export default function Dashboard() {
               })}
               <p className="text-[10px] text-primary/60 flex items-center gap-1">
                 <Beaker className="h-3 w-3" />
-                Data will be analyzed with Python (pandas, matplotlib, seaborn) during the experiment stage
+                Data will be analyzed by the deterministic TypeScript runner during the experiment stage
               </p>
             </div>
           )}
+
+          <div className="space-y-2 rounded-lg border border-border/30 bg-background/40 p-3">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                Research Setup
+              </p>
+              <span className="text-[10px] text-muted-foreground/70">
+                Optional but recommended for causal/econometric runs
+              </span>
+            </div>
+
+            <div className="grid gap-2 md:grid-cols-2 lg:grid-cols-3">
+              <Input
+                placeholder="Outcome column"
+                value={outcome}
+                onChange={(e) => setOutcome(e.target.value)}
+                className="h-9 text-xs bg-background/60 border-border/50"
+              />
+              <Input
+                placeholder="Treatment column"
+                value={treatment}
+                onChange={(e) => setTreatment(e.target.value)}
+                className="h-9 text-xs bg-background/60 border-border/50"
+              />
+              <Input
+                placeholder="Control columns (comma separated)"
+                value={controls}
+                onChange={(e) => setControls(e.target.value)}
+                className="h-9 text-xs bg-background/60 border-border/50"
+              />
+              <Input
+                placeholder="Entity / panel ID"
+                value={entity}
+                onChange={(e) => setEntity(e.target.value)}
+                className="h-9 text-xs bg-background/60 border-border/50"
+              />
+              <Input
+                placeholder="Time column"
+                value={time}
+                onChange={(e) => setTime(e.target.value)}
+                className="h-9 text-xs bg-background/60 border-border/50"
+              />
+              <Input
+                placeholder="Subgroup column"
+                value={subgroup}
+                onChange={(e) => setSubgroup(e.target.value)}
+                className="h-9 text-xs bg-background/60 border-border/50"
+              />
+            </div>
+
+            <div className="grid gap-2 lg:grid-cols-2">
+              <div className="space-y-2">
+                <p className="text-[11px] text-muted-foreground">Missing-data option</p>
+                <Select value={missingDataMode} onValueChange={(value: "complete_case" | "mean_imputation") => setMissingDataMode(value)}>
+                  <SelectTrigger className="h-9 text-xs bg-background/60 border-border/50">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="complete_case" className="text-xs">Complete-case (Recommended)</SelectItem>
+                    <SelectItem value="mean_imputation" className="text-xs">Mean imputation for predictors</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            <div className="grid gap-2 lg:grid-cols-2">
+              <Textarea
+                placeholder="Missing-data notes or exclusion rule"
+                value={missingDataStrategy}
+                onChange={(e) => setMissingDataStrategy(e.target.value)}
+                className="min-h-[76px] text-xs bg-background/60 border-border/50"
+              />
+              <Textarea
+                placeholder="Variable definitions, estimand notes, or column mapping"
+                value={variableNotes}
+                onChange={(e) => setVariableNotes(e.target.value)}
+                className="min-h-[76px] text-xs bg-background/60 border-border/50"
+              />
+            </div>
+          </div>
 
           {/* Options Row */}
           <div className="flex flex-wrap items-center gap-4 text-xs text-muted-foreground">
