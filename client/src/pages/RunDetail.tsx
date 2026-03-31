@@ -136,7 +136,8 @@ export default function RunDetail({ runId }: { runId: string }) {
   });
 
   useEffect(() => {
-    const evtSource = new EventSource(`/api/pipeline/events/${runId}`);
+    let evtSource: EventSource | null = null;
+    let cancelled = false;
     // Debounce refetch to avoid rapid-fire re-fetches from SSE bursts
     let refetchTimer: ReturnType<typeof setTimeout> | null = null;
     const scheduleRefetch = () => {
@@ -146,29 +147,53 @@ export default function RunDetail({ runId }: { runId: string }) {
         runQuery.refetch();
       }, 1_000);
     };
-    evtSource.onmessage = (e) => {
+
+    const connectEventStream = async () => {
       try {
-        const event = JSON.parse(e.data) as PipelineEvent;
-        setEvents(prev => [...prev.slice(-200), event]);
-        // Only refetch on state-changing events (approval, completion, failure)
-        if (
-          event.type === "stage_awaiting_approval" ||
-          event.type === "stage_approved" ||
-          event.type === "stage_rejected" ||
-          event.type === "run_complete" ||
-          event.type === "run_fail"
-        ) {
+        const streamUrl = new URL(`/api/pipeline/events/${runId}`, window.location.origin);
+        const probeResponse = await fetch(streamUrl.toString(), {
+          method: "HEAD",
+          credentials: "include",
+        });
+        const contentType = probeResponse.headers.get("content-type") || "";
+        if (!probeResponse.ok || !contentType.includes("text/event-stream")) {
           scheduleRefetch();
+          return;
         }
-      } catch {}
+        if (cancelled) return;
+
+        evtSource = new EventSource(streamUrl.toString());
+        evtSource.onmessage = (e) => {
+          try {
+            const event = JSON.parse(e.data) as PipelineEvent;
+            setEvents(prev => [...prev.slice(-200), event]);
+            // Only refetch on state-changing events (approval, completion, failure)
+            if (
+              event.type === "stage_awaiting_approval" ||
+              event.type === "stage_approved" ||
+              event.type === "stage_rejected" ||
+              event.type === "run_complete" ||
+              event.type === "run_fail"
+            ) {
+              scheduleRefetch();
+            }
+          } catch {}
+        };
+        evtSource.onerror = () => {
+          // Keep the EventSource instance open: browsers auto-reconnect on transient failures.
+          // Closing here can permanently stop live updates during long-running stages.
+          scheduleRefetch();
+        };
+      } catch {
+        scheduleRefetch();
+      }
     };
-    evtSource.onerror = () => {
-      // Keep the EventSource instance open: browsers auto-reconnect on transient failures.
-      // Closing here can permanently stop live updates during long-running stages.
-      scheduleRefetch();
-    };
+
+    connectEventStream();
+
     return () => {
-      evtSource.close();
+      cancelled = true;
+      evtSource?.close();
       if (refetchTimer) clearTimeout(refetchTimer);
     };
   }, [runId]);

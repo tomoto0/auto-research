@@ -105,10 +105,30 @@ async function startServer() {
     }
   });
 
+  // Lightweight probe so the client can verify SSE support before opening EventSource.
+  app.head("/api/pipeline/events/:runId", (_req, res) => {
+    res.status(204).set({
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "Access-Control-Allow-Origin": "*",
+    }).end();
+  });
+
   // SSE endpoint for real-time pipeline events
   app.get("/api/pipeline/events/:runId", (req, res) => {
     const { runId } = req.params;
     const since = parseInt(req.query.since as string) || 0;
+
+    if (req.query.probe === "1") {
+      res.status(204).set({
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        "Access-Control-Allow-Origin": "*",
+      }).end();
+      return;
+    }
 
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
