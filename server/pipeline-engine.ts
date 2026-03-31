@@ -11,7 +11,7 @@ import { unifiedSearch, type LiteratureResult } from "./literature";
 import { storagePut, storageGet } from "./storage";
 import { nanoid } from "nanoid";
 import { generatePaperPdf, type ChartImage } from "./pdf-generator";
-import { executePythonExperiment, type DatasetInfo, type ExperimentOutput } from "./experiment-runner";
+import { executePythonExperiment, type DatasetInfo, type ExperimentOutput, type ExperimentProgressUpdate } from "./experiment-runner";
 
 export type EventEmitter = (event: PipelineEvent) => void;
 
@@ -1416,12 +1416,34 @@ async function stage11_experimentExecution(ctx: PipelineContext): Promise<string
       // Strip any remaining code block markers
       let codeBody = stripCodeBlockMarkers(ctx.experimentCode);
 
+      const emitExperimentProgress = (update: ExperimentProgressUpdate) => {
+        ctx.emit({
+          type: "log",
+          runId: ctx.runId,
+          stageNumber: 11,
+          message: update.message,
+          data: {
+            phase: update.phase,
+            heartbeat: update.heartbeat,
+            elapsedMs: update.elapsedMs,
+            chartCount: update.chartCount,
+            tableCount: update.tableCount,
+            metricCount: update.metricCount,
+          },
+          timestamp: Date.now(),
+        });
+      };
+
       const output = await executePythonExperiment(
         ctx.runId,
         11,
         codeBody,
         ctx.datasetFiles,
-        ctx.methodContract
+        ctx.methodContract,
+        {
+          heartbeatMs: 15_000,
+          onProgress: emitExperimentProgress,
+        },
       );
 
       ctx.experimentOutput = output;

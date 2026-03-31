@@ -19,7 +19,7 @@ import {
   estimateDatasetMultipartChunks,
   storageDownloadDatasetMultipartToFile,
 } from "./storage";
-import { insertExperimentResult, updateExperimentResult } from "./db";
+import { insertExperimentResult, updateExperimentResult, updateStageLog } from "./db";
 import { parse as csvParseStream } from "csv-parse";
 import * as XLSX from "xlsx";
 import { parseDtaFile } from "./dta-parser";
@@ -58,6 +58,22 @@ export interface ExperimentOutput {
   }[];
   tables: { name: string; url: string; data: string; description: string }[];
   metrics: Record<string, number | string>;
+}
+
+export interface ExperimentProgressUpdate {
+  phase: string;
+  message: string;
+  heartbeat: boolean;
+  elapsedMs: number;
+  chartCount: number;
+  tableCount: number;
+  metricCount: number;
+  stdout: string;
+}
+
+interface ExperimentExecutionOptions {
+  heartbeatMs?: number;
+  onProgress?: (update: ExperimentProgressUpdate) => void | Promise<void>;
 }
 
 interface DeterministicAnalysisPlan {
@@ -1594,7 +1610,8 @@ export async function executePythonExperiment(
   stageNumber: number,
   analysisCode: string,
   datasets: DatasetInfo[],
-  methodContract?: MethodFeasibilityContractInput | null
+  methodContract?: MethodFeasibilityContractInput | null,
+  options?: ExperimentExecutionOptions,
 ): Promise<ExperimentOutput> {
   const startTime = Date.now();
   const deterministicPlan = parseDeterministicAnalysisPlan(analysisCode);
@@ -1618,40 +1635,145 @@ export async function executePythonExperiment(
   const tables: ExperimentOutput["tables"] = [];
   const metrics: Record<string, number | string> = {};
   const executableMethods = buildExecutableMethodSet(methodContract);
+  const heartbeatMs = Math.max(5_000, options?.heartbeatMs ?? 15_000);
+  let currentPhase = "initialising";
+  let lastPersistedAt = 0;
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  let heartbeatInFlight = false;
+
+  const buildRunningStdout = (): string => {
+    const joined = logs.join("\n");
+    if (joined.length <= MAX_OUTPUT_LENGTH) return joined;
+    const trimmedChars = joined.length - MAX_OUTPUT_LENGTH;
+    return `...[truncated ${trimmedChars.toLocaleString()} chars]\n${joined.slice(-MAX_OUTPUT_LENGTH)}`;
+  };
+
+  const persistRunningState = async (force = false) => {
+    const now = Date.now();
+    if (!force && now - lastPersistedAt < 4_000) return;
+    lastPersistedAt = now;
+    const stdout = buildRunningStdout();
+    await Promise.all([
+      updateExperimentResult(dbResult.id, {
+        executionStatus: "running",
+        stdout,
+        executionTimeMs: now - startTime,
+      }),
+      updateStageLog(runId, stageNumber, {
+        output: stdout.substring(0, 60_000),
+        durationMs: now - startTime,
+      }),
+    ]);
+  };
+
+  const publishProgress = async (
+    message: string,
+    optionsOverride?: {
+      phase?: string;
+      heartbeat?: boolean;
+      persist?: boolean;
+      includeInLogs?: boolean;
+    },
+  ) => {
+    if (optionsOverride?.phase) currentPhase = optionsOverride.phase;
+    if (optionsOverride?.includeInLogs !== false) {
+      logs.push(message);
+    }
+    if (options?.onProgress) {
+      await options.onProgress({
+        phase: currentPhase,
+        message,
+        heartbeat: optionsOverride?.heartbeat ?? false,
+        elapsedMs: Date.now() - startTime,
+        chartCount: charts.length,
+        tableCount: tables.length,
+        metricCount: Object.keys(metrics).length,
+        stdout: buildRunningStdout(),
+      });
+    }
+    if (optionsOverride?.persist) {
+      await persistRunningState(true);
+    } else {
+      await persistRunningState(false);
+    }
+  };
+
+  const startHeartbeat = () => {
+    heartbeatTimer = setInterval(() => {
+      if (heartbeatInFlight) return;
+      heartbeatInFlight = true;
+      const elapsedSeconds = Math.round((Date.now() - startTime) / 1000);
+      const heartbeatMessage = `[HEARTBEAT] Stage 11 still running: ${currentPhase} (${elapsedSeconds}s elapsed, ${charts.length} charts, ${tables.length} tables, ${Object.keys(metrics).length} metrics)`;
+      void publishProgress(heartbeatMessage, {
+        heartbeat: true,
+        persist: true,
+      }).finally(() => {
+        heartbeatInFlight = false;
+      });
+    }, heartbeatMs);
+  };
+
+  const stopHeartbeat = () => {
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+  };
 
   try {
+    startHeartbeat();
     // 1. Download and parse all dataset files
-    logs.push("[INFO] Downloading and parsing datasets...");
+    await publishProgress("[INFO] Downloading and parsing datasets...", {
+      phase: "downloading_datasets",
+      persist: true,
+    });
     const allData: { name: string; data: Record<string, any>[]; columns: string[]; totalRows: number }[] = [];
 
     for (const ds of datasets) {
       const localPath = path.join(dataDir, ds.originalName);
+      await publishProgress(`[INFO] Downloading dataset: ${ds.originalName}`, {
+        phase: "downloading_datasets",
+        persist: true,
+      });
       await downloadFile(ds.fileUrl, localPath, ds.fileKey, ds.sizeBytes);
-      logs.push(`[INFO] Downloaded: ${ds.originalName}`);
+      await publishProgress(`[INFO] Downloaded: ${ds.originalName}`, {
+        phase: "parsing_datasets",
+        persist: true,
+      });
 
       try {
+        await publishProgress(`[INFO] Parsing dataset: ${ds.originalName}`, {
+          phase: "parsing_datasets",
+          persist: true,
+        });
         const parsed = await parseAndValidateDataFile(localPath, ds.fileType, ds.rowCount);
         // Remove the local file immediately after parsing to free disk space
         // and avoid keeping both on-disk and in-memory copies
         try { fs.unlinkSync(localPath); } catch {}
         try { global.gc?.(); } catch {}
         allData.push({ name: ds.originalName, ...parsed });
-        logs.push(`[INFO] Parsed ${ds.originalName}: ${parsed.totalRows} rows, ${parsed.columns.length} columns (encoding: ${parsed.encoding || "native"})`);
+        await publishProgress(`[INFO] Parsed ${ds.originalName}: ${parsed.totalRows} rows, ${parsed.columns.length} columns (encoding: ${parsed.encoding || "native"})`, {
+          phase: "parsing_datasets",
+          persist: true,
+        });
         // Log first 20 column names for debugging
         const colPreview = parsed.columns.slice(0, 20).join(", ");
-        logs.push(`[INFO] Columns: ${colPreview}${parsed.columns.length > 20 ? ` ... (${parsed.columns.length} total)` : ""}`);
+        await publishProgress(`[INFO] Columns: ${colPreview}${parsed.columns.length > 20 ? ` ... (${parsed.columns.length} total)` : ""}`);
         // Log sample data (first 3 rows, first 5 columns)
         if (parsed.data.length > 0) {
           const sampleCols = parsed.columns.slice(0, 5);
           const sampleRows = parsed.data.slice(0, 3).map(row =>
             sampleCols.map(c => String(row[c] ?? "null").slice(0, 30)).join(" | ")
           );
-          logs.push(`[INFO] Sample data (first 3 rows, first 5 cols):\n  ${sampleCols.join(" | ")}\n  ${sampleRows.join("\n  ")}`);
+          await publishProgress(`[INFO] Sample data (first 3 rows, first 5 cols):\n  ${sampleCols.join(" | ")}\n  ${sampleRows.join("\n  ")}`);
         }
         metrics[`${ds.originalName}_rows`] = parsed.totalRows;
         metrics[`${ds.originalName}_columns`] = parsed.columns.length;
       } catch (parseErr: any) {
-        logs.push(`[WARN] Failed to parse ${ds.originalName}: ${parseErr.message}`);
+        await publishProgress(`[WARN] Failed to parse ${ds.originalName}: ${parseErr.message}`, {
+          phase: "parsing_datasets",
+          persist: true,
+        });
         // Clean up local file on parse failure too
         try { fs.unlinkSync(localPath); } catch {}
       }
@@ -1662,7 +1784,10 @@ export async function executePythonExperiment(
     }
 
     // 1b. Pre-translate column names to English for chart/table/metric labels
-    logs.push("[INFO] Translating column names to English...");
+    await publishProgress("[INFO] Translating column names to English...", {
+      phase: "translating_columns",
+      persist: true,
+    });
     try {
       const allColNames: string[] = [];
       for (const ds of allData) {
@@ -1677,12 +1802,21 @@ export async function executePythonExperiment(
         for (const ds of allData) {
           applyColumnRenameMap(ds, buildAsciiColumnRenameMap(ds.columns, colTranslations));
         }
-        logs.push(`[INFO] Translated ${allColNames.length} column names to English`);
+        await publishProgress(`[INFO] Translated ${allColNames.length} column names to English`, {
+          phase: "translating_columns",
+          persist: true,
+        });
       } else {
-        logs.push("[INFO] All column names are already ASCII, no translation needed");
+        await publishProgress("[INFO] All column names are already ASCII, no translation needed", {
+          phase: "translating_columns",
+          persist: true,
+        });
       }
     } catch (translateErr: any) {
-      logs.push(`[WARN] Column name translation failed: ${translateErr.message}; applying deterministic ASCII fallback`);
+      await publishProgress(`[WARN] Column name translation failed: ${translateErr.message}; applying deterministic ASCII fallback`, {
+        phase: "translating_columns",
+        persist: true,
+      });
       for (const ds of allData) {
         applyColumnRenameMap(ds, buildAsciiColumnRenameMap(ds.columns));
       }
@@ -1691,21 +1825,56 @@ export async function executePythonExperiment(
     // 2. ALWAYS generate charts/tables/metrics from REAL DATA
     // LLM-generated analysis code is NOT trusted for data values (hallucination risk).
     // We always use generateDefaultCharts/Tables/Metrics which compute from actual data.
-    logs.push("[INFO] Generating analysis from actual data (bypassing LLM data values to prevent hallucination)...");
+    await publishProgress("[INFO] Generating analysis from actual data (bypassing LLM data values to prevent hallucination)...", {
+      phase: "building_analysis_outputs",
+      persist: true,
+    });
     if (analysisInputs && Object.keys(analysisInputs).length > 0) {
-      logs.push(`[INFO] Using user-specified analysis inputs: ${JSON.stringify(analysisInputs)}`);
+      await publishProgress(`[INFO] Using user-specified analysis inputs: ${JSON.stringify(analysisInputs)}`);
     }
-    const chartDefinitions = generateDefaultCharts(allData, executableMethods, analysisTopic, analysisInputs);
-    const tableDefinitions = generateDefaultTables(allData, executableMethods, analysisTopic, analysisInputs);
-    const metricsFromCode = generateDefaultMetrics(allData, executableMethods, analysisTopic, analysisInputs);
-    logs.push(`[INFO] Generated ${chartDefinitions.length} charts, ${tableDefinitions.length} tables, ${Object.keys(metricsFromCode).length} metrics from real data`);
+    await publishProgress("[INFO] Computing shared estimator bundle from real data...", {
+      phase: "building_analysis_bundle",
+      persist: true,
+    });
+    const analysisBundle = buildAnalysisComputationBundle(allData, analysisTopic, analysisInputs);
+    await publishProgress("[INFO] Shared estimator bundle ready.", {
+      phase: "building_analysis_bundle",
+      persist: true,
+    });
+    await publishProgress("[INFO] Computing chart definitions from real data...", {
+      phase: "computing_chart_definitions",
+      persist: true,
+    });
+    const chartDefinitions = generateDefaultCharts(allData, executableMethods, analysisTopic, analysisInputs, analysisBundle);
+    await publishProgress(`[INFO] Chart definitions ready: ${chartDefinitions.length}`, {
+      phase: "computing_chart_definitions",
+      persist: true,
+    });
+    await publishProgress("[INFO] Computing table definitions from real data...", {
+      phase: "computing_table_definitions",
+      persist: true,
+    });
+    const tableDefinitions = generateDefaultTables(allData, executableMethods, analysisTopic, analysisInputs, analysisBundle);
+    await publishProgress(`[INFO] Table definitions ready: ${tableDefinitions.length}`, {
+      phase: "computing_table_definitions",
+      persist: true,
+    });
+    await publishProgress("[INFO] Computing analytical metrics from real data...", {
+      phase: "computing_metrics",
+      persist: true,
+    });
+    const metricsFromCode = generateDefaultMetrics(allData, executableMethods, analysisTopic, analysisInputs, analysisBundle);
+    await publishProgress(`[INFO] Generated ${chartDefinitions.length} charts, ${tableDefinitions.length} tables, ${Object.keys(metricsFromCode).length} metrics from real data`, {
+      phase: "computing_metrics",
+      persist: true,
+    });
     if (executableMethods !== null) {
-      logs.push(`[INFO] Enforced method contract executable_now: ${Array.from(executableMethods).join(", ")}`);
+      await publishProgress(`[INFO] Enforced method contract executable_now: ${Array.from(executableMethods).join(", ")}`);
       if (methodContract?.requiresMissingData?.length) {
-        logs.push(`[INFO] Blocked by missing data: ${methodContract.requiresMissingData.join(", ")}`);
+        await publishProgress(`[INFO] Blocked by missing data: ${methodContract.requiresMissingData.join(", ")}`);
       }
       if (methodContract?.futureWorkOnly?.length) {
-        logs.push(`[INFO] Future-work only methods: ${methodContract.futureWorkOnly.join(", ")}`);
+        await publishProgress(`[INFO] Future-work only methods: ${methodContract.futureWorkOnly.join(", ")}`);
       }
     }
 
@@ -1724,14 +1893,17 @@ export async function executePythonExperiment(
     metrics.execution_no_output_reasons = routingDiagnostics.noOutputReasons.join(" | ");
     metrics.analysis_methods_executed = routingDiagnostics.executedMethods.join(", ");
     if (routingDiagnostics.unresolvedPrerequisites.length > 0) {
-      logs.push(`[INFO] Unresolved prerequisites: ${routingDiagnostics.unresolvedPrerequisites.join(" | ")}`);
+      await publishProgress(`[INFO] Unresolved prerequisites: ${routingDiagnostics.unresolvedPrerequisites.join(" | ")}`);
     }
     if (routingDiagnostics.skippedExecutableMethods.length > 0) {
-      logs.push(`[WARN] Executable methods with no outputs: ${routingDiagnostics.skippedExecutableMethods.join(", ")}`);
+      await publishProgress(`[WARN] Executable methods with no outputs: ${routingDiagnostics.skippedExecutableMethods.join(", ")}`);
     }
 
     // 2b. Translate table headers, row values, and metric keys that contain non-ASCII
-    logs.push("[INFO] Translating table/metric labels to English...");
+    await publishProgress("[INFO] Translating table/metric labels to English...", {
+      phase: "translating_labels",
+      persist: true,
+    });
     try {
       // Collect all non-ASCII strings from tables (headers + cell values) and metric keys
       const nonAsciiSet = new Set<string>();
@@ -1781,10 +1953,16 @@ export async function executePythonExperiment(
           if (/[^\x00-\x7F]/.test(cd.description)) cd.description = tr(cd.description);
         }
 
-        logs.push(`[INFO] Translated ${nonAsciiSet.size} non-ASCII labels in tables/metrics/charts`);
+        await publishProgress(`[INFO] Translated ${nonAsciiSet.size} non-ASCII labels in tables/metrics/charts`, {
+          phase: "translating_labels",
+          persist: true,
+        });
       }
     } catch (trErr: any) {
-      logs.push(`[WARN] Table/metric label translation failed: ${trErr.message}; applying deterministic ASCII fallback`);
+      await publishProgress(`[WARN] Table/metric label translation failed: ${trErr.message}; applying deterministic ASCII fallback`, {
+        phase: "translating_labels",
+        persist: true,
+      });
       const tr = (s: string) => ensureAsciiLabelSync(s);
       for (const t of tableDefinitions) {
         t.headers = t.headers.map(h => typeof h === "string" ? tr(h) : String(h));
@@ -1804,9 +1982,17 @@ export async function executePythonExperiment(
 
     // 3. Render each chart via chartjs-node-canvas
     // Pre-translate all chart labels to English using LLM before rendering
-    logs.push(`[INFO] Translating chart labels to English...`);
-    for (const chartDef of chartDefinitions) {
+    await publishProgress(`[INFO] Translating chart labels to English...`, {
+      phase: "translating_chart_labels",
+      persist: true,
+    });
+    for (let chartIndex = 0; chartIndex < chartDefinitions.length; chartIndex++) {
+      const chartDef = chartDefinitions[chartIndex];
       try {
+        await publishProgress(`[INFO] Preparing chart labels ${chartIndex + 1}/${chartDefinitions.length}: ${chartDef.name}`, {
+          phase: "translating_chart_labels",
+          persist: true,
+        });
         let config: any;
         if (typeof chartDef.config === "string") {
           try { config = JSON.parse(chartDef.config); } catch { config = null; }
@@ -1818,16 +2004,26 @@ export async function executePythonExperiment(
           chartDef.config = translated;
         }
       } catch (err: any) {
-        logs.push(`[WARN] LLM translation failed for ${chartDef.name}: ${err.message}; applying deterministic ASCII fallback`);
+        await publishProgress(`[WARN] LLM translation failed for ${chartDef.name}: ${err.message}; applying deterministic ASCII fallback`, {
+          phase: "translating_chart_labels",
+        });
         if (chartDef.config) {
           chartDef.config = transliterateChartConfigSync(chartDef.config);
         }
       }
     }
 
-    logs.push(`[INFO] Rendering ${chartDefinitions.length} charts (server-side, no Chromium)...`);
-    for (const chartDef of chartDefinitions) {
+    await publishProgress(`[INFO] Rendering ${chartDefinitions.length} charts (server-side, no Chromium)...`, {
+      phase: "rendering_charts",
+      persist: true,
+    });
+    for (let chartIndex = 0; chartIndex < chartDefinitions.length; chartIndex++) {
+      const chartDef = chartDefinitions[chartIndex];
       try {
+        await publishProgress(`[INFO] Rendering chart ${chartIndex + 1}/${chartDefinitions.length}: ${chartDef.name}`, {
+          phase: "rendering_charts",
+          persist: true,
+        });
         const configStr = typeof chartDef.config === "string"
           ? chartDef.config
           : JSON.stringify(chartDef.config);
@@ -1854,18 +2050,31 @@ export async function executePythonExperiment(
           mimeType: contentType,
           format,
         });
-        logs.push(`[CHART] Generated: ${chartDef.name} (${(pngBuffer.length / 1024).toFixed(1)} KiB, ${ext})`);
+        await publishProgress(`[CHART] Generated: ${chartDef.name} (${(pngBuffer.length / 1024).toFixed(1)} KiB, ${ext})`, {
+          phase: "rendering_charts",
+          persist: true,
+        });
       } catch (chartErr: any) {
-        logs.push(`[WARN] Failed to render chart ${chartDef.name}: ${chartErr.message}`);
+        await publishProgress(`[WARN] Failed to render chart ${chartDef.name}: ${chartErr.message}`, {
+          phase: "rendering_charts",
+        });
       }
     }
 
     // 4. Process tables
-    logs.push(`[INFO] Processing ${tableDefinitions.length} tables...`);
-    for (const tableDef of tableDefinitions) {
+    await publishProgress(`[INFO] Processing ${tableDefinitions.length} tables...`, {
+      phase: "processing_tables",
+      persist: true,
+    });
+    for (let tableIndex = 0; tableIndex < tableDefinitions.length; tableIndex++) {
+      const tableDef = tableDefinitions[tableIndex];
       try {
+        await publishProgress(`[INFO] Processing table ${tableIndex + 1}/${tableDefinitions.length}: ${tableDef.name}`, {
+          phase: "processing_tables",
+          persist: true,
+        });
         const headerRow = tableDef.headers.join(",");
-        const dataRows = tableDef.rows.map(r => r.join(",")).join("\n");
+        const dataRows = tableDef.rows.map((r: (string | number)[]) => r.join(",")).join("\n");
         const csvContent = `${headerRow}\n${dataRows}`;
 
         const tableKey = `experiments/${runId}/${tableDef.name}.csv`;
@@ -1876,9 +2085,14 @@ export async function executePythonExperiment(
           description: tableDef.description || tableDef.name,
           data: `${headerRow}\n${dataRows.split("\n").slice(0, 20).join("\n")}`,
         });
-        logs.push(`[TABLE] Generated: ${tableDef.name} (${tableDef.rows.length} rows)`);
+        await publishProgress(`[TABLE] Generated: ${tableDef.name} (${tableDef.rows.length} rows)`, {
+          phase: "processing_tables",
+          persist: true,
+        });
       } catch (tableErr: any) {
-        logs.push(`[WARN] Failed to process table ${tableDef.name}: ${tableErr.message}`);
+        await publishProgress(`[WARN] Failed to process table ${tableDef.name}: ${tableErr.message}`, {
+          phase: "processing_tables",
+        });
       }
     }
 
@@ -1896,6 +2110,7 @@ export async function executePythonExperiment(
       metrics,
     };
 
+    stopHeartbeat();
     await updateExperimentResult(dbResult.id, {
       executionStatus: "success",
       stdout: output.stdout,
@@ -1911,6 +2126,7 @@ export async function executePythonExperiment(
     return output;
 
   } catch (err: any) {
+    stopHeartbeat();
     const executionTimeMs = Date.now() - startTime;
     const stderr = err?.message || "Execution failed";
     logs.push(`[ERROR] ${stderr}`);
@@ -4614,6 +4830,31 @@ interface MethodApplicabilityAssessment {
   notes: string;
 }
 
+interface AnalysisComputationBundle {
+  ds: ParsedDataset;
+  rawNumericCols: string[];
+  categoricalCols: string[];
+  idCols: string[];
+  baseMeaningfulNumericCols: string[];
+  meaningfulNumericCols: string[];
+  designHints: EconometricDesignHints;
+  missingDataMode: MissingDataMode;
+  primaryDescriptiveCol?: string;
+  secondaryDescriptiveCol?: string;
+  methodAssessments: MethodApplicabilityAssessment[];
+  panelFeAssessment: PanelFixedEffectsAssessment;
+  preparedRegression: PreparedRegressionData | null;
+  robustOls: RobustOlsResult | null;
+  panelFixedEffects: PanelFixedEffectsResult | null;
+  diffInDiff: DiffInDiffResult | null;
+  syntheticControl: SyntheticControlResult | null;
+  syntheticControlPlacebos: SyntheticControlPlaceboResult | null;
+  iv2Sls: Iv2SlsResult | null;
+  rdd: RddResult | null;
+  propensityScore: PropensityScoreResult | null;
+  quantileRegression: QuantileRegressionResult | null;
+}
+
 function formatMethodApplicabilityStatus(status: MethodApplicabilityStatus): string {
   if (status === "executable_now") return "Executable now";
   if (status === "partially_ready") return "Partially ready";
@@ -4622,6 +4863,71 @@ function formatMethodApplicabilityStatus(status: MethodApplicabilityStatus): str
 
 function clampReadinessScore(score: number): number {
   return Math.max(0, Math.min(100, Math.round(score)));
+}
+
+function buildAnalysisComputationBundle(
+  allData: ParsedDataset[],
+  analysisTopic = "",
+  analysisInputs?: AnalysisInputs,
+): AnalysisComputationBundle | null {
+  const ds = getPrimaryDataset(allData);
+  if (!ds) return null;
+
+  const { numericCols: rawNumericCols, categoricalCols, idCols } = classifyColumns(ds.data, ds.columns);
+  const baseMeaningfulNumericCols = rawNumericCols.filter(col => !idCols.includes(col));
+  const designHints = inferEconometricDesignHints(ds, baseMeaningfulNumericCols, categoricalCols, idCols, analysisTopic, analysisInputs);
+  const missingDataMode = resolveMissingDataMode(analysisInputs);
+  const meaningfulNumericCols = rankMeaningfulNumericColumns(ds, baseMeaningfulNumericCols, designHints, analysisTopic);
+  const primaryDescriptiveCol = choosePreferredDescriptiveNumericColumn(ds, meaningfulNumericCols, designHints);
+  const secondaryDescriptiveCol = chooseSecondaryDescriptiveNumericColumn(ds, meaningfulNumericCols, designHints, primaryDescriptiveCol);
+  const methodAssessments = buildMethodApplicabilityAssessment(ds, meaningfulNumericCols, categoricalCols);
+  const panelFeAssessment = assessPanelFixedEffects(ds, designHints, missingDataMode);
+  const preparedRegression = prepareRegressionData(ds, designHints, missingDataMode);
+  const robustOls = computeRobustOls(ds, designHints, missingDataMode);
+  const panelFixedEffects = computePanelFixedEffects(ds, designHints, missingDataMode);
+  const diffInDiff = computeDiffInDiff(ds, designHints);
+  const syntheticControl = computeSyntheticControl(ds, designHints);
+  const syntheticControlPlacebos = syntheticControl
+    ? computeSyntheticControlPlacebos(ds, designHints, syntheticControl)
+    : null;
+  const iv2Sls = computeIv2Sls(ds, designHints);
+  const rdd = computeRegressionDiscontinuity(ds, designHints);
+  const propensityScore = computePropensityScore(ds, designHints);
+  const quantileRegression = computeQuantileRegression(ds, designHints, missingDataMode);
+
+  return {
+    ds,
+    rawNumericCols,
+    categoricalCols,
+    idCols,
+    baseMeaningfulNumericCols,
+    meaningfulNumericCols,
+    designHints,
+    missingDataMode,
+    primaryDescriptiveCol,
+    secondaryDescriptiveCol,
+    methodAssessments,
+    panelFeAssessment,
+    preparedRegression,
+    robustOls,
+    panelFixedEffects,
+    diffInDiff,
+    syntheticControl,
+    syntheticControlPlacebos,
+    iv2Sls,
+    rdd,
+    propensityScore,
+    quantileRegression,
+  };
+}
+
+function resolveAnalysisComputationBundle(
+  allData: ParsedDataset[],
+  analysisTopic = "",
+  analysisInputs?: AnalysisInputs,
+  analysisBundle?: AnalysisComputationBundle | null,
+): AnalysisComputationBundle | null {
+  return analysisBundle ?? buildAnalysisComputationBundle(allData, analysisTopic, analysisInputs);
 }
 
 export function buildMethodApplicabilityAssessment(
@@ -4944,27 +5250,28 @@ export function generateDefaultCharts(
   executableMethods: Set<string> | null,
   analysisTopic = "",
   analysisInputs?: AnalysisInputs,
+  analysisBundle?: AnalysisComputationBundle | null,
 ): { name: string; description: string; config: any }[] {
   const charts: { name: string; description: string; config: any }[] = [];
-  const ds = getPrimaryDataset(allData);
+  const bundle = resolveAnalysisComputationBundle(allData, analysisTopic, analysisInputs, analysisBundle);
+  const ds = bundle?.ds || getPrimaryDataset(allData);
   if (!ds || ds.data.length === 0) return charts;
 
-  const { numericCols: rawNumericCols, categoricalCols, idCols } = classifyColumns(ds.data, ds.columns);
-  const baseNumericCols = rawNumericCols.filter(c => !idCols.includes(c));
-  const designHints = inferEconometricDesignHints(ds, baseNumericCols, categoricalCols, idCols, analysisTopic, analysisInputs);
-  const missingDataMode = resolveMissingDataMode(analysisInputs);
-  const numericCols = rankMeaningfulNumericColumns(ds, baseNumericCols, designHints, analysisTopic);
-  const primaryDescriptiveCol = choosePreferredDescriptiveNumericColumn(ds, numericCols, designHints);
-  const secondaryDescriptiveCol = chooseSecondaryDescriptiveNumericColumn(ds, numericCols, designHints, primaryDescriptiveCol);
-  const robustOls = computeRobustOls(ds, designHints, missingDataMode);
-  const panelFixedEffects = computePanelFixedEffects(ds, designHints, missingDataMode);
-  const diffInDiff = computeDiffInDiff(ds, designHints);
-  const syntheticControl = computeSyntheticControl(ds, designHints);
-  const syntheticControlPlacebos = syntheticControl ? computeSyntheticControlPlacebos(ds, designHints, syntheticControl) : null;
-  const iv2Sls = computeIv2Sls(ds, designHints);
-  const rdd = computeRegressionDiscontinuity(ds, designHints);
-  const propensityScore = computePropensityScore(ds, designHints);
-  const quantileRegression = computeQuantileRegression(ds, designHints, missingDataMode);
+  const numericCols = bundle?.meaningfulNumericCols || [];
+  const categoricalCols = bundle?.categoricalCols || [];
+  const designHints = bundle?.designHints;
+  const primaryDescriptiveCol = bundle?.primaryDescriptiveCol;
+  const secondaryDescriptiveCol = bundle?.secondaryDescriptiveCol;
+  const robustOls = bundle?.robustOls || null;
+  const panelFixedEffects = bundle?.panelFixedEffects || null;
+  const diffInDiff = bundle?.diffInDiff || null;
+  const syntheticControl = bundle?.syntheticControl || null;
+  const syntheticControlPlacebos = bundle?.syntheticControlPlacebos || null;
+  const iv2Sls = bundle?.iv2Sls || null;
+  const rdd = bundle?.rdd || null;
+  const propensityScore = bundle?.propensityScore || null;
+  const quantileRegression = bundle?.quantileRegression || null;
+  if (!designHints) return charts;
 
   // Chart 1: Distribution of first numeric column (histogram-like bar chart)
   if (primaryDescriptiveCol && methodAllowed(executableMethods, "descriptive_statistics")) {
@@ -6329,26 +6636,25 @@ function generateDefaultTables(
   executableMethods: Set<string> | null,
   analysisTopic = "",
   analysisInputs?: AnalysisInputs,
+  analysisBundle?: AnalysisComputationBundle | null,
 ): { name: string; description: string; headers: string[]; rows: (string | number)[][] }[] {
   const tables: { name: string; description: string; headers: string[]; rows: (string | number)[][] }[] = [];
-  const ds = getPrimaryDataset(allData);
+  const bundle = resolveAnalysisComputationBundle(allData, analysisTopic, analysisInputs, analysisBundle);
+  const ds = bundle?.ds || getPrimaryDataset(allData);
   if (!ds || ds.data.length === 0) return tables;
 
-  const { numericCols: rawNumericCols, categoricalCols, idCols: _idCols2 } = classifyColumns(ds.data, ds.columns);
-  const baseNumericCols = rawNumericCols.filter(c => !_idCols2.includes(c));
-  const designHints = inferEconometricDesignHints(ds, baseNumericCols, categoricalCols, _idCols2, analysisTopic, analysisInputs);
-  const missingDataMode = resolveMissingDataMode(analysisInputs);
-  const numericCols = rankMeaningfulNumericColumns(ds, baseNumericCols, designHints, analysisTopic);
-  const primaryDescriptiveCol = choosePreferredDescriptiveNumericColumn(ds, numericCols, designHints);
-  const methodAssessments = buildMethodApplicabilityAssessment(ds, numericCols, categoricalCols);
-  const robustOls = computeRobustOls(ds, designHints, missingDataMode);
-  const panelFixedEffects = computePanelFixedEffects(ds, designHints, missingDataMode);
-  const diffInDiff = computeDiffInDiff(ds, designHints);
-  const syntheticControl = computeSyntheticControl(ds, designHints);
-  const iv2Sls = computeIv2Sls(ds, designHints);
-  const rdd = computeRegressionDiscontinuity(ds, designHints);
-  const propensityScore = computePropensityScore(ds, designHints);
-  const quantileRegression = computeQuantileRegression(ds, designHints, missingDataMode);
+  const numericCols = bundle?.meaningfulNumericCols || [];
+  const categoricalCols = bundle?.categoricalCols || [];
+  const primaryDescriptiveCol = bundle?.primaryDescriptiveCol;
+  const methodAssessments = bundle?.methodAssessments || [];
+  const robustOls = bundle?.robustOls || null;
+  const panelFixedEffects = bundle?.panelFixedEffects || null;
+  const diffInDiff = bundle?.diffInDiff || null;
+  const syntheticControl = bundle?.syntheticControl || null;
+  const iv2Sls = bundle?.iv2Sls || null;
+  const rdd = bundle?.rdd || null;
+  const propensityScore = bundle?.propensityScore || null;
+  const quantileRegression = bundle?.quantileRegression || null;
 
   // Table 1: Descriptive statistics of numeric variables
   if (numericCols.length > 0 && methodAllowed(executableMethods, "descriptive_statistics")) {
@@ -6836,18 +7142,21 @@ export function generateDefaultMetrics(
   executableMethods: Set<string> | null,
   analysisTopic = "",
   analysisInputs?: AnalysisInputs,
+  analysisBundle?: AnalysisComputationBundle | null,
 ): Record<string, number | string> {
   const metrics: Record<string, number | string> = {};
-  const ds = getPrimaryDataset(allData);
+  const bundle = resolveAnalysisComputationBundle(allData, analysisTopic, analysisInputs, analysisBundle);
+  const ds = bundle?.ds || getPrimaryDataset(allData);
   if (!ds) return metrics;
+  if (!bundle) return metrics;
 
   metrics.total_observations = ds.totalRows;
   metrics.total_variables = ds.columns.length;
   metrics.datasets_loaded = allData.length;
   metrics.primary_dataset = ds.name;
 
-  const { numericCols, categoricalCols, idCols } = classifyColumns(ds.data, ds.columns);
-  metrics.numeric_variables = numericCols.length;
+  const { rawNumericCols, categoricalCols, idCols } = bundle;
+  metrics.numeric_variables = rawNumericCols.length;
   metrics.categorical_variables = categoricalCols.length;
   if (idCols.length > 0) {
     metrics.id_code_variables_excluded = idCols.length;
@@ -6869,23 +7178,21 @@ export function generateDefaultMetrics(
   metrics.sample_waterfall_rows_loaded = ds.data.length;
   metrics.sample_waterfall_rows_not_loaded = Math.max(0, ds.totalRows - ds.data.length);
 
-  // Descriptive stats for meaningful numeric columns only (exclude ID/code columns)
-  const baseMeaningfulNumericCols = numericCols.filter(c => !idCols.includes(c));
-  const designHints = inferEconometricDesignHints(ds, baseMeaningfulNumericCols, categoricalCols, idCols, analysisTopic, analysisInputs);
-  const missingDataMode = resolveMissingDataMode(analysisInputs);
-  const meaningfulNumericCols = rankMeaningfulNumericColumns(ds, baseMeaningfulNumericCols, designHints, analysisTopic);
-  const methodAssessments = buildMethodApplicabilityAssessment(ds, meaningfulNumericCols, categoricalCols);
-  const panelFeAssessment = assessPanelFixedEffects(ds, designHints, missingDataMode);
-  const preparedRegression = prepareRegressionData(ds, designHints, missingDataMode);
-  const robustOls = computeRobustOls(ds, designHints, missingDataMode);
-  const panelFixedEffects = computePanelFixedEffects(ds, designHints, missingDataMode);
-  const diffInDiff = computeDiffInDiff(ds, designHints);
-  const syntheticControl = computeSyntheticControl(ds, designHints);
-  const syntheticControlPlacebos = syntheticControl ? computeSyntheticControlPlacebos(ds, designHints, syntheticControl) : null;
-  const iv2Sls = computeIv2Sls(ds, designHints);
-  const rdd = computeRegressionDiscontinuity(ds, designHints);
-  const propensityScore = computePropensityScore(ds, designHints);
-  const quantileRegression = computeQuantileRegression(ds, designHints, missingDataMode);
+  const meaningfulNumericCols = bundle.meaningfulNumericCols;
+  const designHints = bundle.designHints;
+  const missingDataMode = bundle.missingDataMode;
+  const methodAssessments = bundle.methodAssessments;
+  const panelFeAssessment = bundle.panelFeAssessment;
+  const preparedRegression = bundle.preparedRegression;
+  const robustOls = bundle.robustOls;
+  const panelFixedEffects = bundle.panelFixedEffects;
+  const diffInDiff = bundle.diffInDiff;
+  const syntheticControl = bundle.syntheticControl;
+  const syntheticControlPlacebos = bundle.syntheticControlPlacebos;
+  const iv2Sls = bundle.iv2Sls;
+  const rdd = bundle.rdd;
+  const propensityScore = bundle.propensityScore;
+  const quantileRegression = bundle.quantileRegression;
   const executableNowCount = methodAssessments.filter(item => item.status === "executable_now").length;
   const partiallyReadyCount = methodAssessments.filter(item => item.status === "partially_ready").length;
   const blockedCount = methodAssessments.filter(item => item.status === "blocked").length;
