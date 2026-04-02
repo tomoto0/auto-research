@@ -62,9 +62,9 @@ The application follows a modern full-stack architecture with a React frontend c
 
 The architecture consists of five primary layers:
 
-**Frontend Layer** — A React 19 single-page application styled with Tailwind CSS 4 and shadcn/ui components. The frontend communicates exclusively through tRPC hooks, ensuring end-to-end type safety. Real-time pipeline updates are delivered via Server-Sent Events (SSE), and file uploads use a direct binary POST endpoint.
+**Frontend Layer** — A React 19 single-page application styled with Tailwind CSS 4 and shadcn/ui components. The frontend communicates through type-safe tRPC clients (React hooks + vanilla client). Real-time pipeline updates are delivered via Server-Sent Events (SSE), and dataset uploads use a chunked tRPC flow.
 
-**API Layer** — An Express 4 server exposing tRPC procedures for all application logic. Manus OAuth handles authentication, and the tRPC context injects the authenticated user into every protected procedure. Additional REST endpoints handle file uploads and artifact downloads.
+**API Layer** — An Express 4 server exposing tRPC procedures for all application logic. Manus OAuth handles authentication, and the tRPC context injects the authenticated user into every protected procedure. Additional REST endpoints provide SSE streaming and artifact download routes.
 
 **Pipeline Engine** — A 23-stage state machine that manages the research workflow. Each stage receives context from previous stages, invokes the LLM for content generation, and persists results to the database. The engine supports auto-approve and manual-approval modes, error recovery with configurable retries, and graceful shutdown.
 
@@ -105,9 +105,9 @@ Each stage produces structured output that feeds into subsequent stages, creatin
 | **Authentication** | Manus OAuth |
 | **LLM Integration** | Manus Forge API |
 | **Experiment Execution** | Node.js/TypeScript deterministic analysis engine, Chart.js, csv-parse, XLSX |
-| **PDF Generation** | Puppeteer (headless Chromium) |
+| **PDF Generation** | PDFKit |
 | **Real-Time Updates** | Server-Sent Events (SSE) |
-| **Build Tool** | Vite 6, esbuild |
+| **Build Tool** | Vite 7, esbuild |
 | **Testing** | Vitest |
 | **Package Manager** | pnpm |
 
@@ -117,7 +117,7 @@ Each stage produces structured output that feeds into subsequent stages, creatin
 
 Auto Research supports uploading structured data files for automated analysis within the research pipeline. When datasets are attached to a pipeline run, the system performs the following workflow:
 
-1. **Upload & Parse** — Files are uploaded via a binary POST endpoint. The server automatically detects the file format and extracts metadata including column names, row counts, and data types. Supported formats include CSV, Excel (.xlsx/.xls), Stata (.dta), JSON, and TSV.
+1. **Upload & Parse** — Files are split into 8MB chunks and uploaded through tRPC mutations (`datasets.uploadChunk`, `datasets.assembleChunks`, `datasets.registerFile`). The server then detects file format and extracts metadata including column names, row counts, and data types. Supported formats include CSV, Excel (.xlsx/.xls), Stata (.dta), JSON, and TSV.
 
 2. **Schema Extraction** — During the experiment code generation stage (Stage 9), the pipeline retrieves all attached dataset files and constructs a detailed schema description including column names, data types, sample values, and basic statistics.
 
@@ -172,17 +172,17 @@ The application requires Node.js 22+ and pnpm. Python is no longer required for 
 
 ```bash
 # Clone the repository
-git clone https://github.com/tomoto0/School-Quality-and-Future-Earnings.git
-cd auto-research-claw
+git clone https://github.com/tomoto0/auto-research.git
+cd auto-research
 
 # Install dependencies
 pnpm install
 
 # Run database migrations
-pnpm db:push
+pnpm run db:push
 
 # Start development server
-pnpm dev
+pnpm run dev
 ```
 
 ### Running Tests
@@ -198,14 +198,15 @@ The test suite covers authentication, pipeline operations, literature search int
 ## Project Structure
 
 ```
-auto-research-claw/
+auto-research/
 ├── client/                    # Frontend application
 │   ├── src/
 │   │   ├── pages/             # Page components (Home, Dashboard, RunDetail, etc.)
 │   │   ├── components/        # Reusable UI components (shadcn/ui)
 │   │   ├── contexts/          # React contexts
 │   │   ├── hooks/             # Custom hooks
-│   │   ├── lib/trpc.ts        # tRPC client binding
+│   │   ├── lib/trpc.ts        # React tRPC client binding
+│   │   ├── lib/chunked-upload.ts # Chunked dataset upload utility
 │   │   ├── App.tsx            # Routes & layout
 │   │   └── index.css          # Global styles & theme
 │   └── index.html             # HTML template with OGP meta tags
@@ -215,15 +216,16 @@ auto-research-claw/
 │   ├── db.ts                  # Database query helpers
 │   ├── pipeline-engine.ts     # 23-stage pipeline state machine
 │   ├── experiment-runner.ts   # Deterministic statistics/econometrics runner
-│   ├── literature-search.ts   # Multi-source academic search
+│   ├── literature.ts          # Multi-source academic search
 │   ├── pdf-generator.ts       # Markdown-to-PDF converter
+│   ├── upload-procedures.ts   # tRPC chunked upload procedures
+│   ├── storage.ts             # S3 proxy helper utilities
 │   └── *.test.ts              # Vitest test files
 ├── drizzle/
 │   ├── schema.ts              # Database schema (Drizzle ORM)
 │   └── *.sql                  # Migration files
 ├── shared/
 │   └── pipeline.ts            # Shared types & constants
-├── storage/                   # S3 helper utilities
 └── package.json
 ```
 
