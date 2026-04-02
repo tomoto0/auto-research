@@ -19,7 +19,7 @@ import {
   estimateDatasetMultipartChunks,
   storageDownloadDatasetMultipartToFile,
 } from "./storage";
-import { insertExperimentResult, updateExperimentResult, updateStageLog } from "./db";
+import { insertExperimentResult, updateExperimentResult, updateStageLogWhileRunning } from "./db";
 import { parse as csvParseStream } from "csv-parse";
 import * as XLSX from "xlsx";
 import { parseDtaFile } from "./dta-parser";
@@ -1648,22 +1648,18 @@ export async function executePythonExperiment(
     return `...[truncated ${trimmedChars.toLocaleString()} chars]\n${joined.slice(-MAX_OUTPUT_LENGTH)}`;
   };
 
+  // Persist progress snapshots to stage_logs only while the stage row is
+  // still marked running. Once the pipeline engine seals the row as done or
+  // failed, any in-flight heartbeat update becomes a no-op at the DB layer.
   const persistRunningState = async (force = false) => {
     const now = Date.now();
     if (!force && now - lastPersistedAt < 4_000) return;
     lastPersistedAt = now;
     const stdout = buildRunningStdout();
-    await Promise.all([
-      updateExperimentResult(dbResult.id, {
-        executionStatus: "running",
-        stdout,
-        executionTimeMs: now - startTime,
-      }),
-      updateStageLog(runId, stageNumber, {
-        output: stdout.substring(0, 60_000),
-        durationMs: now - startTime,
-      }),
-    ]);
+    await updateStageLogWhileRunning(runId, stageNumber, {
+      output: stdout.substring(0, 60_000),
+      durationMs: now - startTime,
+    });
   };
 
   const publishProgress = async (
@@ -1706,7 +1702,7 @@ export async function executePythonExperiment(
       const heartbeatMessage = `[HEARTBEAT] Stage 11 still running: ${currentPhase} (${elapsedSeconds}s elapsed, ${charts.length} charts, ${tables.length} tables, ${Object.keys(metrics).length} metrics)`;
       void publishProgress(heartbeatMessage, {
         heartbeat: true,
-        persist: true,
+        persist: false,
       }).finally(() => {
         heartbeatInFlight = false;
       });

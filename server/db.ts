@@ -102,6 +102,18 @@ export async function updateStageLog(runId: string, stageNumber: number, updates
   );
 }
 
+export async function updateStageLogWhileRunning(runId: string, stageNumber: number, updates: Partial<InsertStageLog>) {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(stageLogs).set(updates).where(
+    and(
+      eq(stageLogs.runId, runId),
+      eq(stageLogs.stageNumber, stageNumber),
+      eq(stageLogs.status, "running"),
+    )
+  );
+}
+
 // ─── Papers ───
 export async function insertPapers(papersData: InsertPaper[]) {
   const db = await getDb();
