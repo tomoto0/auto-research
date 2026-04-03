@@ -77,6 +77,8 @@ interface ExperimentExecutionOptions {
 }
 
 interface DeterministicAnalysisPlan {
+  version?: number;
+  planType?: string;
   methods?: string[];
   blockedMethods?: string[];
   datasets?: Array<{
@@ -85,6 +87,12 @@ interface DeterministicAnalysisPlan {
     rows?: number;
     fileType?: string;
   }>;
+  datasetSummary?: Array<{
+    name?: string;
+    rows?: number;
+    fileType?: string;
+  }>;
+  note?: string;
   topic?: string;
   analysisInputs?: AnalysisInputs;
 }
@@ -152,6 +160,16 @@ function buildExecutableMethodSet(
   }
   const set = new Set<string>();
   for (const methodId of methodContract.executableNow || []) {
+    const normalized = normaliseMethodId(methodId);
+    if (normalized) set.add(normalized);
+  }
+  return set;
+}
+
+function buildMethodSetFromList(methods?: string[] | null): Set<string> | null {
+  if (!methods || methods.length === 0) return null;
+  const set = new Set<string>();
+  for (const methodId of methods) {
     const normalized = normaliseMethodId(methodId);
     if (normalized) set.add(normalized);
   }
@@ -1617,6 +1635,7 @@ export async function executePythonExperiment(
   const deterministicPlan = parseDeterministicAnalysisPlan(analysisCode);
   const analysisTopic = typeof deterministicPlan?.topic === "string" ? deterministicPlan.topic : "";
   const analysisInputs = deterministicPlan?.analysisInputs;
+  const planMethods = Array.isArray(deterministicPlan?.methods) ? deterministicPlan.methods : [];
   const workDir = path.join(os.tmpdir(), `experiment-${runId}-${nanoid(6)}`);
   const dataDir = path.join(workDir, "data");
   fs.mkdirSync(workDir, { recursive: true });
@@ -1634,7 +1653,7 @@ export async function executePythonExperiment(
   const charts: ExperimentOutput["charts"] = [];
   const tables: ExperimentOutput["tables"] = [];
   const metrics: Record<string, number | string> = {};
-  const executableMethods = buildExecutableMethodSet(methodContract);
+  const executableMethods = buildMethodSetFromList(planMethods) ?? buildExecutableMethodSet(methodContract);
   const heartbeatMs = Math.max(5_000, options?.heartbeatMs ?? 15_000);
   let currentPhase = "initialising";
   let lastPersistedAt = 0;
@@ -1825,6 +1844,10 @@ export async function executePythonExperiment(
       phase: "building_analysis_outputs",
       persist: true,
     });
+    if (planMethods.length > 0) {
+      metrics.execution_requested_methods = planMethods.join(", ");
+      await publishProgress(`[INFO] Requested execution methods: ${planMethods.join(", ")}`);
+    }
     if (analysisInputs && Object.keys(analysisInputs).length > 0) {
       await publishProgress(`[INFO] Using user-specified analysis inputs: ${JSON.stringify(analysisInputs)}`);
     }
@@ -1832,7 +1855,7 @@ export async function executePythonExperiment(
       phase: "building_analysis_bundle",
       persist: true,
     });
-    const analysisBundle = buildAnalysisComputationBundle(allData, analysisTopic, analysisInputs);
+    const analysisBundle = buildAnalysisComputationBundle(allData, analysisTopic, analysisInputs, executableMethods);
     await publishProgress("[INFO] Shared estimator bundle ready.", {
       phase: "building_analysis_bundle",
       persist: true,
@@ -4865,6 +4888,7 @@ function buildAnalysisComputationBundle(
   allData: ParsedDataset[],
   analysisTopic = "",
   analysisInputs?: AnalysisInputs,
+  executableMethods?: Set<string> | null,
 ): AnalysisComputationBundle | null {
   const ds = getPrimaryDataset(allData);
   if (!ds) return null;
@@ -4879,17 +4903,37 @@ function buildAnalysisComputationBundle(
   const methodAssessments = buildMethodApplicabilityAssessment(ds, meaningfulNumericCols, categoricalCols);
   const panelFeAssessment = assessPanelFixedEffects(ds, designHints, missingDataMode);
   const preparedRegression = prepareRegressionData(ds, designHints, missingDataMode);
-  const robustOls = computeRobustOls(ds, designHints, missingDataMode);
-  const panelFixedEffects = computePanelFixedEffects(ds, designHints, missingDataMode);
-  const diffInDiff = computeDiffInDiff(ds, designHints);
-  const syntheticControl = computeSyntheticControl(ds, designHints);
+  const robustOls = methodAllowed(executableMethods || null, "robust_ols")
+    ? computeRobustOls(ds, designHints, missingDataMode)
+    : null;
+  const panelFixedEffects = methodAllowed(executableMethods || null, "panel_fixed_effects")
+    ? computePanelFixedEffects(ds, designHints, missingDataMode)
+    : null;
+  const shouldComputeDiffInDiff =
+    methodAllowed(executableMethods || null, "diff_in_diff") ||
+    methodAllowed(executableMethods || null, "event_study");
+  const diffInDiff = shouldComputeDiffInDiff
+    ? computeDiffInDiff(ds, designHints)
+    : null;
+  const syntheticControl = methodAllowed(executableMethods || null, "synthetic_control")
+    ? computeSyntheticControl(ds, designHints)
+    : null;
   const syntheticControlPlacebos = syntheticControl
+    && methodAllowed(executableMethods || null, "synthetic_control")
     ? computeSyntheticControlPlacebos(ds, designHints, syntheticControl)
     : null;
-  const iv2Sls = computeIv2Sls(ds, designHints);
-  const rdd = computeRegressionDiscontinuity(ds, designHints);
-  const propensityScore = computePropensityScore(ds, designHints);
-  const quantileRegression = computeQuantileRegression(ds, designHints, missingDataMode);
+  const iv2Sls = methodAllowed(executableMethods || null, "iv_2sls")
+    ? computeIv2Sls(ds, designHints)
+    : null;
+  const rdd = methodAllowed(executableMethods || null, "regression_discontinuity")
+    ? computeRegressionDiscontinuity(ds, designHints)
+    : null;
+  const propensityScore = methodAllowed(executableMethods || null, "propensity_score")
+    ? computePropensityScore(ds, designHints)
+    : null;
+  const quantileRegression = methodAllowed(executableMethods || null, "quantile_regression")
+    ? computeQuantileRegression(ds, designHints, missingDataMode)
+    : null;
 
   return {
     ds,
@@ -4921,9 +4965,10 @@ function resolveAnalysisComputationBundle(
   allData: ParsedDataset[],
   analysisTopic = "",
   analysisInputs?: AnalysisInputs,
+  executableMethods?: Set<string> | null,
   analysisBundle?: AnalysisComputationBundle | null,
 ): AnalysisComputationBundle | null {
-  return analysisBundle ?? buildAnalysisComputationBundle(allData, analysisTopic, analysisInputs);
+  return analysisBundle ?? buildAnalysisComputationBundle(allData, analysisTopic, analysisInputs, executableMethods);
 }
 
 export function buildMethodApplicabilityAssessment(
@@ -5249,7 +5294,7 @@ export function generateDefaultCharts(
   analysisBundle?: AnalysisComputationBundle | null,
 ): { name: string; description: string; config: any }[] {
   const charts: { name: string; description: string; config: any }[] = [];
-  const bundle = resolveAnalysisComputationBundle(allData, analysisTopic, analysisInputs, analysisBundle);
+  const bundle = resolveAnalysisComputationBundle(allData, analysisTopic, analysisInputs, executableMethods, analysisBundle);
   const ds = bundle?.ds || getPrimaryDataset(allData);
   if (!ds || ds.data.length === 0) return charts;
 
@@ -6635,7 +6680,7 @@ function generateDefaultTables(
   analysisBundle?: AnalysisComputationBundle | null,
 ): { name: string; description: string; headers: string[]; rows: (string | number)[][] }[] {
   const tables: { name: string; description: string; headers: string[]; rows: (string | number)[][] }[] = [];
-  const bundle = resolveAnalysisComputationBundle(allData, analysisTopic, analysisInputs, analysisBundle);
+  const bundle = resolveAnalysisComputationBundle(allData, analysisTopic, analysisInputs, executableMethods, analysisBundle);
   const ds = bundle?.ds || getPrimaryDataset(allData);
   if (!ds || ds.data.length === 0) return tables;
 
@@ -7141,7 +7186,7 @@ export function generateDefaultMetrics(
   analysisBundle?: AnalysisComputationBundle | null,
 ): Record<string, number | string> {
   const metrics: Record<string, number | string> = {};
-  const bundle = resolveAnalysisComputationBundle(allData, analysisTopic, analysisInputs, analysisBundle);
+  const bundle = resolveAnalysisComputationBundle(allData, analysisTopic, analysisInputs, executableMethods, analysisBundle);
   const ds = bundle?.ds || getPrimaryDataset(allData);
   if (!ds) return metrics;
   if (!bundle) return metrics;

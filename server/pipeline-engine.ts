@@ -717,6 +717,90 @@ function formatMethodContract(contract: MethodFeasibilityContract | null): strin
   ].filter(Boolean).join("\n");
 }
 
+const EXECUTION_METHOD_PRIORITY = [
+  "descriptive_statistics",
+  "correlation",
+  "group_comparison",
+  "time_trend",
+  "text_feature_analysis",
+  "robust_ols",
+  "linear_regression",
+  "panel_fixed_effects",
+  "diff_in_diff",
+  "event_study",
+  "synthetic_control",
+  "iv_2sls",
+  "regression_discontinuity",
+  "propensity_score",
+  "quantile_regression",
+];
+
+function selectExecutionMethods(
+  contract: MethodFeasibilityContract,
+  analysisInputs?: AnalysisInputs,
+  maxMethods = 5,
+): string[] {
+  const available = new Set(uniqMethodIds(contract.executableNow).filter(methodId => methodId !== "data_visualisation"));
+  if (available.size === 0) return [];
+
+  const preferred: string[] = [];
+  if (available.has("descriptive_statistics")) preferred.push("descriptive_statistics");
+  if (analysisInputs?.outcome) preferred.push("robust_ols", "linear_regression");
+  if (analysisInputs?.subgroup) preferred.push("group_comparison");
+  if (analysisInputs?.time) preferred.push("time_trend");
+  if (analysisInputs?.entity && analysisInputs?.time) preferred.push("panel_fixed_effects");
+  if (analysisInputs?.treatment && analysisInputs?.time) preferred.push("diff_in_diff", "event_study");
+  if (analysisInputs?.treatment && analysisInputs?.entity && analysisInputs?.time) preferred.push("synthetic_control");
+  if (analysisInputs?.treatment) preferred.push("propensity_score");
+
+  const selected: string[] = [];
+  for (const methodId of [...preferred, ...EXECUTION_METHOD_PRIORITY]) {
+    const normalized = normaliseMethodId(methodId);
+    if (!available.has(normalized) || selected.includes(normalized)) continue;
+    selected.push(normalized);
+    if (selected.length >= maxMethods) break;
+  }
+
+  if (selected.length === 0) {
+    return Array.from(available).slice(0, maxMethods);
+  }
+  return selected;
+}
+
+function buildDeterministicAnalysisPlan(ctx: PipelineContext, contract: MethodFeasibilityContract): string {
+  const selectedMethods = selectExecutionMethods(contract, ctx.config.analysisInputs);
+  const analysisPlan = {
+    version: 2,
+    planType: "deterministic_dataset_analysis",
+    methods: selectedMethods,
+    blockedMethods: uniqMethodIds([
+      ...(contract.requiresMissingData || []),
+      ...(contract.futureWorkOnly || []),
+    ]),
+    topic: ctx.topic,
+    analysisInputs: ctx.config.analysisInputs,
+    datasetSummary: ctx.datasetFiles.map(d => ({
+      name: d.originalName,
+      rows: d.rowCount || 0,
+      fileType: d.fileType,
+    })),
+    note: "Execution plan intentionally capped to limit sandbox runtime and output volume.",
+  };
+  return JSON.stringify(analysisPlan, null, 2);
+}
+
+function extractRequestedExecutionMethods(experimentCode: string): string[] {
+  const trimmed = (experimentCode || "").trim();
+  if (!trimmed.startsWith("{")) return [];
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+    return uniqMethodIds(Array.isArray((parsed as any).methods) ? (parsed as any).methods : []);
+  } catch {
+    return [];
+  }
+}
+
 function collectExecutedMethodIds(experimentOutput: ExperimentOutput | null): string[] {
   if (!experimentOutput) return [];
   const byMetrics = String(experimentOutput.metrics?.analysis_methods_executed || "")
@@ -748,9 +832,12 @@ function collectExecutedMethodIds(experimentOutput: ExperimentOutput | null): st
 function buildExecutionDiagnostics(
   contract: MethodFeasibilityContract | null,
   output: ExperimentOutput,
-  analyticalMetricCount: number
+  analyticalMetricCount: number,
+  requestedMethods?: string[],
 ): ExecutionDiagnostics {
-  const executableRequested = contract?.executableNow || [];
+  const executableRequested = requestedMethods && requestedMethods.length > 0
+    ? uniqMethodIds(requestedMethods)
+    : (contract?.executableNow || []);
   const executedMethods = collectExecutedMethodIds(output);
   const missingRequested = executableRequested.filter(m => !executedMethods.includes(m));
   const failureReasons: string[] = [];
@@ -1352,27 +1439,14 @@ async function stage9_codeGeneration(ctx: PipelineContext): Promise<string> {
   const hasDatasets = ctx.datasetFiles.length > 0;
   const contract = ctx.methodContract || deriveFallbackMethodContract(ctx.methodology, ensureEvidenceProfile(ctx));
   ctx.methodContract = contract;
-  const contractBlock = `\n\nMethod feasibility contract (strictly enforce this):\n${formatMethodContract(contract)}\n\nRULES:\n- Generate analysis specs ONLY for methods listed under "Executable now".\n- DO NOT generate charts/tables/metrics for methods in "Requires missing data" or "Future-work only".\n- If executable methods are very limited, produce fewer but faithful analyses rather than broad fabricated coverage.`;
 
   if (hasDatasets) {
-    // Generate a deterministic analysis plan from the method contract
-    // (The experiment runner computes all charts/tables/metrics from real data,
-    //  so we don't need an LLM to generate a Chart.js JSON spec that would be ignored.)
-    const analysisPlan = {
-      methods: contract.executableNow,
-      blockedMethods: [...(contract.requiresMissingData || []), ...(contract.futureWorkOnly || [])],
-      datasets: ctx.datasetFiles.map(d => ({
-        name: d.originalName,
-        columns: d.columnNames || [],
-        rows: d.rowCount || 0,
-        fileType: d.fileType,
-      })),
-      topic: ctx.topic,
-      analysisInputs: ctx.config.analysisInputs,
-    };
-    ctx.experimentCode = JSON.stringify(analysisPlan, null, 2);
+    // The runner computes outputs from real data, so keep the persisted plan compact
+    // and cap execution to the highest-value feasible methods.
+    ctx.experimentCode = buildDeterministicAnalysisPlan(ctx, contract);
     await persistStageAudit(ctx, 9, {
       methodContract: contract,
+      selectedExecutionMethods: extractRequestedExecutionMethods(ctx.experimentCode),
       experimentCodeLength: ctx.experimentCode.length,
       deterministicPlan: true,
     });
@@ -1395,6 +1469,16 @@ async function stage9_codeGeneration(ctx: PipelineContext): Promise<string> {
 }
 
 async function stage10_codeReview(ctx: PipelineContext): Promise<string> {
+  const isDeterministicDatasetPlan = ctx.datasetFiles.length > 0 && (ctx.experimentCode || "").trim().startsWith("{");
+  if (isDeterministicDatasetPlan) {
+    const message = "Deterministic dataset analysis plan detected; skipping LLM code review because sandbox execution is driven by the curated method list rather than free-form generated code.";
+    await persistStageAudit(ctx, 10, {
+      skippedLlmCodeReview: true,
+      requestedExecutionMethods: extractRequestedExecutionMethods(ctx.experimentCode),
+    });
+    return message;
+  }
+
   return callLLM(
     "You are a senior code reviewer. Review experiment code for correctness, efficiency, and best practices.",
     `Review this experiment code:\n\n${ctx.experimentCode}\n\nCheck for:\n1. Logical errors\n2. Statistical correctness\n3. Edge cases\n4. Performance issues\n5. Code quality and documentation\n6. Reproducibility\n7. Suggested improvements\n\nProvide a corrected version if needed.`
@@ -1415,6 +1499,7 @@ async function stage11_experimentExecution(ctx: PipelineContext): Promise<string
     try {
       // Strip any remaining code block markers
       let codeBody = stripCodeBlockMarkers(ctx.experimentCode);
+      const requestedMethods = extractRequestedExecutionMethods(codeBody);
 
       const emitExperimentProgress = (update: ExperimentProgressUpdate) => {
         ctx.emit({
@@ -1448,10 +1533,16 @@ async function stage11_experimentExecution(ctx: PipelineContext): Promise<string
 
       ctx.experimentOutput = output;
       const analyticalMetricEntries = getAnalyticalMetricEntries(output);
-      ctx.executionDiagnostics = buildExecutionDiagnostics(ctx.methodContract, output, analyticalMetricEntries.length);
+      ctx.executionDiagnostics = buildExecutionDiagnostics(
+        ctx.methodContract,
+        output,
+        analyticalMetricEntries.length,
+        requestedMethods,
+      );
       ctx.methodIntegrityNote = buildMethodIntegrityNote(ctx);
       await persistStageAudit(ctx, 11, {
         methodContract: ctx.methodContract,
+        requestedExecutionMethods: requestedMethods,
         executionDiagnostics: ctx.executionDiagnostics,
         analyticalMetricCount: analyticalMetricEntries.length,
       });
