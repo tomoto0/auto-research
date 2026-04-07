@@ -6,7 +6,12 @@ import { getDb } from "./db";
 import { pipelineRuns, stageLogs } from "../drizzle/schema";
 import { eq, or } from "drizzle-orm";
 
-export async function cleanupStaleRuns(): Promise<number> {
+interface CleanupStaleRunsOptions {
+  includePending?: boolean;
+  reason?: string;
+}
+
+export async function cleanupStaleRuns(options?: CleanupStaleRunsOptions): Promise<number> {
   const db = await getDb();
   if (!db) {
     console.warn("[Cleanup] Database not available, skipping stale run cleanup");
@@ -14,16 +19,18 @@ export async function cleanupStaleRuns(): Promise<number> {
   }
 
   try {
-    // Find all runs that are still "running" or "pending"
+    const includePending = options?.includePending ?? true;
+    const staleReason = options?.reason || "Pipeline process lost due to server restart";
+
+    // Find stale runs that are still marked running (and optionally pending).
+    const staleCondition = includePending
+      ? or(eq(pipelineRuns.status, "running"), eq(pipelineRuns.status, "pending"))
+      : eq(pipelineRuns.status, "running");
+
     const staleRuns = await db
       .select({ runId: pipelineRuns.runId })
       .from(pipelineRuns)
-      .where(
-        or(
-          eq(pipelineRuns.status, "running"),
-          eq(pipelineRuns.status, "pending")
-        )
-      );
+      .where(staleCondition);
 
     if (staleRuns.length === 0) {
       console.log("[Cleanup] No stale runs found");
@@ -38,7 +45,7 @@ export async function cleanupStaleRuns(): Promise<number> {
         .update(pipelineRuns)
         .set({
           status: "failed",
-          errorMessage: "Pipeline process lost due to server restart",
+          errorMessage: staleReason,
         })
         .where(eq(pipelineRuns.runId, run.runId));
 

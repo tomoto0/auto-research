@@ -2,7 +2,8 @@ import { z } from "zod";
 import { COOKIE_NAME } from "@shared/const";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
-import { publicProcedure, protectedProcedure, router } from "./_core/trpc";
+import { publicProcedure, router } from "./_core/trpc";
+import { isWorkerExecutionMode } from "./_core/pipeline-execution";
 import { nanoid } from "nanoid";
 import * as db from "./db";
 import { unifiedSearch } from "./literature";
@@ -157,8 +158,18 @@ const pipelineRouter = router({
         await db.assignDatasetFilesToRun(input.datasetFileIds, runId);
       }
 
-      // Start pipeline in background
       const emit = createEmitter(runId);
+      if (isWorkerExecutionMode()) {
+        emit({
+          type: "log",
+          runId,
+          message: "Pipeline queued for worker execution",
+          timestamp: Date.now(),
+        });
+        return { runId, status: "pending", executionMode: "worker" as const };
+      }
+
+      // Start pipeline in background
       executePipeline(runId, input.topic, config, emit).catch(err => {
         console.error(`[Pipeline] Run ${runId} crashed:`, err);
         db.updatePipelineRun(runId, { status: "failed", errorMessage: err?.message || String(err) });
@@ -182,6 +193,15 @@ const pipelineRouter = router({
       editedOutput: z.string().optional(),
     }))
     .mutation(async ({ input }) => {
+      if (isWorkerExecutionMode()) {
+        const run = await db.getPipelineRun(input.runId);
+        if (!run || run.status !== "awaiting_approval") {
+          return { success: false, message: "This run is not currently awaiting approval" };
+        }
+        const ok = await db.approveBlockedApprovalStage(input.runId, input.editedOutput);
+        return { success: ok };
+      }
+
       if (!isAwaitingApproval(input.runId)) {
         return { success: false, message: "This run is not currently awaiting approval" };
       }
@@ -195,6 +215,15 @@ const pipelineRouter = router({
       reason: z.string().optional(),
     }))
     .mutation(async ({ input }) => {
+      if (isWorkerExecutionMode()) {
+        const run = await db.getPipelineRun(input.runId);
+        if (!run || run.status !== "awaiting_approval") {
+          return { success: false, message: "This run is not currently awaiting approval" };
+        }
+        const ok = await db.rejectBlockedApprovalStage(input.runId, input.reason);
+        return { success: ok };
+      }
+
       if (!isAwaitingApproval(input.runId)) {
         return { success: false, message: "This run is not currently awaiting approval" };
       }
@@ -204,7 +233,11 @@ const pipelineRouter = router({
 
   approvalStatus: publicProcedure
     .input(z.object({ runId: z.string() }))
-    .query(({ input }) => {
+    .query(async ({ input }) => {
+      if (isWorkerExecutionMode()) {
+        const run = await db.getPipelineRun(input.runId);
+        return { awaiting: run?.status === "awaiting_approval" };
+      }
       return { awaiting: isAwaitingApproval(input.runId) };
     }),
 

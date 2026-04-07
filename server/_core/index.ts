@@ -10,6 +10,7 @@ import { serveStatic, setupVite } from "./vite";
 import { cleanupStaleRuns } from "../startup-cleanup";
 import { getArtifactsForRun } from "../db";
 import archiver from "archiver";
+import { getPipelineExecutionMode } from "./pipeline-execution";
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise(resolve => {
@@ -120,16 +121,6 @@ async function startServer() {
     const { runId } = req.params;
     const since = parseInt(req.query.since as string) || 0;
 
-    if (req.query.probe === "1") {
-      res.status(204).set({
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-        "Access-Control-Allow-Origin": "*",
-      }).end();
-      return;
-    }
-
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
@@ -188,9 +179,14 @@ async function startServer() {
 
   server.listen(port, async () => {
     console.log(`Server running on http://localhost:${port}/`);
+    const executionMode = getPipelineExecutionMode();
+    console.log(`[Startup] Pipeline execution mode: ${executionMode}`);
     // Cleanup stale pipeline runs from previous server instance
     try {
-      const cleaned = await cleanupStaleRuns();
+      const cleaned = await cleanupStaleRuns({
+        includePending: executionMode !== "worker",
+        reason: "Pipeline process lost due to server restart",
+      });
       if (cleaned > 0) console.log(`[Startup] Cleaned up ${cleaned} stale pipeline run(s)`);
     } catch (e) {
       console.warn("[Startup] Cleanup failed:", e);

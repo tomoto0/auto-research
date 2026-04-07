@@ -1,4 +1,4 @@
-import { eq, desc, and, sql } from "drizzle-orm";
+import { eq, desc, and, asc, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import { InsertUser, users, pipelineRuns, stageLogs, papers, artifacts, userSettings, datasetFiles, experimentResults } from "../drizzle/schema";
 import type { InsertPipelineRun, InsertStageLog, InsertPaper, InsertArtifact, InsertDatasetFile, InsertExperimentResult } from "../drizzle/schema";
@@ -81,6 +81,35 @@ export async function updatePipelineRun(runId: string, updates: Partial<InsertPi
   await db.update(pipelineRuns).set(updates).where(eq(pipelineRuns.runId, runId));
 }
 
+export async function claimNextPendingPipelineRun() {
+  const db = await getDb();
+  if (!db) return null;
+
+  const candidate = await db
+    .select()
+    .from(pipelineRuns)
+    .where(eq(pipelineRuns.status, "pending"))
+    .orderBy(asc(pipelineRuns.createdAt))
+    .limit(1);
+
+  if (!candidate[0]) return null;
+
+  const run = candidate[0];
+  const claimed = await db
+    .update(pipelineRuns)
+    .set({
+      status: "running",
+      errorMessage: null,
+      currentStage: run.currentStage > 0 ? run.currentStage : 1,
+    })
+    .where(and(eq(pipelineRuns.runId, run.runId), eq(pipelineRuns.status, "pending")));
+
+  const affectedRows = Number((claimed as any)?.affectedRows ?? (claimed as any)?.[0]?.affectedRows ?? 0);
+  if (affectedRows === 0) return null;
+
+  return run;
+}
+
 // ─── Stage Logs ───
 export async function createStageLog(log: InsertStageLog) {
   const db = await getDb();
@@ -92,6 +121,79 @@ export async function getStageLogsForRun(runId: string) {
   const db = await getDb();
   if (!db) return [];
   return db.select().from(stageLogs).where(eq(stageLogs.runId, runId)).orderBy(stageLogs.stageNumber);
+}
+
+export async function getStageLog(runId: string, stageNumber: number) {
+  const db = await getDb();
+  if (!db) return null;
+  const rows = await db
+    .select()
+    .from(stageLogs)
+    .where(and(eq(stageLogs.runId, runId), eq(stageLogs.stageNumber, stageNumber)))
+    .limit(1);
+  return rows[0] || null;
+}
+
+export async function getBlockedApprovalStage(runId: string) {
+  const db = await getDb();
+  if (!db) return null;
+  const rows = await db
+    .select()
+    .from(stageLogs)
+    .where(and(eq(stageLogs.runId, runId), eq(stageLogs.status, "blocked_approval")))
+    .orderBy(desc(stageLogs.stageNumber))
+    .limit(1);
+  return rows[0] || null;
+}
+
+export async function approveBlockedApprovalStage(runId: string, editedOutput?: string): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false;
+
+  const blockedStage = await getBlockedApprovalStage(runId);
+  if (!blockedStage) return false;
+
+  const stageUpdates: Partial<InsertStageLog> = {
+    status: "done",
+    completedAt: new Date(),
+  };
+  if (editedOutput !== undefined) {
+    stageUpdates.output = editedOutput.substring(0, 60000);
+  }
+
+  await db.update(stageLogs).set(stageUpdates).where(eq(stageLogs.id, blockedStage.id));
+  await db.update(pipelineRuns).set({ status: "running", errorMessage: null }).where(eq(pipelineRuns.runId, runId));
+
+  return true;
+}
+
+export async function rejectBlockedApprovalStage(runId: string, reason?: string): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false;
+
+  const blockedStage = await getBlockedApprovalStage(runId);
+  if (!blockedStage) return false;
+
+  const message = reason || "Stage rejected by user";
+
+  await db
+    .update(stageLogs)
+    .set({
+      status: "failed",
+      errorMessage: message,
+      completedAt: new Date(),
+    })
+    .where(eq(stageLogs.id, blockedStage.id));
+
+  await db
+    .update(pipelineRuns)
+    .set({
+      status: "failed",
+      errorMessage: `Stage ${blockedStage.stageNumber} rejected: ${message}`,
+    })
+    .where(eq(pipelineRuns.runId, runId));
+
+  return true;
 }
 
 export async function updateStageLog(runId: string, stageNumber: number, updates: Partial<InsertStageLog>) {

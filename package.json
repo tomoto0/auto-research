@@ -5,8 +5,12 @@
   "license": "MIT",
   "scripts": {
     "dev": "NODE_ENV=development NODE_OPTIONS='--max-old-space-size=4096 --expose-gc' tsx watch server/_core/index.ts",
-    "build": "vite build && esbuild server/_core/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
+    "dev:api": "PIPELINE_EXECUTION_MODE=worker NODE_ENV=development NODE_OPTIONS='--max-old-space-size=4096 --expose-gc' tsx watch server/_core/index.ts",
+    "dev:worker": "PIPELINE_EXECUTION_MODE=worker NODE_ENV=development NODE_OPTIONS='--max-old-space-size=4096 --expose-gc' tsx watch server/worker.ts",
+    "build": "vite build && esbuild server/_core/index.ts --platform=node --packages=external --bundle --format=esm --outfile=dist/index.js && esbuild server/worker.ts --platform=node --packages=external --bundle --format=esm --outfile=dist/worker.js",
     "start": "NODE_ENV=production NODE_OPTIONS='--max-old-space-size=4096 --expose-gc' node dist/index.js",
+    "start:api": "PIPELINE_EXECUTION_MODE=worker NODE_ENV=production NODE_OPTIONS='--max-old-space-size=4096 --expose-gc' node dist/index.js",
+    "start:worker": "PIPELINE_EXECUTION_MODE=worker NODE_ENV=production NODE_OPTIONS='--max-old-space-size=4096 --expose-gc' node dist/worker.js",
     "check": "tsc --noEmit",
     "format": "prettier --write .",
     "test": "vitest run",

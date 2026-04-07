@@ -12,6 +12,7 @@ import { storagePut, storageGet } from "./storage";
 import { nanoid } from "nanoid";
 import { generatePaperPdf, type ChartImage } from "./pdf-generator";
 import { executePythonExperiment, type DatasetInfo, type ExperimentOutput, type ExperimentProgressUpdate } from "./experiment-runner";
+import { isWorkerExecutionMode } from "./_core/pipeline-execution";
 
 export type EventEmitter = (event: PipelineEvent) => void;
 
@@ -2367,6 +2368,26 @@ async function waitForApproval(runId: string, stageNumber: number, output: strin
     data: { output: output.substring(0, 2000) },
     timestamp: Date.now(),
   });
+
+  if (isWorkerExecutionMode()) {
+    // In worker mode, approval requests are handled by the API process,
+    // so we synchronise via DB status instead of process-local waiters.
+    while (true) {
+      const run = await db.getPipelineRun(runId);
+      if (!run) throw new Error("Pipeline run no longer exists");
+
+      if (run.status === "running") {
+        const stageLog = await db.getStageLog(runId, stageNumber);
+        return stageLog?.output || output;
+      }
+
+      if (run.status === "failed" || run.status === "stopped") {
+        throw new Error(run.errorMessage || "Stage rejected by user");
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  }
 
   return new Promise<string>((resolve, reject) => {
     approvalWaiters.set(runId, {
