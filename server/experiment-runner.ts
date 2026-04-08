@@ -22,7 +22,7 @@ import {
 import { insertExperimentResult, updateExperimentResult, updateStageLogWhileRunning } from "./db";
 import { parse as csvParseStream } from "csv-parse";
 import * as XLSX from "xlsx";
-import { parseDtaFile } from "./dta-parser";
+import { parseDtaFileAsync } from "./dta-parser";
 import * as iconv from "iconv-lite";
 import chardet from "chardet";
 import { invokeLLM } from "./_core/llm";
@@ -31,6 +31,20 @@ import type { AnalysisInputs } from "../shared/pipeline";
 const EXECUTION_TIMEOUT_MS = 90_000; // 90 seconds max
 const MAX_OUTPUT_LENGTH = 50_000;
 const CSV_ENCODING_SAMPLE_BYTES = 128 * 1024;
+
+interface DatasetParseOptions {
+  signal?: AbortSignal;
+  onDtaProgress?: (progress: { rowsParsed: number; totalRows: number }) => void | Promise<void>;
+}
+
+function formatMiB(bytes: number): string {
+  return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+}
+
+function formatMemoryUsageSnapshot(): string {
+  const usage = process.memoryUsage();
+  return `rss=${formatMiB(usage.rss)}, heapUsed=${formatMiB(usage.heapUsed)}, heapTotal=${formatMiB(usage.heapTotal)}`;
+}
 
 export interface DatasetInfo {
   originalName: string;
@@ -478,6 +492,7 @@ async function parseDataFile(
   filePath: string,
   fileType: string,
   rowCountHint?: number,
+  options?: DatasetParseOptions,
 ): Promise<{ data: Record<string, any>[]; columns: string[]; totalRows: number; encoding?: string }> {
   const hintedRows = rowCountHint && rowCountHint > 0 ? rowCountHint : undefined;
 
@@ -486,8 +501,12 @@ async function parseDataFile(
   }
 
   if (fileType === "dta") {
-    let rawBuf: Buffer | null = fs.readFileSync(filePath);
-    const result = parseDtaFile(rawBuf);
+    let rawBuf: Buffer | null = await fs.promises.readFile(filePath);
+    const result = await parseDtaFileAsync(rawBuf, {
+      signal: options?.signal,
+      yieldEveryRows: 1000,
+      onProgress: options?.onDtaProgress,
+    });
     // Release the large buffer immediately so GC can reclaim it
     rawBuf = null;
     try { global.gc?.(); } catch {}
@@ -544,8 +563,9 @@ async function parseAndValidateDataFile(
   filePath: string,
   fileType: string,
   rowCountHint?: number,
+  options?: DatasetParseOptions,
 ): Promise<{ data: Record<string, any>[]; columns: string[]; totalRows: number; encoding?: string }> {
-  const result = await parseDataFile(filePath, fileType, rowCountHint);
+  const result = await parseDataFile(filePath, fileType, rowCountHint, options);
   validateParsedData(result, fileType);
   return result;
 }
@@ -1655,6 +1675,10 @@ export async function executePythonExperiment(
   const metrics: Record<string, number | string> = {};
   const executableMethods = buildMethodSetFromList(planMethods) ?? buildExecutableMethodSet(methodContract);
   const heartbeatMs = Math.max(5_000, options?.heartbeatMs ?? 15_000);
+  const executionController = new AbortController();
+  const executionTimeout = setTimeout(() => {
+    executionController.abort(new Error(`Experiment execution timed out after ${Math.round(EXECUTION_TIMEOUT_MS / 1000)}s`));
+  }, EXECUTION_TIMEOUT_MS);
   let currentPhase = "initialising";
   let lastPersistedAt = 0;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -1690,6 +1714,12 @@ export async function executePythonExperiment(
       includeInLogs?: boolean;
     },
   ) => {
+    if (executionController.signal.aborted) {
+      const reason = executionController.signal.reason;
+      throw reason instanceof Error
+        ? reason
+        : new Error(typeof reason === "string" ? reason : "Experiment execution aborted");
+    }
     if (optionsOverride?.phase) currentPhase = optionsOverride.phase;
     if (optionsOverride?.includeInLogs !== false) {
       logs.push(message);
@@ -1710,6 +1740,12 @@ export async function executePythonExperiment(
       await persistRunningState(true);
     } else {
       await persistRunningState(false);
+    }
+    if (executionController.signal.aborted) {
+      const reason = executionController.signal.reason;
+      throw reason instanceof Error
+        ? reason
+        : new Error(typeof reason === "string" ? reason : "Experiment execution aborted");
     }
   };
 
@@ -1735,8 +1771,20 @@ export async function executePythonExperiment(
     }
   };
 
+  const clearExecutionTimeout = () => {
+    clearTimeout(executionTimeout);
+  };
+
+  const throwIfAborted = () => {
+    if (!executionController.signal.aborted) return;
+    const reason = executionController.signal.reason;
+    if (reason instanceof Error) throw reason;
+    throw new Error(typeof reason === "string" ? reason : "Experiment execution aborted");
+  };
+
   try {
     startHeartbeat();
+    throwIfAborted();
     // 1. Download and parse all dataset files
     await publishProgress("[INFO] Downloading and parsing datasets...", {
       phase: "downloading_datasets",
@@ -1745,6 +1793,7 @@ export async function executePythonExperiment(
     const allData: { name: string; data: Record<string, any>[]; columns: string[]; totalRows: number }[] = [];
 
     for (const ds of datasets) {
+      throwIfAborted();
       const localPath = path.join(dataDir, ds.originalName);
       await publishProgress(`[INFO] Downloading dataset: ${ds.originalName}`, {
         phase: "downloading_datasets",
@@ -1761,16 +1810,39 @@ export async function executePythonExperiment(
           phase: "parsing_datasets",
           persist: true,
         });
-        const parsed = await parseAndValidateDataFile(localPath, ds.fileType, ds.rowCount);
+        await publishProgress(`[INFO] Parse context ${ds.originalName}: ${formatMemoryUsageSnapshot()}`, {
+          phase: "parsing_datasets",
+        });
+        let lastDtaProgressLogAt = 0;
+        const parsed = await parseAndValidateDataFile(localPath, ds.fileType, ds.rowCount, {
+          signal: executionController.signal,
+          onDtaProgress: async ({ rowsParsed, totalRows }) => {
+            if (ds.fileType !== "dta") return;
+            const now = Date.now();
+            const isFinal = totalRows > 0 && rowsParsed >= totalRows;
+            if (!isFinal && now - lastDtaProgressLogAt < 5_000) return;
+            lastDtaProgressLogAt = now;
+            await publishProgress(
+              `[INFO] DTA parse progress ${ds.originalName}: ${rowsParsed.toLocaleString()}/${totalRows.toLocaleString()} rows (${formatMemoryUsageSnapshot()})`,
+              {
+                phase: "parsing_datasets",
+                persist: false,
+              },
+            );
+          },
+        });
         // Remove the local file immediately after parsing to free disk space
         // and avoid keeping both on-disk and in-memory copies
         try { fs.unlinkSync(localPath); } catch {}
         try { global.gc?.(); } catch {}
         allData.push({ name: ds.originalName, ...parsed });
-        await publishProgress(`[INFO] Parsed ${ds.originalName}: ${parsed.totalRows} rows, ${parsed.columns.length} columns (encoding: ${parsed.encoding || "native"})`, {
-          phase: "parsing_datasets",
-          persist: true,
-        });
+        await publishProgress(
+          `[INFO] Parsed ${ds.originalName}: ${parsed.totalRows} rows, ${parsed.columns.length} columns (encoding: ${parsed.encoding || "native"}, ${formatMemoryUsageSnapshot()})`,
+          {
+            phase: "parsing_datasets",
+            persist: true,
+          },
+        );
         // Log first 20 column names for debugging
         const colPreview = parsed.columns.slice(0, 20).join(", ");
         await publishProgress(`[INFO] Columns: ${colPreview}${parsed.columns.length > 20 ? ` ... (${parsed.columns.length} total)` : ""}`);
@@ -2130,6 +2202,7 @@ export async function executePythonExperiment(
     };
 
     stopHeartbeat();
+    clearExecutionTimeout();
     await updateExperimentResult(dbResult.id, {
       executionStatus: "success",
       stdout: output.stdout,
@@ -2146,6 +2219,7 @@ export async function executePythonExperiment(
 
   } catch (err: any) {
     stopHeartbeat();
+    clearExecutionTimeout();
     const executionTimeMs = Date.now() - startTime;
     const stderr = err?.message || "Execution failed";
     logs.push(`[ERROR] ${stderr}`);

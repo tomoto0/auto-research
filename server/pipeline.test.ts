@@ -572,6 +572,7 @@ describe("DTA Parser", () => {
     // Verify the import chain works (dta-parser is imported)
     const dtaMod = await import("./dta-parser");
     expect(typeof dtaMod.parseDtaFile).toBe("function");
+    expect(typeof dtaMod.parseDtaFileAsync).toBe("function");
   });
 });
 
